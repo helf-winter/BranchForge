@@ -211,9 +211,15 @@ Manifest 至少包含：
 - `plan_markdown`；
 - `manifest_json`；
 - `parse_status`；
+- `source_trace_event_id`；
+- `created_at`。
+
+新增不可变 `native_plan_tree_links`，用于保存 Snapshot 后续形成的结构化计划关联：
+
+- `id`；
+- `snapshot_id`；
 - `tree_id`；
 - `tree_revision_id`；
-- `execution_policy`，取值为 `structured_candidate`、`task_tree` 或 `direct_execution`；
 - `source_trace_event_id`；
 - `created_at`。
 
@@ -222,12 +228,13 @@ Manifest 至少包含：
 - `id`；
 - `snapshot_id`；
 - `approved`；
+- `execution_policy`，取值为 `task_tree`、`direct_execution` 或 `sync_required`；
 - `approval_trace_event_id`；
 - `created_at`。
 
-同一 Project、Session 和 plan hash 的重复 Hook 必须幂等。Snapshot 内容不可更新；计划变化创建新 Snapshot。Approval Event 不修改 Snapshot，只追加批准事实。
+同一 Project、Session 和 plan hash 的重复 Hook 必须幂等。Snapshot 内容不可更新；计划变化创建新 Snapshot。Tree Link 和 Approval Event 都不修改 Snapshot，只追加关联或批准事实。一个 Snapshot 至多关联一个 Task Tree revision；需要修正 Manifest 时必须创建新的 Snapshot，再通过显式同步为新 Snapshot 产生 Tree Link，原失败快照继续保留。
 
-原生 Plan 文件位于 Agent 私有目录时，不作为 Project 文件 Artifact；Native Plan Snapshot 本身作为 planning record，并通过 `source_trace_event_id` 和 `tree_revision_id` 与 Trace、Task Tree 相连。计划中声明的工程文件、接口和命令仍进入 Artifact Graph。
+原生 Plan 文件位于 Agent 私有目录时，不作为 Project 文件 Artifact；Native Plan Snapshot 本身作为 planning record，并通过 `source_trace_event_id`、Native Plan Tree Link 和 `tree_revision_id` 与 Trace、Task Tree 相连。计划中声明的工程文件、接口和命令仍进入 Artifact Graph。
 
 ## 7. 失败恢复与显式同步
 
