@@ -29,6 +29,7 @@ import { TaskTreeDraftService } from "./task-tree-draft-service.js";
 import { TaskTreeValidationService } from "./task-tree-validation-service.js";
 import { TaskTreeApprovalService } from "./task-tree-approval-service.js";
 import { NativePlanBindingService } from "./native-plan-binding-service.js";
+import { ExecutionSchedulerService } from "./execution-scheduler-service.js";
 
 export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
   const database = new RuntimeDatabase(path.join(resolveDataHome(environment), "runtime.db"));
@@ -62,6 +63,7 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
     new JevEvaluationProvider(jevConfiguration),
   );
   const freshness = new VerificationFreshnessService(database);
+  const scheduler = new ExecutionSchedulerService(database);
   return {
     database,
     projects,
@@ -70,6 +72,7 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
     taskTreeValidation: new TaskTreeValidationService(database, taskTrees),
     taskTreeApprovals,
     nativePlans,
+    scheduler,
     affiliations,
     workflows,
     executions: new NodeExecutionService(database),

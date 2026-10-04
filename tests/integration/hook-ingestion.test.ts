@@ -45,6 +45,20 @@ async function activeTree(directory: string, database: RuntimeDatabase) {
   return { project, tree, nodeId, nodeRevisionId };
 }
 
+function setProfile(
+  database: RuntimeDatabase,
+  projectId: string,
+  sessionId: string,
+  profile: "conversation" | "direct_coding" | "structured_coding",
+) {
+  database.run(`
+    INSERT INTO runtime_profile_states (
+      project_id, session_id, profile, reason_code, updated_at
+    ) VALUES (?, ?, ?, 'test', 'now')
+    ON CONFLICT(project_id, session_id) DO UPDATE SET profile = excluded.profile, updated_at = excluded.updated_at
+  `, projectId, sessionId, profile);
+}
+
 async function nativePlanTree(directory: string, database: RuntimeDatabase) {
   const identity = new ProjectIdentityService(database);
   const project = await identity.resolve(directory, "persist");
@@ -432,9 +446,10 @@ describe("Claude hook ingestion", () => {
     database.close();
   });
 
-  it("blocks a project mutation while an active Task Tree is still awaiting confirmation", async () => {
+  it("blocks only structured project mutation before native Plan approval", async () => {
     const { directory, database, service } = await fixture();
-    await activeTree(directory, database);
+    const { project } = await activeTree(directory, database);
+    setProfile(database, project.projectId, "s1", "structured_coding");
     const event = mapClaudeHook({
       hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "u1",
       tool_input: { file_path: path.join(directory, "a.ts") },
@@ -444,9 +459,42 @@ describe("Claude hook ingestion", () => {
       recorded: true,
       violation: true,
       blocked: true,
-      directive: { kind: "deny", reason: expect.stringContaining("active Task Tree") },
+      directive: { kind: "deny", reason: expect.stringContaining("harness_prepare_task_tree_approval") },
     });
     expect(await service.ingest(event)).toMatchObject({ recorded: false, reason: "duplicate", directive: { kind: "deny" } });
+    database.close();
+  });
+
+  it.each(["conversation", "direct_coding"] as const)(
+    "allows %s project mutation even when a Task Tree exists",
+    async (profile) => {
+      const { directory, database, service } = await fixture();
+      const { project } = await activeTree(directory, database);
+      setProfile(database, project.projectId, "s1", profile);
+      expect(await service.ingest(mapClaudeHook({
+        hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+        tool_name: "Write", tool_use_id: `write-${profile}`,
+        tool_input: { file_path: path.join(directory, "a.ts") },
+      }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+      database.close();
+    },
+  );
+
+  it("keeps planning, questions, runtime tools, and reads available before approval", async () => {
+    const { directory, database, service } = await fixture();
+    const { project } = await activeTree(directory, database);
+    setProfile(database, project.projectId, "s1", "structured_coding");
+    for (const [toolName, toolInput] of [
+      ["AskUserQuestion", { questions: [] }],
+      ["EnterPlanMode", {}],
+      ["Read", { file_path: path.join(directory, "README.md") }],
+      ["mcp__agent-harness__harness_get_runtime_state", { cwd: directory }],
+    ] as const) {
+      expect(await service.ingest(mapClaudeHook({
+        hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+        tool_name: toolName, tool_use_id: `safe-${toolName}`, tool_input: toolInput,
+      }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    }
     database.close();
   });
 
@@ -491,6 +539,57 @@ describe("Claude hook ingestion", () => {
     expect(database.get<{ stage: string }>("SELECT stage FROM workflow_states WHERE tree_id = ?", native.revision.treeId))
       .toEqual({ stage: "skeleton_pass" });
     expect(database.all("SELECT id FROM native_plan_approval_events")).toHaveLength(1);
+    database.close();
+  });
+
+  it("requires a scheduled active Attempt after approval and binds allowed mutation to that node", async () => {
+    const { directory, database } = await fixture();
+    const native = await nativePlanTree(directory, database);
+    setProfile(database, native.project.projectId, "s1", "structured_coding");
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-for-attempt", tool_input: { plan: native.approval.canonicalBlock },
+    }));
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-for-attempt", tool_input: {}, tool_response: { approved: true },
+    }));
+
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "Write", tool_use_id: "write-without-attempt",
+      tool_input: { file_path: path.join(directory, "canvas.ts") },
+    }))).toMatchObject({
+      recorded: true, violation: true, blocked: true,
+      directive: { kind: "deny", reason: expect.stringContaining("harness_get_next_executable_node") },
+    });
+
+    const nodeRevisionId = database.get<{ id: string }>(`
+      SELECT id FROM task_node_revisions WHERE tree_revision_id = ? AND node_id = 'canvas'
+    `, native.revision.revisionId)!.id;
+    database.run(`
+      INSERT INTO execution_attempts (
+        id, project_id, tree_id, task_node_id, task_node_revision_id,
+        attempt_number, status, started_at
+      ) VALUES ('canvas-attempt', ?, ?, 'canvas', ?, 1, 'running', 'now')
+    `, native.project.projectId, native.revision.treeId, nodeRevisionId);
+    const allowed = await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "Write", tool_use_id: "write-with-attempt",
+      tool_input: { file_path: path.join(directory, "canvas.ts") },
+    }));
+    expect(allowed).toMatchObject({ recorded: true, violation: false, blocked: false });
+    if (!allowed.recorded) throw new Error("allowed mutation was not recorded");
+    expect(database.get<{ node_id: string }>(
+      "SELECT node_id FROM trace_events WHERE id = ?", allowed.eventId,
+    )).toEqual({ node_id: "canvas" });
+
+    setProfile(database, native.project.projectId, "s1", "direct_coding");
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "Write", tool_use_id: "explicit-direct",
+      tool_input: { file_path: path.join(directory, "direct.ts") },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
     database.close();
   });
 

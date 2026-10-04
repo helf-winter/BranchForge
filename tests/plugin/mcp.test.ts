@@ -50,6 +50,7 @@ describe("Harness MCP binding", () => {
       "harness_preview_task_node_replacement", "harness_confirm_task_node_replacement",
       "harness_execute_task_node_replacement", "harness_recover_task_node_replacement",
       "harness_get_task_node_replacements", "harness_get_task_node_replacement_detail",
+      "harness_get_next_executable_node",
       "harness_get_project_identity", "harness_get_project_clones", "harness_get_project_clone_detail",
       "harness_register_plugin_revision", "harness_reconcile_plugins", "harness_get_plugins", "harness_get_plugin_detail",
       "harness_preview_plugin_replacement", "harness_execute_plugin_replacement", "harness_recover_plugin_replacement",
@@ -72,6 +73,9 @@ describe("Harness MCP binding", () => {
     expect(tools.find((tool) => tool.name === "harness_prepare_task_tree_approval")?.inputSchema).toMatchObject({
       required: expect.arrayContaining(["treeId", "treeRevisionId", "readinessResultId", "sourceUserMessageTraceEventId"]),
       properties: expect.not.objectContaining({ sessionId: expect.anything() }),
+    });
+    expect(tools.find((tool) => tool.name === "harness_get_next_executable_node")?.inputSchema).toMatchObject({
+      required: expect.arrayContaining(["treeId"]), properties: { treeId: { type: "string" } },
     });
     expect(tools.find((tool) => tool.name === "harness_scan_plan_readiness")?.inputSchema).toMatchObject({
       properties: { scopeRootNodeId: { type: "string" } },
@@ -274,7 +278,9 @@ describe("Harness MCP binding", () => {
       name: "harness_propose_task_affiliation",
       arguments: { cwd: project, requestTitle: "Build editor", recommendation: "new_tree" },
     }));
-    const identity = parse(await client.callTool({ name: "harness_get_project_identity", arguments: { cwd: project } }));
+    const identity = parse(await client.callTool({
+      name: "harness_get_project_identity", arguments: { cwd: project },
+    })) as { projectId: string };
     const database = new RuntimeDatabase(path.join(dataHome, "runtime.db"));
     const addAnswer = (id: string, treeId: string | null = null) => database.run(`
       INSERT INTO trace_events (

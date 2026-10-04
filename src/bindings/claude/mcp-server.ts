@@ -922,6 +922,13 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
     (await existingProject(cwd)).projectId, replacementId,
   )));
 
+  server.registerTool("harness_get_next_executable_node", {
+    description: "Project the one deterministic Task Node eligible to execute next; this does not start an Attempt or change lifecycle state.",
+    inputSchema: { cwd: cwdSchema, treeId: z.string().min(1) },
+  }, ({ cwd, treeId }) => guarded(async () => runtime.scheduler.next({
+    projectId: (await existingProject(cwd)).projectId, treeId,
+  })));
+
   server.registerTool("harness_start_node_attempt", {
     description: "Start an evidence-backed Execution Attempt for the current Task Node revision.",
     inputSchema: { cwd: cwdSchema, nodeId: z.string().min(1), expectedTreeRevisionId: z.string().min(1) },

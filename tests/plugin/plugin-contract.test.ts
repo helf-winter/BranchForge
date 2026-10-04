@@ -60,6 +60,16 @@ describe("Claude plugin contract", () => {
     expect(planning).toContain("Never ask for a second Harness confirmation");
   });
 
+  it("binds branch execution to the deterministic scheduler and Attempt lifecycle", async () => {
+    const source = await readFile(path.join(root, "skills", "branch-execution", "SKILL.md"), "utf8");
+    expect(source).toContain("harness_get_next_executable_node");
+    expect(source).toContain("harness_start_node_attempt");
+    expect(source).toContain("harness_begin_node_verification");
+    expect(source).toContain("harness_attach_attempt_evidence");
+    expect(source).toContain("harness_evaluate_node_attempt");
+    expect(source).toContain("Never invent a cross-branch order");
+  });
+
   it("runs the compiled CLI from a non-ASCII plugin path", () => {
     const result = spawnSync(process.execPath, [path.join(root, "runtime", "cli.mjs"), "doctor", "--json"], { encoding: "utf8" });
     expect(result.status, result.stderr).toBe(0);

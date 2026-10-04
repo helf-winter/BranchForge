@@ -14,6 +14,12 @@ interface WorkflowContext {
   tree_id: string;
   stage: string;
   selected_node_id: string | null;
+  current_revision_id: string;
+}
+
+interface ActiveAttemptContext {
+  id: string;
+  task_node_id: string;
 }
 
 interface ArtifactProjection {
@@ -25,11 +31,17 @@ interface ArtifactProjection {
 const mutationTools = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 const mutationLifecycleEvents = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure"]);
 const executableStages = new Set(["skeleton_pass", "skeleton_gate", "branch_implementation", "branch_verification", "root_verification", "final_report"]);
-const unconfirmedMutationReason = [
-  "Agent Harness blocked this project mutation because an active Task Tree is still awaiting executable-scope confirmation.",
+const missingNativeApprovalReason = [
+  "This structured-coding mutation has no consumed native Plan approval for the active Task Tree revision.",
   "Do not retry the mutation.",
-  "Continue its confirmation workflow, or honor an explicit user request to leave Task Tree planning before executing directly.",
-  "Do not suggest shell escapes or other ways to bypass Harness.",
+  "Validate the current revision, call harness_prepare_task_tree_approval, place its canonical block unchanged in the native Plan, and obtain native Plan approval.",
+  "If the user explicitly wants this change outside the workflow, record a direct-execution affiliation instead.",
+].join(" ");
+const missingActiveAttemptReason = [
+  "This approved structured-coding mutation is not bound to an active Task Node Attempt.",
+  "Do not retry the mutation.",
+  "Call harness_get_next_executable_node, then harness_start_node_attempt for that exact revision before changing project files.",
+  "If the user explicitly wants this change outside the workflow, record a direct-execution affiliation instead.",
 ].join(" ");
 export type HookDirective =
   | { kind: "deny"; reason: string }
@@ -79,8 +91,9 @@ export class HookIngestionService {
     let project = await this.projects.resolve(event.cwd, "inspect");
     let workflow = project.status === "same_project"
       ? this.database.get<WorkflowContext>(`
-          SELECT w.tree_id, w.stage, r.selected_node_id
+          SELECT w.tree_id, w.stage, r.selected_node_id, t.current_revision_id
           FROM workflow_states w
+          JOIN task_trees t ON t.id = w.tree_id AND t.project_id = w.project_id
           LEFT JOIN runtime_states r ON r.project_id = w.project_id
           WHERE w.project_id = ? AND w.active = 1
         `, project.projectId)
@@ -107,8 +120,9 @@ export class HookIngestionService {
       project = await this.projects.resolve(event.cwd, "inspect");
       workflow = project.status === "same_project"
         ? this.database.get<WorkflowContext>(`
-            SELECT w.tree_id, w.stage, r.selected_node_id
+            SELECT w.tree_id, w.stage, r.selected_node_id, t.current_revision_id
             FROM workflow_states w
+            JOIN task_trees t ON t.id = w.tree_id AND t.project_id = w.project_id
             LEFT JOIN runtime_states r ON r.project_id = w.project_id
             WHERE w.project_id = ? AND w.active = 1
           `, project.projectId)
@@ -120,16 +134,25 @@ export class HookIngestionService {
     if (project.status !== "same_project") project = await this.projects.resolve(event.cwd, "persist");
     if (project.status === "identity_conflict") return { recorded: false, reason: "inactive" };
     workflow ??= this.database.get<WorkflowContext>(`
-      SELECT w.tree_id, w.stage, r.selected_node_id
+      SELECT w.tree_id, w.stage, r.selected_node_id, t.current_revision_id
       FROM workflow_states w
+      JOIN task_trees t ON t.id = w.tree_id AND t.project_id = w.project_id
       LEFT JOIN runtime_states r ON r.project_id = w.project_id
       WHERE w.project_id = ? AND w.active = 1
     `, project.projectId);
 
-    const violationReason = event.eventName === "PreToolUse" && mutation && workflow && !executableStages.has(workflow.stage)
-        ? "mutation_before_confirmed_executable_scope"
-        : undefined;
+    const activeAttempt = workflow
+      ? this.database.get<ActiveAttemptContext>(`
+          SELECT id, task_node_id FROM execution_attempts
+          WHERE project_id = ? AND tree_id = ? AND status IN ('running', 'verifying')
+          ORDER BY started_at DESC, id DESC LIMIT 1
+        `, project.projectId, workflow.tree_id)
+      : undefined;
+    const violationReason = event.eventName === "PreToolUse" && mutation
+      ? this.structuredMutationViolation(project.projectId, event.sessionId, workflow, activeAttempt)
+      : undefined;
     const violation = Boolean(violationReason);
+    const traceNodeId = activeAttempt?.task_node_id ?? workflow?.selected_node_id ?? null;
     const eventId = newId();
     const eventName = violation ? "workflow_violation" : event.eventName;
     const payload = redactSecrets({
@@ -153,7 +176,7 @@ export class HookIngestionService {
       this.database.run("INSERT INTO hook_receipts (idempotency_key, event_name, received_at) VALUES (?, ?, ?)", key, event.eventName, event.occurredAt);
       this.database.run(
         "INSERT INTO trace_events (id, project_id, tree_id, node_id, session_id, event_name, payload_json, execution_context_json, occurred_at, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        eventId, project.projectId, workflow?.tree_id ?? null, workflow?.selected_node_id ?? null, event.sessionId, eventName,
+        eventId, project.projectId, workflow?.tree_id ?? null, traceNodeId, event.sessionId, eventName,
         canonicalJson(payload), canonicalJson(executionContext), event.occurredAt, key,
       );
       if (event.eventName === "PostToolUse" || event.eventName === "PostToolUseFailure") {
@@ -164,8 +187,8 @@ export class HookIngestionService {
             canonicalJson({ ...(payload as Record<string, unknown>), artifactRefs: [artifact.artifactId] }),
             eventId,
           );
-          if (event.eventName === "PostToolUse" && artifact.kind === "file" && this.isMutation(event) && workflow?.tree_id && workflow.selected_node_id) {
-            this.recordAutomaticDrift(project.projectId, workflow.tree_id, workflow.selected_node_id, eventId, artifact);
+          if (event.eventName === "PostToolUse" && artifact.kind === "file" && this.isMutation(event) && workflow?.tree_id && traceNodeId) {
+            this.recordAutomaticDrift(project.projectId, workflow.tree_id, traceNodeId, eventId, artifact);
           }
           if (event.eventName === "PostToolUse" && this.isMutation(event) && workflow?.tree_id) {
             this.freshness.invalidateMutationWithinTransaction({
@@ -173,7 +196,7 @@ export class HookIngestionService {
               treeId: workflow.tree_id,
               sourceTraceEventId: eventId,
               artifactId: artifact.artifactId,
-              ...(workflow.selected_node_id ? { fallbackNodeId: workflow.selected_node_id } : {}),
+              ...(traceNodeId ? { fallbackNodeId: traceNodeId } : {}),
             });
           }
         }
@@ -231,7 +254,12 @@ export class HookIngestionService {
         eventId,
         violation: true,
         blocked: true,
-        directive: { kind: "deny", reason: unconfirmedMutationReason },
+        directive: {
+          kind: "deny",
+          reason: violationReason === "structured_mutation_without_active_attempt"
+            ? missingActiveAttemptReason
+            : missingNativeApprovalReason,
+        },
       };
     }
     return {
@@ -269,8 +297,11 @@ export class HookIngestionService {
     if (row?.event_name !== "workflow_violation") return undefined;
     try {
       const payload = JSON.parse(row.payload_json) as { reason?: unknown };
-      if (payload.reason === "mutation_before_confirmed_executable_scope") {
-        return { kind: "deny", reason: unconfirmedMutationReason };
+      if (payload.reason === "structured_mutation_before_native_approval") {
+        return { kind: "deny", reason: missingNativeApprovalReason };
+      }
+      if (payload.reason === "structured_mutation_without_active_attempt") {
+        return { kind: "deny", reason: missingActiveAttemptReason };
       }
     } catch {
       // A malformed historical payload must not change ordinary duplicate handling.
@@ -293,6 +324,34 @@ export class HookIngestionService {
       if (target && this.isProjectPath(event.cwd, target)) return true;
     }
     return false;
+  }
+
+  private structuredMutationViolation(
+    projectId: string,
+    sessionId: string,
+    workflow: WorkflowContext | undefined,
+    activeAttempt: ActiveAttemptContext | undefined,
+  ): "structured_mutation_before_native_approval" | "structured_mutation_without_active_attempt" | undefined {
+    try {
+      const profile = this.database.get<{ profile: string }>(`
+        SELECT profile FROM runtime_profile_states WHERE project_id = ? AND session_id = ?
+      `, projectId, sessionId)?.profile;
+      if (profile !== "structured_coding") return undefined;
+      if (!workflow) return "structured_mutation_before_native_approval";
+      const approval = this.database.get<{ approval_ref: string }>(`
+        SELECT approval_ref FROM task_tree_approval_references
+        WHERE project_id = ? AND session_id = ? AND tree_id = ? AND tree_revision_id = ? AND status = 'consumed'
+        LIMIT 1
+      `, projectId, sessionId, workflow.tree_id, workflow.current_revision_id);
+      if (!approval) return "structured_mutation_before_native_approval";
+      if (executableStages.has(workflow.stage) && !activeAttempt) {
+        return "structured_mutation_without_active_attempt";
+      }
+      return undefined;
+    } catch {
+      // Runtime projection failures must not globally terminate the native Agent.
+      return undefined;
+    }
   }
 
   private isProjectPath(cwd: string, candidate: string): boolean {
