@@ -21,6 +21,9 @@ import { SkeletonGateService } from "./skeleton-gate-service.js";
 import { WorkflowPhaseService } from "./workflow-phase-service.js";
 import { FinalReportService } from "./final-report-service.js";
 import { VerificationFreshnessService } from "./verification-freshness-service.js";
+import { resolveJevRequestRoutingConfiguration } from "../domain/request-routing.js";
+import { JevRequestRouter } from "../bindings/typesafe/jev-request-router.js";
+import { RequestRoutingService } from "./request-routing-service.js";
 
 export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
   const database = new RuntimeDatabase(path.join(resolveDataHome(environment), "runtime.db"));
@@ -31,6 +34,7 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
   const replacements = new ReplacementService(database);
   const plugins = new PluginCompositionService(database);
   const jevConfiguration = resolveJevConfiguration(environment);
+  const requestRoutingConfiguration = resolveJevRequestRoutingConfiguration(environment);
   const semanticEvaluations = new SemanticEvaluationService(
     database,
     jevConfiguration,
@@ -46,6 +50,11 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
     executions: new NodeExecutionService(database),
     evaluations: new EvaluationService(database, failures, evolution, { semanticEvaluationRequired: jevConfiguration.enabled }),
     semanticEvaluations,
+    requestRouting: new RequestRoutingService(
+      database,
+      requestRoutingConfiguration,
+      new JevRequestRouter(requestRoutingConfiguration),
+    ),
     skeletonGates: new SkeletonGateService(database),
     workflowPhases: new WorkflowPhaseService(database),
     finalReports: new FinalReportService(database),
