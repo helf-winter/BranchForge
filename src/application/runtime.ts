@@ -28,6 +28,7 @@ import { RuntimeProfileService } from "./runtime-profile-service.js";
 import { TaskTreeDraftService } from "./task-tree-draft-service.js";
 import { TaskTreeValidationService } from "./task-tree-validation-service.js";
 import { TaskTreeApprovalService } from "./task-tree-approval-service.js";
+import { NativePlanBindingService } from "./native-plan-binding-service.js";
 
 export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
   const database = new RuntimeDatabase(path.join(resolveDataHome(environment), "runtime.db"));
@@ -52,6 +53,9 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
   );
   const affiliations = new TaskAffiliationService(database, runtimeProfiles);
   const taskTrees = new TaskTreeService(database);
+  const workflows = new WorkflowService(database);
+  const taskTreeApprovals = new TaskTreeApprovalService(database, taskTrees);
+  const nativePlans = new NativePlanBindingService(database, workflows);
   const semanticEvaluations = new SemanticEvaluationService(
     database,
     jevConfiguration,
@@ -64,9 +68,10 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
     taskTrees,
     taskTreeDrafts: new TaskTreeDraftService(database, taskTrees),
     taskTreeValidation: new TaskTreeValidationService(database, taskTrees),
-    taskTreeApprovals: new TaskTreeApprovalService(database, taskTrees),
+    taskTreeApprovals,
+    nativePlans,
     affiliations,
-    workflows: new WorkflowService(database),
+    workflows,
     executions: new NodeExecutionService(database),
     evaluations: new EvaluationService(database, failures, evolution, { semanticEvaluationRequired: jevConfiguration.enabled }),
     semanticEvaluations,
@@ -83,7 +88,7 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
     drifts,
     actions: new RuntimeActionService(database, drifts),
     queries: new RuntimeQueryService(database, { semanticEvaluation: semanticEvaluations.configuration() }),
-    hooks: new HookIngestionService(database, projects, drifts, freshness, runtimeProfiles),
+    hooks: new HookIngestionService(database, projects, drifts, freshness, runtimeProfiles, nativePlans),
     close: () => database.close(),
   };
 }

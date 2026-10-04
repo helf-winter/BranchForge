@@ -11,6 +11,11 @@ import { RuntimeProfileService } from "../../src/application/runtime-profile-ser
 import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
 import { resolveJevRequestRoutingConfiguration } from "../../src/domain/request-routing.js";
 import { RuntimeDatabase } from "../../src/storage/database.js";
+import { NativePlanBindingService } from "../../src/application/native-plan-binding-service.js";
+import { TaskTreeApprovalService } from "../../src/application/task-tree-approval-service.js";
+import { TaskTreeValidationService } from "../../src/application/task-tree-validation-service.js";
+import { WorkflowService } from "../../src/application/workflow-service.js";
+import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
 
 const dirs: string[] = [];
 const databases: RuntimeDatabase[] = [];
@@ -38,6 +43,48 @@ async function activeTree(directory: string, database: RuntimeDatabase) {
     `attempt-${nodeId}`, project.projectId, tree.treeId, nodeId, nodeRevisionId,
   );
   return { project, tree, nodeId, nodeRevisionId };
+}
+
+async function nativePlanTree(directory: string, database: RuntimeDatabase) {
+  const identity = new ProjectIdentityService(database);
+  const project = await identity.resolve(directory, "persist");
+  const trees = new TaskTreeService(database);
+  const root = await trees.createTaskRoot({ projectId: project.projectId, title: "Editor" });
+  const document: TaskTreeDocument = {
+    planningVersion: 1,
+    planningContext: {
+      goal: "Build editor", scopeBoundaries: ["browser"], exclusions: ["server"],
+      unresolvedQuestions: [], unresolvedDecisions: [], plannedEffects: [],
+    },
+    nodes: [
+      { id: "root", parentId: null, title: "Editor", children: ["canvas"] },
+      {
+        id: "canvas", parentId: "root", title: "Canvas", children: [], objectives: ["Render beads"],
+        expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["test passes"], unresolvedQuestions: [],
+        unresolvedDecisions: [], dependencies: [], requiredEvidence: [{ key: "test", description: "Canvas test" }],
+        executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
+      },
+    ],
+    relations: [], artifacts: [],
+    skeletonCriteria: [{
+      id: "canvas-skeleton", branchNodeId: "canvas", expectedArtifacts: ["canvas.ts"],
+      requiredContracts: ["canvas-api"], verificationCommands: ["npm test"], readinessConditions: ["module imports"],
+    }],
+  };
+  const revision = trees.saveDraftRevision({
+    projectId: project.projectId, treeId: root.treeId, baseRevisionId: root.revisionId, document,
+  });
+  const readiness = new TaskTreeValidationService(database, trees).validate({
+    projectId: project.projectId, treeId: revision.treeId, treeRevisionId: revision.revisionId,
+  });
+  const approval = new TaskTreeApprovalService(database, trees).prepare({
+    projectId: project.projectId, sessionId: "s1", treeId: revision.treeId,
+    treeRevisionId: revision.revisionId, readinessResultId: readiness.resultId,
+  });
+  const workflows = new WorkflowService(database);
+  const binding = new NativePlanBindingService(database, workflows);
+  const service = new HookIngestionService(database, identity, undefined, undefined, undefined, binding);
+  return { project, trees, revision, document, approval, service };
 }
 
 function linkPlannedFile(database: RuntimeDatabase, input: {
@@ -403,7 +450,7 @@ describe("Claude hook ingestion", () => {
     database.close();
   });
 
-  it("blocks Claude native Plan Mode from bypassing Task Tree planning", async () => {
+  it("keeps Claude native Plan Mode available while Task Tree planning is active", async () => {
     const { directory, database, service } = await fixture();
     await activeTree(directory, database);
     const result = await service.ingest(mapClaudeHook({
@@ -411,18 +458,10 @@ describe("Claude hook ingestion", () => {
       tool_name: "EnterPlanMode", tool_use_id: "plan-mode", tool_input: {},
     }));
 
-    expect(result).toMatchObject({
-      recorded: true,
-      violation: true,
-      blocked: true,
-      directive: {
-        kind: "deny",
-        reason: expect.stringContaining("agent-harness:task-tree-planning"),
-      },
-    });
-    expect(JSON.parse(database.get<{ payload_json: string }>(
-      "SELECT payload_json FROM trace_events WHERE event_name = 'workflow_violation'",
-    )!.payload_json)).toMatchObject({ reason: "native_plan_mode_bypasses_task_tree" });
+    expect(result).toMatchObject({ recorded: true, violation: false, blocked: false });
+    expect(database.get<{ event_name: string }>(
+      "SELECT event_name FROM trace_events WHERE id = ?", result.recorded ? result.eventId : "",
+    )).toEqual({ event_name: "PreToolUse" });
     database.close();
   });
 
@@ -434,6 +473,70 @@ describe("Claude hook ingestion", () => {
     }))).toEqual({ recorded: false, reason: "inactive" });
     expect(database.all("SELECT id FROM projects")).toEqual([]);
     database.close();
+  });
+
+  it("binds successful ExitPlanMode hooks to the exact prepared Task Tree revision once", async () => {
+    const { directory, database } = await fixture();
+    const native = await nativePlanTree(directory, database);
+    const pre = mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-approved", tool_input: { plan: native.approval.canonicalBlock },
+    });
+    expect(await native.service.ingest(pre)).toMatchObject({ recorded: true, violation: false, blocked: false });
+    expect(await native.service.ingest(pre)).toMatchObject({ recorded: false, reason: "duplicate" });
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-approved", tool_input: {}, tool_response: { approved: true },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    expect(database.get<{ stage: string }>("SELECT stage FROM workflow_states WHERE tree_id = ?", native.revision.treeId))
+      .toEqual({ stage: "skeleton_pass" });
+    expect(database.all("SELECT id FROM native_plan_approval_events")).toHaveLength(1);
+    database.close();
+  });
+
+  it("records failed ExitPlanMode as rejection without activating execution", async () => {
+    const { directory, database } = await fixture();
+    const native = await nativePlanTree(directory, database);
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-rejected", tool_input: { plan: native.approval.canonicalBlock },
+    }));
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUseFailure", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-rejected", tool_input: {}, tool_response: { rejected: true },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM task_tree_approval_references WHERE approval_ref = ?", native.approval.approvalRef,
+    )).toEqual({ status: "rejected" });
+    expect(database.get<{ stage: string }>("SELECT stage FROM workflow_states WHERE tree_id = ?", native.revision.treeId))
+      .toEqual({ stage: "branch_confirmation" });
+    database.close();
+  });
+
+  it("denies malformed or stale canonical blocks with a recoverable native Plan action", async () => {
+    const malformedFixture = await fixture();
+    const malformed = await nativePlanTree(malformedFixture.directory, malformedFixture.database);
+    expect(await malformed.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: malformedFixture.directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-malformed",
+      tool_input: { plan: malformed.approval.canonicalBlock.replace("Canvas", "Changed Canvas") },
+    }))).toMatchObject({
+      recorded: true, violation: true, blocked: true,
+      directive: { kind: "deny", reason: expect.stringContaining("prepare a new approval block") },
+    });
+    malformedFixture.database.close();
+
+    const staleFixture = await fixture();
+    const stale = await nativePlanTree(staleFixture.directory, staleFixture.database);
+    stale.trees.saveDraftRevision({
+      projectId: stale.project.projectId, treeId: stale.revision.treeId,
+      baseRevisionId: stale.revision.revisionId, document: stale.document,
+    });
+    expect(await stale.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: staleFixture.directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-stale", tool_input: { plan: stale.approval.canonicalBlock },
+    }))).toMatchObject({ recorded: true, violation: true, blocked: true });
+    staleFixture.database.close();
   });
 
   it("does not treat project-external planning files or read-only tools as project mutations", async () => {

@@ -8,6 +8,7 @@ import { PlanDriftService } from "./plan-drift-service.js";
 import type { ProjectIdentityService } from "./project-identity-service.js";
 import { VerificationFreshnessService } from "./verification-freshness-service.js";
 import type { RuntimeProfileDecisionView, RuntimeProfileService } from "./runtime-profile-service.js";
+import type { NativePlanBindingService } from "./native-plan-binding-service.js";
 
 interface WorkflowContext {
   tree_id: string;
@@ -30,11 +31,6 @@ const unconfirmedMutationReason = [
   "Continue its confirmation workflow, or honor an explicit user request to leave Task Tree planning before executing directly.",
   "Do not suggest shell escapes or other ways to bypass Harness.",
 ].join(" ");
-const nativePlanModeReason = [
-  "Agent Harness blocked Claude Plan Mode because Task Tree planning is the active project planning workflow.",
-  "Do not enter native Plan Mode.",
-  "Use the agent-harness:task-tree-planning Skill to resolve Task affiliation, refine the Task Tree, and request scoped confirmation.",
-].join(" ");
 export type HookDirective =
   | { kind: "deny"; reason: string }
   | { kind: "context"; context: string };
@@ -53,6 +49,7 @@ export class HookIngestionService {
     drifts?: PlanDriftService,
     freshness?: VerificationFreshnessService,
     private readonly profiles?: RuntimeProfileService,
+    private readonly nativePlans?: NativePlanBindingService,
   ) {
     this.drifts = drifts ?? new PlanDriftService(database);
     this.freshness = freshness ?? new VerificationFreshnessService(database);
@@ -89,7 +86,6 @@ export class HookIngestionService {
         `, project.projectId)
       : undefined;
     const mutation = mutationLifecycleEvents.has(event.eventName) && this.isMutation(event);
-    const nativePlanMode = event.eventName === "PreToolUse" && event.toolName === "EnterPlanMode";
     const pendingAffiliationAnswer = project.status === "same_project" && event.eventName === "UserPromptSubmit" && Boolean(
       this.database.get(`
         SELECT id FROM task_affiliation_decisions
@@ -130,9 +126,7 @@ export class HookIngestionService {
       WHERE w.project_id = ? AND w.active = 1
     `, project.projectId);
 
-    const violationReason = nativePlanMode && workflow
-      ? "native_plan_mode_bypasses_task_tree"
-      : event.eventName === "PreToolUse" && mutation && workflow && !executableStages.has(workflow.stage)
+    const violationReason = event.eventName === "PreToolUse" && mutation && workflow && !executableStages.has(workflow.stage)
         ? "mutation_before_confirmed_executable_scope"
         : undefined;
     const violation = Boolean(violationReason);
@@ -141,6 +135,7 @@ export class HookIngestionService {
     const payload = redactSecrets({
       sourceEvent: event.eventName,
       ...(event.toolName ? { toolName: event.toolName } : {}),
+      ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
       ...(event.toolInput ? { toolInput: event.toolInput } : {}),
       ...(event.toolResponse !== undefined ? { toolResponse: event.toolResponse } : {}),
       ...(event.prompt ? { prompt: event.prompt } : {}),
@@ -192,13 +187,51 @@ export class HookIngestionService {
         promptTraceEventId: eventId,
       });
     }
+    if (this.nativePlans && workflow && event.toolName === "ExitPlanMode" && event.toolUseId) {
+      try {
+        if (event.eventName === "PreToolUse") {
+          const planMarkdown = typeof event.toolInput?.plan === "string" ? event.toolInput.plan : "";
+          const planFilePath = typeof event.toolInput?.plan_file_path === "string" ? event.toolInput.plan_file_path : undefined;
+          this.nativePlans.preExit({
+            projectId: project.projectId,
+            sessionId: event.sessionId,
+            toolUseId: event.toolUseId,
+            planMarkdown,
+            ...(planFilePath ? { planFilePath } : {}),
+            traceEventId: eventId,
+          });
+        } else if (event.eventName === "PostToolUse" || event.eventName === "PostToolUseFailure") {
+          this.nativePlans.postExit({
+            projectId: project.projectId,
+            sessionId: event.sessionId,
+            toolUseId: event.toolUseId,
+            traceEventId: eventId,
+            outcome: event.eventName === "PostToolUse" ? "approved" : "rejected",
+          });
+        }
+      } catch (error) {
+        if (event.eventName === "PreToolUse") {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            recorded: true,
+            eventId,
+            violation: true,
+            blocked: true,
+            directive: {
+              kind: "deny",
+              reason: `Native Plan approval binding was rejected: ${message}. Revalidate the Task Tree and prepare a new approval block.`,
+            },
+          };
+        }
+      }
+    }
     if (violation) {
       return {
         recorded: true,
         eventId,
         violation: true,
         blocked: true,
-        directive: { kind: "deny", reason: nativePlanMode ? nativePlanModeReason : unconfirmedMutationReason },
+        directive: { kind: "deny", reason: unconfirmedMutationReason },
       };
     }
     return {
@@ -236,9 +269,6 @@ export class HookIngestionService {
     if (row?.event_name !== "workflow_violation") return undefined;
     try {
       const payload = JSON.parse(row.payload_json) as { reason?: unknown };
-      if (payload.reason === "native_plan_mode_bypasses_task_tree") {
-        return { kind: "deny", reason: nativePlanModeReason };
-      }
       if (payload.reason === "mutation_before_confirmed_executable_scope") {
         return { kind: "deny", reason: unconfirmedMutationReason };
       }
