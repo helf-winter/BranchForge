@@ -1,497 +1,436 @@
-# Native Plan → Task Tree Bridge 设计规格
+# Structured Coding Runtime 与 Native Plan Approval Binding 设计规格
 
-## 1. 目标
+## 1. 设计目标
 
-在不替代、不禁用 Claude Code 原生 Plan Mode 的前提下，让复杂 coding 请求稳定形成可持久化的 Task Tree，并在用户批准计划后按照 Task Node 推进代码执行。
+本设计解决一个已在真实测试中暴露的问题：用户提出完整工程需求时，Claude Code 能够进入原生 Plan Mode、讨论需求并输出文字计划，但 Agent Harness 没有稳定地产生 Task Tree，也无法保证后续代码执行与树节点关联。
 
-本设计遵循以下原则：
+目标不是替代 Claude Code 的规划能力，而是把原生规划过程沉淀为可持久化、可修订、可确认、可执行和可追溯的工程事实。
 
-- Agent Core 继续负责需求理解、项目探索、推理、提问、计划编写和代码实现；
-- Claude 原生 Plan Mode 继续作为需求讨论、计划展示和用户批准的交互载体；
-- Harness 采用 passive-first 策略，通过 Hooks 记录生命周期事实，通过 Skill 引导计划结构；
-- Task Tree 是原生计划的长期结构化投影，不是第二套独立规划，也不是事后从执行痕迹反推的结果；
-- Harness 只在“批准计划进入执行”“节点完成”“阶段推进”“高风险或重大 Drift”等必要边界实施确定性约束；
-- 小型、自包含请求和用户明确选择直接执行的请求不强制建立 Task Tree。
+同一个 Agent Runtime 必须支持三种工作方式：
 
-## 2. 非目标
+1. 普通问答：直接回答，不建立 Task Tree；
+2. 直接执行：处理小型、局部或用户明确要求跳过规划的编码操作；
+3. 结构化开发：对需要讨论、分解和分阶段实施的工程任务建立 Task Tree，并绑定原生 Plan 的用户确认结果。
 
-本设计不做以下事项：
+## 2. 核心设计原则
 
-- 不阻止 `EnterPlanMode`；
-- 不实现一套替代 Claude `AskUserQuestion`、计划文件或批准界面的 Harness UI；
-- 不要求另一次模型调用重新把原生计划拆成任务树；
-- 不把 Agent 的隐藏思维链保存为 Task Tree；
-- 不在每轮自然语言输入中注入完整 Runtime State；
-- 不因为当前 Project 没有 Task Tree 而阻止普通代码修改；
-- 不把任意简单请求升级为结构化工作流。
+### 2.1 一个 Agent Runtime，而非两套系统
 
-## 3. 核心关系
+Claude Code 的推理、提问、Plan Mode 和工具执行能力保持原生行为。Harness 以插件形式成为同一 Agent Runtime 的长期工程能力层，通过 Skills 引导行为，通过类型化工具维护事实，通过 Hooks 记录生命周期事件。
+
+不得形成“Claude 先执行，Harness 再从外部接管”的双系统结构。
+
+### 2.2 Skill 定义方法，Tool Provider 维护事实
+
+- Skill 规定何时应建立任务树、怎样拆解、怎样精炼、怎样执行；
+- Task Tree Tool Provider 负责创建、修订、校验和读取结构化任务树；
+- Hook 负责观察原生生命周期并完成确定性绑定；
+- Jev 只提供请求分类建议，不直接修改运行时事实。
+
+### 2.3 Task Tree 是一等领域对象
+
+Task Tree 不是从聊天文本或 Markdown 中事后猜测出来的副产品。规划 Agent 在讨论过程中使用类型化工具直接创建和修订 Task Tree，数据库中的具体 revision 是唯一事实源。
+
+### 2.4 Hook 被动优先，边界恢复
+
+Hooks 默认只记录和关联事件，不承担语义规划，不生成任务树，也不修复 Agent 输出。只有当结构化流程即将越过关键边界且缺少必要事实时，Hook 才返回可恢复的引导信息。
+
+## 3. 总体架构
 
 ```text
-用户自然语言输入
+User Prompt
     ↓
-Jev Request Route Decision
-    ├── direct_response → Claude 原生回答
-    ├── direct_execution → Claude 原生执行，Hooks 记录
-    └── task_tree_workflow
+UserPromptSubmit Hook
+    ↓
+Jev Request Router（建议性分类）
+    ↓
+Runtime Profile Resolver
+    ├── conversation
+    ├── direct_coding
+    └── structured_coding
             ↓
-Claude 原生 Plan Mode
-    ├── 项目探索
-    ├── 自然语言推理
-    ├── AskUserQuestion
-    └── 原生 Plan 文件
-    ↓
-Native Plan → Task Tree Bridge
-    ├── Hook 捕获计划生命周期
-    ├── Skill 引导 Task Tree Manifest
-    ├── 确定性解析与校验
-    └── 绑定原生批准结果
-    ↓
-Task Tree Runtime
-    ├── Skeleton Pass
-    ├── Skeleton Gate
-    ├── Branch Implementation
-    ├── Branch Verification
-    └── Root Verification / Final Report
-    ↓
-Claude 原生 Coding 能力完成当前 Task Node
+Task Planning Skill（规划方法）
+            ↓
+Task Tree Tool Provider（结构化事实）
+    ├── create draft
+    ├── atomic patch
+    ├── validate
+    └── prepare approval
+            ↓
+Task Tree Revision
+            ↓
+Claude Native Plan（展示与原生确认）
+            ↓
+Plan Approval Binding Hook（确定性绑定）
+            ↓
+Scheduler / Attempt / Trace / Artifact / Evaluation
 ```
 
-规划阶段以原生 Plan 为当前编辑源。原生计划获得用户批准后，对应的 Task Tree revision 成为执行阶段的结构化计划基准。后续范围变化通过新的原生计划快照或现有 Draft Change Set 机制产生新的 Task Tree revision，不覆盖旧事实。
+这里不存在额外的“规划 LLM”。同一个 Claude Code Agent 负责理解需求、向用户提问、构造 Task Tree 文档以及解释计划。Harness 提供结构化生命周期，而不重复推理。
 
-## 4. Jev 请求路由
+## 4. Jev Request Router
 
-Jev 请求路由是 Native Plan → Task Tree Bridge 的前置决策层，只负责判断一次自然语言输入应采用哪种执行形态，不负责需求拆解、Task Tree 生成、工具选择或代码执行。Jev 返回的结构化结果是 Runtime 可记录和组合的路由事实；Claude 仍负责理解用户、自然语言交互和后续智能行为。
+### 4.1 分类结果
 
-该设计采用 TypeSafe 官方的 [`Choice`](https://docs.typesafe.ai/primitives/choice) 和 [Confidence-Gated Routing](https://docs.typesafe.ai/confidence) 模式，但阈值和降级行为由 Harness 根据自身风险边界决定。
+Jev 对新用户请求返回以下三类之一：
 
-### 4.1 三分类路由
+| 分类 | 含义 | 默认 Profile |
+| --- | --- | --- |
+| `direct_response` | 问答、解释、只读查看，不产生项目资产变更 | `conversation` |
+| `direct_execution` | 边界清晰、影响局部、不值得建立任务树的编码操作 | `direct_coding` |
+| `task_tree_workflow` | 新项目、跨模块功能、架构调整或用户明确要求先规划确认 | `structured_coding` |
 
-路由使用一个 TypeSafe `Choice` 问题，选项固定为：
+当项目存在活动 Task Tree 时，Router 还应给出关系建议：
 
-- `direct_response`：解释、咨询、只读分析或无需修改项目的普通对话；
-- `direct_execution`：范围小、目标明确、自包含且无需结构化任务分解的项目操作；
-- `task_tree_workflow`：完整项目、多阶段或跨模块功能、需要需求澄清、计划确认和分阶段执行的工作。
+- `continue_existing_tree`
+- `change_existing_tree`
+- `create_new_tree`
+- `unclear`
 
-不得使用二分类把普通回答和小型代码修改合并为同一语义。路由结果不代替 Task affiliation；`task_tree_workflow` 仍需通过现有新建、归并、直接执行或暂停选择确定 Task Tree 归属。
+### 4.2 路由不拥有执行权
 
-当 Project 已有 active Workflow 时，同一次 Jev 调用增加一个独立 `Choice` 问题，判断本轮输入与当前工作是 `continue_current_workflow`、`change_current_workflow`、`new_request` 还是 `unclear`。代码组合两个独立答案：前两项进入现有执行或 User Change 流程，只有 `new_request` 才应用三分类结果启动新的归属判断。该关系判断不把 Task Tree 变成会话级状态。
+Jev 输出是建议证据，不是不可越过的授权系统。Runtime Profile Resolver 综合以下信息确定工作方式：
 
-### 4.2 确定性优先级
+1. 用户显式命令或明确自然语言要求；
+2. 当前项目是否存在活动 Task Tree；
+3. 当前是否处于已确认的结构化工作流；
+4. Jev 分类、置信度和理由；
+5. 确定性例外规则。
 
-以下输入不调用 Jev，也不由模型重新分类：
+用户明确说“直接执行，不建立任务树”时，应进入 `direct_coding`。用户明确要求“先讨论并确认规划”时，应进入 `structured_coding`。
 
-- Claude 原生命令和 Harness 显式命令；
-- 正在等待的 Runtime Confirmation 的合法回答；
-- 显式 `/taskroot` 等已经固定语义的 Harness 命令；
-- Runtime 已能根据 active Attempt、确认项或原生工具响应确定归属的事件。
+### 4.3 置信度和降级
 
-用户在确认流程中作出的显式选择始终覆盖 Jev。自然语言中的“直接回答”“直接执行”或“不建立任务树”由 Jev 分类，并由 Claude 在中低置信度时结合上下文理解；代码不得用零散关键词假装完成通用意图识别。Jev 不得覆盖 pending confirmation、活动节点或已经批准的 Workflow revision。
+- `confidence >= 0.80`：采用 Jev 建议；
+- `0.50 <= confidence < 0.80`：把建议交给 Agent 结合上下文判断；
+- `confidence < 0.50`：不依赖分类结果，由 Agent 原生判断；
+- Jev 超时、限流、鉴权失败或返回非法结构：记录失败并降级，不阻断用户请求。
 
-### 4.3 输入边界与隐私
+### 4.4 隐私边界
 
-Jev 只接收完成分类所需的有界状态：
+Router 默认只接收：用户当前请求、规范化项目标识、活动树摘要和有限的运行状态。不得上传项目源码、密钥、完整对话历史或工具输出。
 
-- 当前用户输入；
-- 当前 Project 是否存在 active Workflow、active Attempt 或待确认项；
-- active Task Tree 的标题和当前节点标题；
-- 最近一次路由决定的标识和类型；
-- 不含源码的短上下文摘要。
+## 5. Runtime Profile
 
-不得发送项目源码、文件内容、工具完整输出、密钥、环境变量、完整聊天历史或隐藏推理。路由使用独立配置 `HARNESS_JEV_ROUTING_ENABLED`，并复用只从运行环境读取的 `TYPESAFE_API_KEY`。Evidence 评估开关和请求路由开关必须相互独立。
+### 5.1 `conversation`
 
-底层 HTTP、认证、超时和响应校验由共享的 `TypeSafeSystemOneClient` 提供；Evidence 语义评估和请求路由分别由 `JevEvidenceEvaluator` 与 `JevRequestRouter` 使用，二者不得共享领域问题或阈值。
+- 保留 Claude 的正常问答与只读工具能力；
+- 不要求创建 Task Tree；
+- Hooks 仅记录必要的会话级事实。
 
-### 4.4 置信度与降级
+### 5.2 `direct_coding`
 
-默认路由置信度阈值为 `0.80`，并允许通过配置覆盖；稳定发布前必须使用标注过的真实请求集校准。处理规则为：
+- 允许 Agent 原生执行局部修改；
+- 不要求先创建 Task Tree；
+- 工具调用、文件变化和结果仍可写入 Trace；
+- 若执行过程中影响范围显著扩大，Agent 可建议切换为 `structured_coding`，但不得丢失当前上下文。
 
-- `confidence >= 0.80`：接受路由结果并形成 Runtime route decision；
-- `0.50 <= confidence < 0.80`：只把结果作为非强制建议交给 Claude，Claude 可结合上下文判断或询问用户，不推进 Task Tree 生命周期；
-- `confidence < 0.50`：忽略分类结果，使用 Claude 原生判断；
-- Provider 未启用、超时、限流、鉴权失败或响应非法：记录有界失败事实并立即降级到 Claude 原生判断，不阻断用户请求。
+### 5.3 `structured_coding`
 
-每次结果保存所用模型、choice、完整 probabilities、confidence、输入快照 hash、耗时、token usage 和错误码；不保存 API Key。相同输入快照和路由配置的 Hook 重放必须幂等。
+- 加载 Task Planning Skill；
+- 先确认任务归属，再进行问题驱动的局部精炼；
+- 使用 Task Tree Tool Provider 建立一等任务树；
+- 在用户通过原生 Plan 确认前，不开始计划中的项目修改；
+- 确认后由 Scheduler 按任务树推进并记录节点 Attempt。
 
-若当前输入尚未形成 Project，`direct_response` 不得仅为保存分类结果而创建 Project；结果只作为当前 Hook 的瞬时决定。已存在 Project 的请求，以及被接受为 `direct_execution` 或 `task_tree_workflow` 并按现有身份规则解析出 Project 的请求，才保存持久化路由事实。Provider 失败同理：有 Project 时写入有界失败事实，无 Project 时只返回瞬时原生降级结果。
+插件可以保持工具注册状态；Profile 决定哪些状态迁移当前合法。后续可在 Agent 平台支持时增加 capability snapshot，以减少无关工具对模型的可见噪声，但这不是首期正确性的前提。
 
-### 4.5 路由后的行为
+## 6. Structured Planning Lifecycle
 
-- `direct_response`：不创建 Task Tree，不注入 Runtime State，由 Claude 直接回答；仅在 Project 已存在时记录有界路由事实；
-- `direct_execution`：不创建 Task Tree，Claude 使用原生工具完成请求，Hooks 继续记录 Trace、Artifact 和风险事件；
-- `task_tree_workflow`：将请求标记为 `structured_candidate`，通过当前 `UserPromptSubmit` 的事件相关 `additionalContext` 引导 Claude 使用原生需求讨论、Plan Mode 和 `task-tree-planning` Skill。
+### 6.1 任务归属
 
-`task_tree_workflow` 的路由决定只是入口触发器，不能单独算作 Task Tree 已建立。只有 Native Plan Manifest 通过确定性校验、形成 Task Tree revision，并由用户的原生 Plan 批准绑定后，Workflow 才能进入 `skeleton_pass`。
+收到 `task_tree_workflow` 请求后，Agent 先读取当前项目候选树，并让用户确认：
 
-若高置信度 `task_tree_workflow` 已形成 `structured_candidate`，Claude 仍未建立有效 Task Tree 就尝试首次项目 mutation，Harness 在这一处返回可恢复的生命周期门禁和明确引导。用户可以通过可追踪的 `direct_execution` 选择退出结构化路径；Harness 不得要求通过外部终端绕过门禁。
+- 新建 Task Tree；
+- 归并到现有 Task Tree；
+- 修改现有 Task Tree；
+- 暂不进入结构化工作流。
 
-### 4.6 路由事实持久化
+该决定被持久化为 `affiliation_decision`，后续创建 Draft 时必须引用它。
 
-新增不可变 `request_route_decisions`，至少保存：
+### 6.2 问题驱动的局部精炼
 
-- `id`、`project_id`、`session_id` 和来源 `UserPromptSubmit` Trace；
-- `input_snapshot_hash` 和经过脱敏、有界化的 `input_snapshot_json`；
-- `route_choice`、`route_probabilities_json` 和 `route_confidence`；
-- 可选的 `relationship_choice`、`relationship_probabilities_json` 和 `relationship_confidence`；
-- `disposition`，取值为 `accepted`、`advisory` 或 `native_fallback`；
-- `provider`、请求模型、实际模型、耗时和 token usage；
-- 可选错误码和 `created_at`。
+Agent 使用原生对话与提问能力讨论影响最大的未决问题。每次得到会改变计划结构、节点契约或验收标准的答案后，Agent 应通过 Tool Provider 原子修订 Task Tree，而不是等到最后重新生成一份不相关的计划。
 
-记录必须 append-only。幂等键至少包含 Project、Session、User Prompt Trace、输入快照 hash、问题版本和模型配置；问题条件、阈值或模型变化必须产生新决定而不是覆盖旧事实。路由决定通过 Trace 与后续 Task affiliation、Native Plan Snapshot 或 direct execution 事件关联，但不伪装成 Task Tree Node。
+### 6.3 首次完整 Draft
 
-## 5. Claude Binding 生命周期
+信息足够时，同一个 Agent 一次性生成完整 `TaskTreeDocument` 并调用创建工具。该文档至少包含：
 
-### 5.1 进入 Plan Mode
+- Tree 目标、范围与非目标；
+- Skeleton 节点；
+- 功能分支与子节点；
+- 节点目标、输出、验收标准和完成证据；
+- Task Relation Edges；
+- Artifact Graph Draft；
+- 未决问题与决策；
+- 执行阶段和停止拆分理由。
 
-`PreToolUse(EnterPlanMode)` 和 `PostToolUse(EnterPlanMode)` 必须被允许并写入 Trace，不得返回 `deny`。
+### 6.4 局部修订
 
-`PostToolUse(EnterPlanMode)` 返回一次事件相关的 `additionalContext`，内容只说明：
+后续调整通过带前置 revision 的原子 patch 完成。不得以“最后写入者获胜”的方式静默覆盖并发变化。
 
-- 原生 Plan Mode 可以照常使用；
-- 若该工作属于复杂、多阶段、跨模块或用户明确要求结构化规划，应加载 `agent-harness:task-tree-planning`；
-- 最终 Plan 需要包含可持久化的 Task Tree Manifest；
-- 小型或明确直接执行的请求不需要建立任务树。
+### 6.5 准备确认
 
-该上下文只在进入 Plan Mode 时注入一次，不替代 Skill，不包含 Runtime State，不形成每轮固定 Prompt。
+当 Agent 认为规划可执行时：
 
-高置信度 `task_tree_workflow` 路由会在进入 Plan Mode 前形成 `structured_candidate`。当 Jev 未启用、失败或低置信度时，Agent 自主进入 Plan Mode 也会形成 `structured_candidate`，因此路由降级不会关闭现有桥接路径。用户通过 Task affiliation 明确选择 `direct_execution` 后，该会话转为直接执行并豁免 Task Tree；除此之外，原生计划获批后必须在首次项目 mutation 前形成有效 Task Tree revision。
+1. 调用校验工具；
+2. 修复结构性错误或继续向用户提问；
+3. 校验通过后调用 `prepare approval`；
+4. 把工具返回的 canonical Task Tree block 写入 Claude Native Plan；
+5. 由用户使用 Claude 原生确认界面批准或拒绝。
 
-### 5.2 规划与需求讨论
+## 7. Task Tree Tool Provider
 
-Agent 使用原生能力完成：
-
-- 读取和搜索项目；
-- 通过 `AskUserQuestion` 逐步澄清高影响问题；
-- 展示 Task Tree 的人类可读结构；
-- 根据用户回答修改原生 Plan；
-- 在适用时完成 Task affiliation 的新建、归并、直接执行或暂停选择。
-
-Hooks 被动记录 User Prompt、AskUserQuestion、计划文件写入和工具结果。Task Tree Skill 负责方法论，不接管原生交互界面。
-
-### 5.3 退出 Plan Mode
-
-Claude Code 的 `PreToolUse(ExitPlanMode)` 输入包含 `plan` 和 `planFilePath`。Binding 必须将其规范化为 Native Plan Snapshot，并执行以下流程：
-
-1. 计算规范化 Markdown 的内容哈希；
-2. 记录不可变计划快照和来源 Trace；
-3. 提取 `harness-task-tree` Manifest；
-4. 使用现有 Task Tree Validator、Leaf Task Contract、Artifact、Relation 和 Skeleton Acceptance Criteria 规则校验；
-5. 在已解决 Task affiliation 的前提下创建或更新 draft Task Tree revision；
-6. 将 snapshot、tree、revision 和 plan file path 建立稳定关联；
-7. 允许 Claude 继续显示原生计划批准界面。
-
-解析或校验失败不得破坏原生 Plan Mode。失败事实写入 Trace，并在工具结果旁通过 `additionalContext` 指导 Agent 修正 Manifest 或调用显式同步工具。
-
-### 5.4 用户批准计划
-
-`PostToolUse(ExitPlanMode)` 的 approved plan response 是原生批准事实。Binding 必须：
-
-1. 根据 plan hash 找到精确 Native Plan Snapshot；
-2. 记录 `native_plan_approved` Trace；
-3. 将批准绑定到精确 Task Tree revision，禁止批准旧 revision；
-4. 复用现有分支确认和 Workflow 创建逻辑；
-5. 将 Workflow 推进到 `skeleton_pass`；
-6. 通过一次 `additionalContext` 引导 `branch-execution` Skill 从当前可执行 Skeleton Node 开始。
-
-不得要求用户在批准原生 Plan 后再批准一套内容相同的 Harness 计划。原生批准必须成为 Task Tree revision 的确认来源。
-
-如果计划被拒绝、取消或修改，则保持 draft 状态；下一次 `ExitPlanMode` 形成新的 snapshot 和 revision。
-
-## 6. Task Tree Manifest
-
-原生 Plan 保持正常 Markdown 可读性，并在末尾包含一个标准 fenced block：
-
-````markdown
-```harness-task-tree
-{
-  "planningVersion": 1,
-  "planningContext": {
-    "goal": "实现拼豆图案设计网页",
-    "scopeBoundaries": ["浏览器端应用"],
-    "exclusions": ["服务端账号系统"],
-    "unresolvedQuestions": [],
-    "unresolvedDecisions": [],
-    "plannedEffects": []
-  },
-  "nodes": [
-    {
-      "id": "root",
-      "parentId": null,
-      "title": "实现拼豆图案设计网页",
-      "children": ["foundation", "canvas"]
-    },
-    {
-      "id": "foundation",
-      "parentId": "root",
-      "title": "建立工程骨架",
-      "children": [],
-      "objectives": ["建立可构建的 React/Vite 工程骨架"],
-      "expectedOutputs": ["package.json", "src/main.tsx"],
-      "acceptanceCriteria": ["npm run build 成功"],
-      "unresolvedQuestions": [],
-      "unresolvedDecisions": [],
-      "dependencies": [],
-      "requiredEvidence": [{"key": "build", "description": "构建成功 Trace"}],
-      "executionPhase": "skeleton",
-      "stopDecompositionReason": "该节点具有单一可验证工程输出"
-    },
-    {
-      "id": "canvas",
-      "parentId": "root",
-      "title": "实现画布功能",
-      "children": ["grid"]
-    },
-    {
-      "id": "grid",
-      "parentId": "canvas",
-      "title": "实现网格绘制",
-      "children": [],
-      "objectives": ["支持点击和拖动放置拼豆"],
-      "expectedOutputs": ["画布组件及交互测试"],
-      "acceptanceCriteria": ["桌面鼠标与移动端触控测试通过"],
-      "unresolvedQuestions": [],
-      "unresolvedDecisions": [],
-      "dependencies": ["foundation"],
-      "requiredEvidence": [{"key": "interaction-test", "description": "交互测试成功 Trace"}],
-      "executionPhase": "implementation",
-      "stopDecompositionReason": "该节点聚焦一种内聚交互能力"
-    }
-  ],
-  "relations": [
-    {
-      "fromNodeId": "grid",
-      "toNodeId": "foundation",
-      "kind": "depends_on",
-      "dependencyKind": "execution_order"
-    }
-  ],
-  "artifacts": [],
-  "skeletonCriteria": []
-}
-```
-````
-
-Manifest 使用现有 Task Tree Document 领域结构，不引入第二套任务模型。人类可读计划可以自由组织；只有 fenced block 采用稳定 JSON，以避免对自然语言 Markdown 做脆弱的语义猜测。
-
-Skill 必须指导 Agent 让人类可读树和 Manifest 语义一致。Runtime 只信任通过确定性 Validator 的 Manifest；不在 Hook 内调用 LLM 修复或补全 JSON。
-
-Manifest 至少包含：
-
-- 根目标和 `planningVersion`；
-- Task Node 父子关系；
-- 每个叶子的 objective、expected outputs、acceptance criteria、dependencies、completion evidence、execution phase 和 stop-decomposition reason；
-- Skeleton Node 与各顶层分支的 Skeleton Acceptance Criteria；
-- 计划态 Artifact、跨分支 Contract 和 Task Relation Edge；
-- 未决问题、未决决策和高风险 Effect。
-
-## 7. Native Plan 持久化
-
-新增不可变 `native_plan_snapshots` 记录，至少保存：
-
-- `id`；
-- `project_id`；
-- `session_id`；
-- `plan_file_path`；
-- `plan_hash`；
-- `plan_markdown`；
-- `manifest_json`；
-- `parse_status`；
-- `source_trace_event_id`；
-- `created_at`。
-
-新增不可变 `native_plan_tree_links`，用于保存 Snapshot 后续形成的结构化计划关联：
-
-- `id`；
-- `snapshot_id`；
-- `tree_id`；
-- `tree_revision_id`；
-- `source_trace_event_id`；
-- `created_at`。
-
-新增不可变 `native_plan_approval_events`，至少保存：
-
-- `id`；
-- `snapshot_id`；
-- `approved`；
-- `execution_policy`，取值为 `task_tree`、`direct_execution` 或 `sync_required`；
-- `approval_trace_event_id`；
-- `created_at`。
-
-同一 Project、Session 和 plan hash 的重复 Hook 必须幂等。Snapshot 内容不可更新；计划变化创建新 Snapshot。Tree Link 和 Approval Event 都不修改 Snapshot，只追加关联或批准事实。一个 Snapshot 至多关联一个 Task Tree revision；需要修正 Manifest 时必须创建新的 Snapshot，再通过显式同步为新 Snapshot 产生 Tree Link，原失败快照继续保留。
-
-原生 Plan 文件位于 Agent 私有目录时，不作为 Project 文件 Artifact；Native Plan Snapshot 本身作为 planning record，并通过 `source_trace_event_id`、Native Plan Tree Link 和 `tree_revision_id` 与 Trace、Task Tree 相连。计划中声明的工程文件、接口和命令仍进入 Artifact Graph。
-
-## 8. 失败恢复与显式同步
-
-提供 `harness_sync_native_plan` Runtime Tool 作为恢复入口，而不是默认主流程。它接收 snapshot ID 和修正后的 Task Tree Document，执行同一套确定性校验与 revision 写入。
-
-典型恢复场景：
-
-- 第三方模型没有生成 Manifest；
-- fenced block JSON 损坏；
-- Manifest 未通过 Leaf Task Contract；
-- Task affiliation 尚未解决；
-- plan hash 与待批准 snapshot 不一致；
-- 用户批准后，树写入因存储错误失败。
-
-恢复工具不得重新生成计划，不调用外部模型，不静默选择新建或归并。Agent 依据原生 Plan 生成修正结构，用户已有批准只对内容 hash 一致的计划有效。
-
-## 9. 按 Task Node 执行
-
-### 9.1 执行游标
-
-复用并强化现有 Runtime State：
-
-```text
-selected_tree_id
-selected_node_id
-active_branch_node_id
-workflow_stage
-workflow_revision
-```
-
-用户批准后，调度器按当前 Task Tree revision 计算第一个可执行 Skeleton Node。Agent 在节点内部继续自由推理、读写文件和运行命令；Harness 不规定具体编码步骤。
-
-### 9.2 节点循环
-
-```text
-查询当前可执行节点
-  ↓
-start execution attempt
-  ↓
-Agent 使用原生 Coding 能力完成节点
-  ↓
-Hooks 将工具调用和 Artifact 变化绑定到 active node
-  ↓
-提交节点所需 completion evidence
-  ↓
-Evaluation 判定 succeeded / failed / blocked
-  ↓
-Runtime 选择下一节点或推进阶段
-```
-
-节点成功不得由 Agent 仅凭自然语言声明。现有 Attempt、Evidence、Evaluation、Verification Freshness、Drift 和 Gate 机制继续作为事实依据。
-
-### 9.3 调度顺序
-
-调度必须保持既定策略：
-
-1. 在所有已确认范围内广度完成 Skeleton Node；
-2. Skeleton Gate 通过后，按顶层分支顺序选择一个分支；
-3. 在当前分支内深度执行 implementation leaf；
-4. 完成分支 verification；
-5. 进入下一分支；
-6. 全部分支完成后执行 root verification；
-7. 最终门禁通过后生成不可变 Final Report。
-
-### 9.4 必要的最小主动边界
-
-Harness 只在以下执行边界主动阻止不合法迁移：
-
-- 原生复杂计划已经批准，但尚无有效 Task Tree revision 时开始修改项目；
-- 已进入 Task Tree 执行阶段，但没有 active Task Node 时修改项目；
-- Skeleton Gate 未通过时跳入功能分支；
-- 当前节点缺少必需证据却尝试完成；
-- mutation 跨越未确认分支、破坏 Contract 或形成 blocking Drift；
-- 使用旧 plan hash、旧 tree revision 或旧 workflow revision 推进状态。
-
-这些门禁只约束生命周期边界，不限制 Agent 在合法节点内的规划、编码和工具选择。普通直接执行路径不使用这些门禁。
-
-高置信度 Jev 路由和 Agent 自主进入 Plan Mode 都可以形成 `structured_candidate`；只有用户留下可追踪的 `direct_execution` 选择时才豁免。Jev 解决工作流入口识别，Native Plan Bridge 解决 Task Tree 建立，active Attempt 门禁解决按节点执行，三者缺一不可。
-
-## 10. Hook Directive 调整
-
-Hook 输出需从当前仅支持 SessionStart context 扩展为事件相关 context：
+首期提供四个核心操作：
 
 ```ts
-type HookDirective =
-  | { kind: "deny"; eventName: "PreToolUse"; reason: string }
-  | { kind: "context"; eventName: HookEventName; context: string };
+harness_create_task_tree_draft({
+  cwd,
+  affiliationDecisionId,
+  expectedTreeRevisionId?,
+  document: TaskTreeDocument,
+  idempotencyKey,
+}): TaskTreeRevisionView
+
+harness_patch_task_tree({
+  cwd,
+  treeId,
+  expectedTreeRevisionId,
+  operations: TaskTreePatchOperation[],
+  idempotencyKey,
+}): TaskTreeRevisionView
+
+harness_validate_task_tree({
+  cwd,
+  treeId,
+  treeRevisionId,
+}): PlanReadinessView
+
+harness_prepare_task_tree_approval({
+  cwd,
+  treeId,
+  treeRevisionId,
+  readinessResultId,
+  sessionId,
+}): TaskTreeApprovalPreparation
 ```
 
-`hook-entry` 必须使用 directive 自带的 event name，而不是把全部 context 硬编码成 `SessionStart`。
+内部服务按职责拆分：
 
-关键事件行为：
+- `TaskTreeDraftService`：创建和原子修订；
+- `TaskTreeValidationService`：结构、叶子契约、关系和 readiness 校验；
+- `TaskTreeApprovalService`：冻结待确认 revision、生成展示块与一次性 approval reference。
 
-| 事件 | 行为 |
-| --- | --- |
-| SessionStart | 注入一次最小 passive-first 定位，不携带状态 |
-| UserPromptSubmit | 先处理确定性例外；其余输入调用 Jev，记录路由并按置信度返回事件相关引导或原生降级 |
-| Pre/Post EnterPlanMode | 允许、记录；Post 注入一次 Task Tree Skill 引导 |
-| Pre ExitPlanMode | 捕获 plan/path、创建 snapshot、解析并保存 draft revision |
-| Post ExitPlanMode | 绑定批准事实、确认 revision、进入 skeleton_pass |
-| Pre mutation | 仅校验已进入结构化工作流后的 active node 与阶段边界 |
-| Post mutation | 记录 Trace、Artifact、Drift、Verification Invalidation |
-| Stop | 若批准计划尚未同步，仅给出非错误恢复提示，不伪造完成 |
+所有写操作必须支持幂等键，并返回确定的 revision 标识。
 
-## 11. Skill 调整
+## 8. Native Plan Approval Binding
 
-### task-tree-planning
+### 8.1 Native Plan 的职责
 
-- 明确原生 Plan Mode 是首选交互载体，不得要求退出或替代；
-- 在进入 Plan Mode 后生成和维护人类可读计划与 `harness-task-tree` Manifest；
-- 使用原生 `AskUserQuestion` 做问题驱动的局部精炼；
-- 完成 Task affiliation，但不重复实现批准 UI；
-- 在 `ExitPlanMode` 前确保 Manifest 通过自检；
-- 解析失败时使用 `harness_sync_native_plan` 恢复。
+Claude Native Plan 负责：
 
-### branch-execution
+- 向用户展示可读实施计划；
+- 承载 Task Tree 的确定性摘要；
+- 提供 Claude 原生的批准、拒绝和修改交互。
 
-- 原生计划批准后查询 active node；
-- 为 active node 启动 Attempt；
-- 只在节点范围内执行，跨范围变化走 Drift；
-- 节点完成后提交证据并查询下一节点；
-- 不自行跳过 Skeleton Gate、Branch Gate 或 Root Gate。
+它不是 Task Tree 的事实源。
 
-## 12. 一致性和并发
+### 8.2 Canonical Task Tree Block
 
-- plan hash、tree revision、workflow revision 必须同时参与状态迁移校验；
-- 同一 Project 任意时刻最多一个 active Workflow；
-- 两个 Session 同时修改同一计划时，较旧 snapshot 的批准返回 revision conflict；
-- 原生计划被批准后又发生 scope change，必须生成新 snapshot 和新 Task Tree revision；
-- 用户拒绝计划不会删除 snapshot、Trace 或已有 draft revision；
-- Project Clone 可以复制已确认 Task Tree 和 planning provenance，但不能复制原 Session 的批准事实为目标 Project 的新批准。
+`prepare approval` 返回不可由模型自行拼造的 canonical block：
 
-## 13. 测试与验收
+```markdown
+<!-- agent-harness-task-tree:start approval_ref="<opaque-id>" -->
+## Task Tree
 
-### 自动化测试
+<由 Runtime 确定性渲染的树、Artifact 草案、关系和验收摘要>
+<!-- agent-harness-task-tree:end -->
+```
 
-1. Jev 把典型聊天、小型代码操作和完整项目请求分别路由为 `direct_response`、`direct_execution` 和 `task_tree_workflow`；
-2. 显式命令、待确认回答和确认流程中已经记录的用户选择不调用 Jev；
-3. 高、中、低置信度分别产生自动路由、建议和原生降级；Provider 的超时、限流、鉴权失败和非法响应不阻断 Claude；
-4. active Workflow 下的继续、范围变更和新请求通过独立关系问题进入正确路径；
-5. 路由快照不包含源码、密钥、完整历史或工具完整输出；无 Project 的普通回答不创建 Project，重复 Hook 保持结果幂等；
-6. `EnterPlanMode` 在无树、有 draft tree 和有 active workflow 时均不会因 Harness 被拒绝；
-7. `PostToolUse(EnterPlanMode)` 记录 Trace 并返回事件相关 Skill 引导；
-8. `PreToolUse(ExitPlanMode)` 从真实 Claude payload 读取 `plan` 和 `planFilePath`；
-9. 合法 Manifest 创建或更新 draft Task Tree revision；
-10. 缺失、损坏或不合法 Manifest 不破坏原生 Plan Mode，并产生可恢复失败事实；
-11. `PostToolUse(ExitPlanMode)` 只批准 plan hash 和 revision 精确匹配的树；
-12. 重复 Hook 保持 snapshot、revision 和 approval 幂等；
-13. 原生批准后不产生第二个内容重复的用户确认；
-14. 批准计划后选择第一个 Skeleton Node，并将后续工具事件绑定到该节点；
-15. 无 active node、越阶段、跨未确认分支和 stale revision 的 mutation 被拒绝；
-16. 节点内合法 mutation 正常放行；
-17. 小型直接执行请求不创建 snapshot/tree，mutation 正常记录和放行；
-18. 完整流程遵循 Skeleton breadth → Branch depth → Root verification；
-19. 插件安装包、缓存副本和全局安装后的真实 Claude 会话行为一致。
+Runtime 对完整 block 计算 hash，并把 `approval_ref`、`tree_revision_id`、`session_id`、`project_id`、block hash 和有效期一并保存。
 
-### 黑盒验收
+### 8.3 进入与退出 Plan Mode
 
-在空目录中直接启动全局安装的 Claude Code，并输入一个从零开发、跨多个功能分支、要求先讨论后实现的项目请求：
+- `EnterPlanMode`：始终允许；Hook 只记录 planning lifecycle 开始；
+- `PreToolUse(ExitPlanMode)`：读取计划文件快照，提取 opaque `approval_ref`，验证 block hash、项目、会话、树 revision 和 readiness；
+- `PostToolUse(ExitPlanMode)`：根据 Claude 返回的原生批准结果，将该 Plan hash 与精确 Task Tree revision 绑定；
+- 用户拒绝或修改：不激活 revision，Agent 继续讨论并产生新 revision。
 
-- Claude 自主进入原生 Plan Mode；
-- Harness 在进入 Plan Mode 前记录高置信度 `task_tree_workflow` 路由决定；
-- Harness 不阻止原生 Plan Mode；
-- Claude 使用原生提问界面完成需求精炼；
-- 原生 Plan 显示完整 Task Tree；
-- 用户只批准一次原生 Plan；
-- Runtime 中出现对应 Task Tree revision 和 approved native plan link；
-- 首次代码修改属于第一个 Skeleton Node；
-- Skeleton Gate 通过前不进入功能实现分支；
-- 分支实现期间 Trace、Artifact、Attempt 和 Evaluation 均关联正确节点；
-- 一个小型后续修改可以明确选择直接执行且不新建 Task Tree。
+Hook 不解析完整 JSON，不从 Markdown 重建树，也不进行 LLM 语义判断。
 
-## 14. 实施边界
+### 8.4 未使用 Plan Mode 的恢复路径
 
-第一阶段只实现 Claude Code Binding，因为它提供明确的 Plan Mode 与 `ExitPlanMode` Hook 契约。Jev Request Route Decision、Native Plan Snapshot、Approval Event 和 Task Tree Revision 使用 Agent 中立的核心语义；未来 Codex 或其他 Agent Binding 可以从自己的用户输入、计划和批准事件映射到同一领域模型，而无需修改 Task Tree、Workflow、Trace 或 Evaluation 的核心规则。
+若 `structured_coding` 已生效，但 Agent 未完成 approval binding 就尝试第一次项目写入，PreToolUse Hook 返回一次可恢复的生命周期提示，要求 Agent 回到 Task Planning Skill 完成准备确认。它不是全局工具封锁：
+
+- 只作用于高置信结构化工作流的首个变更边界；
+- Runtime Introspection、Task Tree 工具和只读工具保持可用；
+- 用户可明确选择“直接执行，不建立任务树”，Profile 随即切换为 `direct_coding`。
+
+## 9. Hook 职责边界
+
+| Hook | 应做 | 不应做 |
+| --- | --- | --- |
+| `UserPromptSubmit` | 记录 prompt receipt、调用 Jev、保存 route decision、解析 Project Identity | 创建任务树、替 Agent 规划 |
+| `PreToolUse` | 检查关键状态迁移、关联节点、验证 approval ref、必要时返回可恢复提示 | 对所有工具强制阻断、进行开放式意图判断 |
+| `PostToolUse` | 记录工具结果、Artifact delta、Attempt evidence、原生批准结果 | 从日志反推完整计划 |
+| `SessionStart/End` | 恢复/归档运行状态并记录生命周期 | 把 Session 当作 Task 边界 |
+| `Stop` | 收敛当前 Attempt、触发可确定的评估 | 自动宣称整个树完成 |
+
+Hooks 必须尽量 fail-open。只有确定会破坏生命周期一致性的关键写入边界可以 fail-closed，并且必须返回具体恢复动作。
+
+## 10. 执行调度
+
+用户批准 Task Tree revision 后，Scheduler 创建不可变的 `Workflow Revision`。执行策略为：
+
+1. 先按广度完成 Skeleton 阶段，建立公共接口、数据结构和最小可运行框架；
+2. Skeleton Gate 通过后，按用户选择或依赖关系进入某个功能分支；
+3. 分支内部按深度推进到可验证完成；
+4. 节点结果逐级汇总，最后验证根目标。
+
+Agent 仍使用原生推理和工具能力执行代码。Harness 只提供当前可执行节点、节点契约、关系和状态迁移，并通过 Hooks 把实际工具事件关联到对应 Attempt。
+
+## 11. 持久化事实
+
+除既有 Task Tree、Task Node、Trace、Artifact 和 Attempt 数据外，需要增加：
+
+### 11.1 `request_route_decisions`
+
+- `decision_id`
+- `project_id`
+- `session_id`
+- `prompt_fingerprint`
+- `classification`
+- `tree_relation`
+- `confidence`
+- `reason_codes`
+- `provider`
+- `fallback_reason`
+- `created_at`
+
+### 11.2 `task_tree_approval_references`
+
+- `approval_ref`
+- `project_id`
+- `session_id`
+- `tree_id`
+- `tree_revision_id`
+- `readiness_result_id`
+- `canonical_block_hash`
+- `status`
+- `expires_at`
+- `created_at`
+
+### 11.3 Native Plan 事实
+
+- `native_plan_snapshots`
+- `native_plan_task_tree_links`
+- `native_plan_approval_events`
+
+这些表保存 Plan hash、精确 revision 绑定、原生批准结果和时间信息。批准后不得把新 revision 偷换为旧批准对象。
+
+## 12. 一致性、并发与恢复
+
+### 12.1 乐观并发
+
+每次 patch 必须携带 `expectedTreeRevisionId`。不匹配时返回冲突和最新 revision 摘要，由 Agent 重新读取后再决定修订。
+
+### 12.2 幂等性
+
+所有创建、patch、准备确认和批准绑定操作均使用 `idempotencyKey` 或事件指纹，避免 Hook 重试造成重复事实。
+
+### 12.3 崩溃恢复
+
+重启后根据项目身份、Session 映射和最新未完成状态恢复：
+
+- 当前 Profile；
+- 活动 Tree/Revision；
+- 待确认 approval reference；
+- 当前 Workflow Revision 与 Attempt。
+
+过期或跨项目的 approval reference 必须拒绝绑定。
+
+## 13. 多 Agent 与多会话
+
+Task Tree 绑定 Project Identity，而不是绑定某个 Session。不同 Agent 或会话可以读取同一棵树，但写入必须遵循 revision 并发控制。
+
+每个执行 Attempt 还应绑定：
+
+- `agent_runtime`
+- `session_id`
+- `tree_revision_id`
+- `workflow_revision_id`
+- `task_node_id`
+
+这样既允许多个 Agent 协作，又能明确每次变更来自哪个已确认版本和哪个节点。
+
+## 14. 非目标
+
+本阶段不做以下事情：
+
+- 不用第二个 LLM 把 Claude Plan 翻译为 Task Tree；
+- 不从任意自然语言中强行抽取完整树；
+- 不要求所有编码请求都建立 Task Tree；
+- 不用 Hooks 替代 Agent 的规划和提问；
+- 不把完整 Task Tree JSON 嵌入 Plan 再由 Hook 解析；
+- 不建立独立于 Agent Runtime 的 Harness 管理后台；
+- 不复制 ACE 面向通用数据工作流的类型端口模型到 Coding Task Tree。
+
+## 15. 验收与测试
+
+### 15.1 Router
+
+- 三分类结构解析；
+- 显式用户要求覆盖分类；
+- 活动树关系判断；
+- 超时、401、429、5xx 和非法响应降级；
+- 不上传源码和密钥。
+
+### 15.2 Task Tree Provider
+
+- 完整 Draft 创建；
+- 原子 patch 成功与 revision 冲突；
+- 非法关系、非叶子契约、未决问题等 readiness 失败；
+- 幂等重放不产生重复 revision。
+
+### 15.3 Approval Binding
+
+- canonical block hash 一致时可以绑定；
+- block 被模型或用户修改后拒绝旧 ref；
+- 跨项目、跨 Session、过期 ref 拒绝；
+- 用户拒绝 Plan 时不激活 Workflow Revision；
+- native approval 精确绑定一个 tree revision。
+
+### 15.4 Hook 行为
+
+- 普通问答不触发建树；
+- direct coding 不被 Task Tree Gate 阻断；
+- structured coding 缺少批准时，首个写入得到可恢复提示；
+- Runtime 自身工具和只读工具不会被错误拦截；
+- Hooks 失败时不会让 Claude Code 整体不可用。
+
+### 15.5 黑盒验收场景
+
+使用“从零开发可实际使用的拼豆图案设计网页”作为黑盒请求：
+
+1. Router 选择 `task_tree_workflow`；
+2. Agent 询问任务归属和关键需求；
+3. Agent 使用工具建立并逐步修订 Task Tree；
+4. Native Plan 展示与数据库一致的 canonical Task Tree；
+5. 用户批准后生成 Workflow Revision；
+6. 代码执行先完成 Skeleton，再进入分支；
+7. Tool/Artifact/Trace/Attempt 均关联到具体节点；
+8. 用户要求小型直接修改时，可不建立新树并正常执行。
+
+## 16. 实现边界
+
+首期实现范围包括：
+
+1. Jev Request Router 与降级策略；
+2. Runtime Profile Resolver；
+3. Task Planning Skill 更新；
+4. Task Tree Tool Provider 四个核心操作；
+5. Native Plan canonical block 与 approval binding；
+6. Skeleton-first / branch-depth Scheduler 接线；
+7. 对应持久化迁移、自动化测试和黑盒验证。
+
+此前“在 Native Plan 中输出完整 JSON Manifest，再由 ExitPlan Hook 解析并迁移为 Task Tree”的方案被本规格取代，不得继续作为实现依据。

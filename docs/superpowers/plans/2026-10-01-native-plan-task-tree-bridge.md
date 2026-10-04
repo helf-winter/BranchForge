@@ -1,5 +1,7 @@
 # Native Plan → Task Tree Bridge Implementation Plan
 
+> **Status: SUPERSEDED — DO NOT EXECUTE.** The approved architecture now uses a first-class Task Tree Tool Provider and a canonical approval reference instead of parsing a full JSON Manifest from the native Plan. A replacement implementation plan will be written after review of `docs/superpowers/specs/2026-10-01-native-plan-task-tree-bridge-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Preserve Claude Code's native Plan Mode while deterministically persisting approved complex plans as Task Trees and executing project mutations through active Task Nodes.
