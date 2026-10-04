@@ -75,7 +75,7 @@ async function confirmedFixture() {
     projectId: project.projectId, confirmationId: prompt.confirmationId, answer: "yes",
     answerTraceEventId: answer.eventId, workflowRevision: 3,
   });
-  return { directory, projectDir, environment, runtime, project, root, revision };
+  return { directory, projectDir, environment, runtime, project, root, revision, answerTraceEventId: answer.eventId };
 }
 
 describe("SkeletonGateService", () => {
@@ -94,6 +94,7 @@ describe("SkeletonGateService", () => {
 
     const attempt = fixture.runtime.executions.startAttempt({
       projectId: fixture.project.projectId, nodeId: "api-skeleton", expectedTreeRevisionId: fixture.revision.revisionId,
+      sourceTraceEventId: fixture.answerTraceEventId,
     });
     const write = await fixture.runtime.hooks.ingest(mapClaudeHook({
       hook_event_name: "PostToolUse", session_id: "gate-run", cwd: fixture.projectDir, tool_name: "Write", tool_use_id: "write-api",
@@ -134,6 +135,7 @@ describe("SkeletonGateService", () => {
     expect(incompleteImplementation).toMatchObject({ status: "failed", incompleteNodeIds: ["api-implementation"], nextStage: "branch_implementation" });
     const implementation = fixture.runtime.executions.startAttempt({
       projectId: fixture.project.projectId, nodeId: "api-implementation", expectedTreeRevisionId: fixture.revision.revisionId,
+      sourceTraceEventId: fixture.answerTraceEventId,
     });
     const implementationTrace = await fixture.runtime.hooks.ingest(mapClaudeHook({
       hook_event_name: "PostToolUse", session_id: "gate-run", cwd: fixture.projectDir, tool_name: "Bash", tool_use_id: "api-test",
@@ -146,7 +148,7 @@ describe("SkeletonGateService", () => {
     expect(fixture.runtime.workflowPhases.evaluate({ projectId: fixture.project.projectId, treeId: fixture.root.treeId, workflowRevision: 5 }))
       .toMatchObject({ status: "passed", nextStage: "branch_verification", nextBranchNodeId: "api", workflow: { revision: 6 } });
 
-    const branchAttempt = fixture.runtime.executions.startAttempt({ projectId: fixture.project.projectId, nodeId: "api", expectedTreeRevisionId: fixture.revision.revisionId });
+    const branchAttempt = fixture.runtime.executions.startAttempt({ projectId: fixture.project.projectId, nodeId: "api", expectedTreeRevisionId: fixture.revision.revisionId, sourceTraceEventId: fixture.answerTraceEventId });
     const branchTrace = await fixture.runtime.hooks.ingest(mapClaudeHook({
       hook_event_name: "PostToolUse", session_id: "gate-run", cwd: fixture.projectDir, tool_name: "Bash", tool_use_id: "branch-test",
       tool_input: { command: "npm test -- branch" }, tool_response: { exitCode: 0 },
@@ -158,7 +160,7 @@ describe("SkeletonGateService", () => {
     expect(fixture.runtime.workflowPhases.evaluate({ projectId: fixture.project.projectId, treeId: fixture.root.treeId, workflowRevision: 6 }))
       .toMatchObject({ status: "passed", nextStage: "root_verification", nextBranchNodeId: null, workflow: { revision: 7 } });
 
-    const rootAttempt = fixture.runtime.executions.startAttempt({ projectId: fixture.project.projectId, nodeId: "root", expectedTreeRevisionId: fixture.revision.revisionId });
+    const rootAttempt = fixture.runtime.executions.startAttempt({ projectId: fixture.project.projectId, nodeId: "root", expectedTreeRevisionId: fixture.revision.revisionId, sourceTraceEventId: fixture.answerTraceEventId });
     const rootTrace = await fixture.runtime.hooks.ingest(mapClaudeHook({
       hook_event_name: "PostToolUse", session_id: "gate-run", cwd: fixture.projectDir, tool_name: "Bash", tool_use_id: "root-test",
       tool_input: { command: "npm test -- integration" }, tool_response: { exitCode: 0 },

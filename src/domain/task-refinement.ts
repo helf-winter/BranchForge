@@ -254,6 +254,39 @@ export function analyzePlanReadiness(document: TaskTreeDocument, scopeRootNodeId
     const root = document.nodes.find((node) => node.parentId === null);
     const topBranches = root?.children ?? [];
     const scopedBranches = new Set([...scope].map((nodeId) => topBranchForNode(document, nodeId)).filter((value): value is string => Boolean(value)));
+    const descendantsOf = (rootId: string) => {
+      const result = new Set<string>();
+      const visit = (nodeId: string) => {
+        result.add(nodeId);
+        for (const child of byId.get(nodeId)?.children ?? []) visit(child);
+      };
+      visit(rootId);
+      return result;
+    };
+    for (const nodeId of [...scope].sort()) {
+      const node = byId.get(nodeId)!;
+      if (!node.executionPhase) continue;
+      if (!node.requiredEvidence?.length) {
+        blockingIssues.push(issue({
+          code: "execution_evidence_missing", category: "acceptance_skeleton", severity: "blocking",
+          summary: "Declare required evidence for executable Task Node " + node.title, affectedRefs: [node.id],
+        }));
+      }
+      if (node.executionPhase === "implementation" && node.children.length > 0) {
+        blockingIssues.push(issue({
+          code: "implementation_container_not_executable", category: "branch_dependency", severity: "blocking",
+          summary: "Implementation Task Nodes with children must be containers or be decomposed into executable leaves",
+          affectedRefs: [node.id],
+        }));
+      }
+    }
+    if (root && scope.has(root.id)
+      && (root.executionPhase !== "verification" || !root.requiredEvidence?.length)) {
+      blockingIssues.push(issue({
+        code: "root_verification_missing", category: "acceptance_skeleton", severity: "blocking",
+        summary: "Define one executable root verification contract", affectedRefs: [root.id], crossBranch: true,
+      }));
+    }
     for (const branchId of topBranches.filter((id) => scopedBranches.has(id))) {
       const criterion = document.skeletonCriteria?.find((item) => item.branchNodeId === branchId);
       if (!skeletonComplete(criterion)) {
@@ -261,6 +294,25 @@ export function analyzePlanReadiness(document: TaskTreeDocument, scopeRootNodeId
           code: "skeleton_criteria_incomplete", category: "acceptance_skeleton", severity: "blocking",
           summary: "Complete Skeleton Acceptance Criteria for " + (byId.get(branchId)?.title ?? branchId),
           affectedRefs: [branchId, criterion?.id ?? "missing-skeleton-criteria"],
+        }));
+      }
+      const branchScope = descendantsOf(branchId);
+      const skeletonNodes = [...branchScope].map((id) => byId.get(id)!)
+        .filter((node) => node.executionPhase === "skeleton" && node.requiredEvidence?.length);
+      if (!skeletonNodes.length) {
+        blockingIssues.push(issue({
+          code: "skeleton_task_missing", category: "acceptance_skeleton", severity: "blocking",
+          summary: "Define schedulable Skeleton work for " + (byId.get(branchId)?.title ?? branchId),
+          affectedRefs: [branchId],
+        }));
+      }
+      const verificationNodes = [...branchScope].map((id) => byId.get(id)!)
+        .filter((node) => node.executionPhase === "verification" && node.requiredEvidence?.length);
+      if (!verificationNodes.length) {
+        blockingIssues.push(issue({
+          code: "branch_verification_missing", category: "acceptance_skeleton", severity: "blocking",
+          summary: "Define schedulable branch verification for " + (byId.get(branchId)?.title ?? branchId),
+          affectedRefs: [branchId],
         }));
       }
     }

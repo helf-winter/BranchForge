@@ -57,10 +57,11 @@ describe("Skill Evolution vertical slice", () => {
     for (let attemptNumber = 1; attemptNumber <= 3; attemptNumber += 1) {
       const attempt = runtime.executions.startAttempt({
         projectId: project.projectId, nodeId: "endpoint-repair", expectedTreeRevisionId: revision.revisionId,
+        sourceTraceEventId: answer.eventId,
       });
       const succeeded = attemptNumber === 3;
       const trace = await runtime.hooks.ingest(mapClaudeHook({
-        hook_event_name: "PostToolUse", session_id: `attempt-${attemptNumber}`, cwd: projectDir,
+        hook_event_name: "PostToolUse", session_id: "confirm", cwd: projectDir,
         tool_name: "Bash", tool_use_id: `endpoint-${attemptNumber}`,
         tool_input: { command: "npm test -- endpoint.test.ts" },
         tool_response: succeeded ? { exitCode: 0 } : { exitCode: 1, stderr: "AssertionError: endpoint" },

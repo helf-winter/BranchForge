@@ -77,6 +77,30 @@ describe("JevRequestRouter", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
+  it("redacts secrets, omits pasted source, and bounds every outbound routing field", async () => {
+    const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const serialized = String(init?.body);
+      const body = JSON.parse(serialized) as { state: RequestRouteSnapshot };
+      expect(serialized).not.toContain("super-secret-token");
+      expect(serialized).not.toContain("const leakedSource");
+      expect(serialized).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz1234567890");
+      expect(body.state.prompt).toContain("[REDACTED]");
+      expect(body.state.prompt).toContain("[CODE OMITTED]");
+      expect(body.state.prompt.length).toBeLessThanOrEqual(2_000);
+      expect(body.state.activeTreeTitle!.length).toBeLessThanOrEqual(160);
+      expect(body.state.currentNodeTitle!.length).toBeLessThanOrEqual(160);
+      return new Response(JSON.stringify(successBody()), { status: 200 });
+    });
+    const router = new JevRequestRouter(enabledConfig(), fetcher as typeof fetch);
+    await router.route({
+      prompt: `Implement login with token=super-secret-token\n\`\`\`ts\nconst leakedSource = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";\n\`\`\`\n${"x".repeat(3_000)}`,
+      hasActiveTree: true,
+      activeTreeTitle: `Tree apiKey=super-secret-token ${"t".repeat(300)}`,
+      currentNodeTitle: `Node ghp_abcdefghijklmnopqrstuvwxyz1234567890 ${"n".repeat(300)}`,
+      hasActiveWorkflow: false,
+    });
+  });
+
   it("omits the tree relation question when there is no active tree", async () => {
     const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };

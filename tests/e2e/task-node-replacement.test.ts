@@ -23,7 +23,13 @@ describe("Task Node Replacement vertical slice", () => {
     const providerNodeId = root.document.nodes[0]!.id;
     const document: TaskTreeDocument = {
       nodes: [
-        { id: providerNodeId, parentId: null, title: "Provide API", children: ["consumer"] },
+        {
+          id: providerNodeId, parentId: null, title: "Provide API", children: ["consumer"],
+          objectives: ["Provide the API contract"], expectedOutputs: ["src/api.ts"],
+          acceptanceCriteria: ["provider contract is available"], unresolvedQuestions: [], unresolvedDecisions: [],
+          dependencies: [], requiredEvidence: [{ key: "provider-effect", description: "provider effect is recorded" }],
+          executionPhase: "skeleton", stopDecompositionReason: "one provider contract boundary",
+        },
         {
           id: "consumer", parentId: providerNodeId, title: "Consume API", children: [],
           objectives: ["Consume the API"], expectedOutputs: ["src/consumer.ts"],
@@ -70,6 +76,15 @@ describe("Task Node Replacement vertical slice", () => {
       "SELECT id FROM task_node_revisions WHERE node_id = ? AND tree_revision_id = ?",
       providerNodeId, revision.revisionId,
     )!;
+    const effectSource = await first.hooks.ingest(mapClaudeHook({
+      hook_event_name: "UserPromptSubmit", session_id: "effect", cwd: projectDir,
+      prompt: "Implement the approved provider contract",
+    }));
+    if (!effectSource.recorded) throw new Error("effect source Trace was not recorded");
+    first.executions.startAttempt({
+      projectId: project.projectId, nodeId: providerNodeId, expectedTreeRevisionId: revision.revisionId,
+      sourceTraceEventId: effectSource.eventId,
+    });
     const effectEvidence = await first.hooks.ingest(mapClaudeHook({
       hook_event_name: "PostToolUse", session_id: "effect", cwd: projectDir,
       tool_name: "Edit", tool_use_id: "effect-edit", tool_input: { file_path: path.join(projectDir, "src/api.ts") },

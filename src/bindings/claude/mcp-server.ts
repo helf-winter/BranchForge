@@ -342,10 +342,12 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
     const project = await existingProject(cwd);
     const trace = requireUserMessage(project.projectId, sourceUserMessageTraceEventId);
     const affiliation = runtime.database.get<{ id: string }>(`
-      SELECT id FROM task_affiliation_decisions
-      WHERE project_id = ? AND resolved_tree_id = ? AND status IN ('new_tree', 'merged') AND created_at <= ?
-      ORDER BY resolved_at DESC, id DESC LIMIT 1
-    `, project.projectId, treeId, trace.occurred_at);
+      SELECT d.id FROM task_affiliation_decisions d
+      JOIN trace_events answer ON answer.id = d.answer_trace_event_id
+      WHERE d.project_id = ? AND d.resolved_tree_id = ? AND d.status IN ('new_tree', 'merged')
+        AND d.resolved_at IS NOT NULL AND d.resolved_at <= ? AND answer.session_id = ?
+      ORDER BY d.resolved_at DESC, d.id DESC LIMIT 1
+    `, project.projectId, treeId, trace.occurred_at, trace.session_id);
     if (!affiliation) {
       throw new HarnessError("evidence_scope_mismatch", "approval evidence must follow the Task Tree's resolved affiliation");
     }
@@ -355,6 +357,7 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
       treeId,
       treeRevisionId,
       readinessResultId,
+      sourceTraceEventId: sourceUserMessageTraceEventId,
     });
   }));
 
@@ -930,10 +933,13 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   })));
 
   server.registerTool("harness_start_node_attempt", {
-    description: "Start an evidence-backed Execution Attempt for the current Task Node revision.",
-    inputSchema: { cwd: cwdSchema, nodeId: z.string().min(1), expectedTreeRevisionId: z.string().min(1) },
-  }, ({ cwd, nodeId, expectedTreeRevisionId }) => guarded(async () => runtime.executions.startAttempt({
-    projectId: (await existingProject(cwd)).projectId, nodeId, expectedTreeRevisionId,
+    description: "Start the exact scheduler-selected Execution Attempt with same-Project Trace provenance for the current Session.",
+    inputSchema: {
+      cwd: cwdSchema, nodeId: z.string().min(1), expectedTreeRevisionId: z.string().min(1),
+      sourceTraceEventId: z.string().min(1),
+    },
+  }, ({ cwd, nodeId, expectedTreeRevisionId, sourceTraceEventId }) => guarded(async () => runtime.executions.startAttempt({
+    projectId: (await existingProject(cwd)).projectId, nodeId, expectedTreeRevisionId, sourceTraceEventId,
   })));
 
   server.registerTool("harness_begin_node_verification", {

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ExecutionSchedulerService } from "../../src/application/execution-scheduler-service.js";
+import { NodeExecutionService } from "../../src/application/node-execution-service.js";
 import { TaskTreeService } from "../../src/application/task-tree-service.js";
 import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
 import { RuntimeDatabase } from "../../src/storage/database.js";
@@ -71,6 +72,19 @@ describe("ExecutionSchedulerService", () => {
     });
     f.database.run("UPDATE task_nodes SET status = 'succeeded' WHERE id = 'a-skeleton'");
     expect(f.scheduler.next({ projectId: "p1", treeId: f.revision.treeId })).toMatchObject({ nodeId: "b-skeleton" });
+    f.database.close();
+  });
+
+  it("rejects starting an eligible node that is not the deterministic scheduler result", async () => {
+    const f = await fixture();
+    expect(() => new NodeExecutionService(f.database).startAttempt({
+      projectId: "p1", nodeId: "b-skeleton", expectedTreeRevisionId: f.revision.revisionId,
+    })).toThrow(expect.objectContaining({
+      code: "attempt_not_executable", message: expect.stringContaining("deterministic next scheduled node"),
+    }));
+    expect(new NodeExecutionService(f.database).startAttempt({
+      projectId: "p1", nodeId: "a-skeleton", expectedTreeRevisionId: f.revision.revisionId,
+    })).toMatchObject({ nodeId: "a-skeleton", treeRevisionId: f.revision.revisionId });
     f.database.close();
   });
 

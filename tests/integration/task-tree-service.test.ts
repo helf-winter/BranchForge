@@ -347,10 +347,10 @@ describe("TaskTreeService", () => {
     const branch = service.scanPlanReadiness({ projectId: "p1", treeId: root.treeId, scopeRootNodeId: "branch-a" });
     expect(branch).toMatchObject({ revisionId: draft.revisionId, ready: false, scopeKind: "branch" });
     expect(branch.blockingIssues).toEqual(expect.arrayContaining([expect.objectContaining({ code: "leaf_contract_incomplete" })]));
-    expect(branch.recommendedNextIssue).toMatchObject({ code: "leaf_contract_incomplete" });
+    expect(branch.recommendedNextIssue).toMatchObject({ code: "branch_verification_missing" });
     expect(database.get<{ issues_json: string; recommended_issue_json: string }>(
       "SELECT issues_json, recommended_issue_json FROM plan_readiness_results WHERE id = ?", branch.resultId,
-    )).toMatchObject({ issues_json: expect.stringContaining("leaf_contract_incomplete"), recommended_issue_json: expect.stringContaining("leaf_contract_incomplete") });
+    )).toMatchObject({ issues_json: expect.stringContaining("leaf_contract_incomplete"), recommended_issue_json: expect.stringContaining("branch_verification_missing") });
     database.close();
   });
 

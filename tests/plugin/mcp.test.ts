@@ -77,6 +77,10 @@ describe("Harness MCP binding", () => {
     expect(tools.find((tool) => tool.name === "harness_get_next_executable_node")?.inputSchema).toMatchObject({
       required: expect.arrayContaining(["treeId"]), properties: { treeId: { type: "string" } },
     });
+    expect(tools.find((tool) => tool.name === "harness_start_node_attempt")?.inputSchema).toMatchObject({
+      required: expect.arrayContaining(["nodeId", "expectedTreeRevisionId", "sourceTraceEventId"]),
+      properties: { sourceTraceEventId: { type: "string" } },
+    });
     expect(tools.find((tool) => tool.name === "harness_scan_plan_readiness")?.inputSchema).toMatchObject({
       properties: { scopeRootNodeId: { type: "string" } },
     });
@@ -303,11 +307,21 @@ describe("Harness MCP binding", () => {
         unresolvedQuestions: [], unresolvedDecisions: [], plannedEffects: [],
       },
       nodes: [
-        { id: "root", parentId: null, title: "Editor", children: ["canvas"] },
+        { id: "root", parentId: null, title: "Editor", children: ["canvas"], executionPhase: "verification", requiredEvidence: [{ key: "root-test", description: "Full test" }] },
         {
-          id: "canvas", parentId: "root", title: "Canvas", children: [], objectives: ["Render beads"],
+          id: "canvas", parentId: "root", title: "Canvas", children: ["canvas-skeleton", "canvas-implementation"],
+          executionPhase: "verification", requiredEvidence: [{ key: "branch-test", description: "Canvas integration" }],
+        },
+        {
+          id: "canvas-skeleton", parentId: "canvas", title: "Canvas skeleton", children: [], objectives: ["Wire canvas"],
+          expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["module imports"], unresolvedQuestions: [],
+          unresolvedDecisions: [], dependencies: [], requiredEvidence: [{ key: "skeleton-test", description: "Skeleton test" }],
+          executionPhase: "skeleton", stopDecompositionReason: "One verifiable skeleton",
+        },
+        {
+          id: "canvas-implementation", parentId: "canvas", title: "Canvas implementation", children: [], objectives: ["Render beads"],
           expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["test passes"], unresolvedQuestions: [],
-          unresolvedDecisions: [], dependencies: [], requiredEvidence: [{ key: "test", description: "Canvas test" }],
+          unresolvedDecisions: [], dependencies: ["canvas-skeleton"], requiredEvidence: [{ key: "test", description: "Canvas test" }],
           executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
         },
       ],

@@ -21,12 +21,17 @@ function document(): TaskTreeDocument {
       unresolvedQuestions: [], unresolvedDecisions: [], plannedEffects: [],
     },
     nodes: [
-      { id: "root", parentId: null, title: "Editor", children: ["canvas"] },
+      { id: "root", parentId: null, title: "Editor", children: ["canvas"], executionPhase: "verification", requiredEvidence: [{ key: "root-test", description: "Full editor test" }] },
+      { id: "canvas", parentId: "root", title: "Canvas", children: ["canvas-skeleton", "canvas-implementation"], executionPhase: "verification", requiredEvidence: [{ key: "branch-test", description: "Canvas integration test" }] },
       {
-        id: "canvas", parentId: "root", title: "Canvas", children: [], objectives: ["Render beads"],
-        expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["test passes"], unresolvedQuestions: [],
-        unresolvedDecisions: [], dependencies: [], requiredEvidence: [{ key: "test", description: "Canvas test" }],
-        executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
+        id: "canvas-skeleton", parentId: "canvas", title: "Canvas skeleton", children: [], objectives: ["Create canvas contract"],
+        expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["module imports"], unresolvedQuestions: [], unresolvedDecisions: [], dependencies: [],
+        requiredEvidence: [{ key: "skeleton-test", description: "Canvas contract check" }], executionPhase: "skeleton", stopDecompositionReason: "One verifiable skeleton",
+      },
+      {
+        id: "canvas-implementation", parentId: "canvas", title: "Canvas implementation", children: [], objectives: ["Render beads"],
+        expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["test passes"], unresolvedQuestions: [], unresolvedDecisions: [], dependencies: ["canvas-skeleton"],
+        requiredEvidence: [{ key: "test", description: "Canvas test" }], executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
       },
     ],
     relations: [], artifacts: [],
@@ -195,5 +200,29 @@ describe("NativePlanBindingService", () => {
         projectId: "p1", sessionId: "session-1", toolUseId: "restart", traceEventId: "post", outcome: "approved",
       })).toMatchObject({ status: "consumed", stage: "skeleton_pass" });
     reopened.close();
+  });
+
+  it("expires a reference when approval completes after the PreToolUse validation window", async () => {
+    const f = await fixture(new Date("2030-01-02T04:00:00.000Z"));
+    trace(f.database, { id: "pre-late", treeId: f.revision.treeId, eventName: "PreToolUse", toolUseId: "late" });
+    f.binding.preExit({
+      projectId: "p1", sessionId: "session-1", toolUseId: "late",
+      planMarkdown: f.prepared.canonicalBlock, traceEventId: "pre-late",
+    });
+    trace(f.database, { id: "post-late", treeId: f.revision.treeId, eventName: "PostToolUse", toolUseId: "late" });
+    const afterExpiry = new NativePlanBindingService(
+      f.database,
+      f.workflows,
+      () => new Date("2030-01-03T04:00:00.000Z"),
+    );
+    expect(() => afterExpiry.postExit({
+      projectId: "p1", sessionId: "session-1", toolUseId: "late",
+      traceEventId: "post-late", outcome: "approved",
+    })).toThrow(expect.objectContaining({ code: "confirmation_not_applicable", message: expect.stringContaining("expired") }));
+    expect(f.database.get<{ status: string }>(
+      "SELECT status FROM task_tree_approval_references WHERE approval_ref = ?", f.prepared.approvalRef,
+    )).toEqual({ status: "expired" });
+    expect(f.database.all("SELECT id FROM native_plan_approval_events")).toEqual([]);
+    f.database.close();
   });
 });

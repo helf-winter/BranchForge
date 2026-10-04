@@ -19,12 +19,17 @@ function document(): TaskTreeDocument {
       unresolvedQuestions: [], unresolvedDecisions: [], plannedEffects: [],
     },
     nodes: [
-      { id: "root", parentId: null, title: "Editor", children: ["canvas"] },
+      { id: "root", parentId: null, title: "Editor", children: ["canvas"], executionPhase: "verification", requiredEvidence: [{ key: "root-test", description: "Full editor test" }] },
+      { id: "canvas", parentId: "root", title: "Canvas", children: ["canvas-skeleton", "canvas-implementation"], executionPhase: "verification", requiredEvidence: [{ key: "branch-test", description: "Canvas integration test" }] },
       {
-        id: "canvas", parentId: "root", title: "Canvas", children: [], objectives: ["Render beads"],
-        expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["canvas test passes"], unresolvedQuestions: [],
-        unresolvedDecisions: [], dependencies: [], requiredEvidence: [{ key: "test", description: "Canvas test" }],
-        executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
+        id: "canvas-skeleton", parentId: "canvas", title: "Canvas skeleton", children: [], objectives: ["Create canvas contract"],
+        expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["module imports"], unresolvedQuestions: [], unresolvedDecisions: [], dependencies: [],
+        requiredEvidence: [{ key: "skeleton-test", description: "Canvas contract check" }], executionPhase: "skeleton", stopDecompositionReason: "One verifiable skeleton",
+      },
+      {
+        id: "canvas-implementation", parentId: "canvas", title: "Canvas implementation", children: [], objectives: ["Render beads"],
+        expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["canvas test passes"], unresolvedQuestions: [], unresolvedDecisions: [], dependencies: ["canvas-skeleton"],
+        requiredEvidence: [{ key: "test", description: "Canvas test" }], executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
       },
     ],
     relations: [], artifacts: [],
@@ -115,6 +120,25 @@ describe("TaskTreeApprovalService", () => {
       first.approvalRef,
     )).toThrow();
     expect(f.database.all("SELECT id FROM runtime_confirmation_prompts WHERE tree_id = ?", f.revision.treeId)).toHaveLength(2);
+    f.database.close();
+  });
+
+  it("returns the same preparation for a retry with identical source evidence", async () => {
+    const f = await fixture();
+    f.database.run(`
+      INSERT INTO trace_events (id, project_id, tree_id, session_id, event_name, payload_json, occurred_at, idempotency_key)
+      VALUES ('approval-source', 'p1', ?, 'session-1', 'UserPromptSubmit', '{}', '2030-01-02T03:00:00.000Z', 'approval-source')
+    `, f.revision.treeId);
+    const input = {
+      projectId: "p1", sessionId: "session-1", treeId: f.revision.treeId,
+      treeRevisionId: f.revision.revisionId, readinessResultId: f.readiness.resultId,
+      sourceTraceEventId: "approval-source",
+    };
+    const first = f.approvals.prepare(input);
+    const retried = f.approvals.prepare(input);
+    expect(retried).toEqual(first);
+    expect(f.database.all("SELECT approval_ref FROM task_tree_approval_references")).toHaveLength(1);
+    expect(f.database.all("SELECT id FROM runtime_confirmation_prompts WHERE tree_id = ?", f.revision.treeId)).toHaveLength(1);
     f.database.close();
   });
 

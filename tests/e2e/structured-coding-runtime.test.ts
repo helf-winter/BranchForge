@@ -175,6 +175,7 @@ describe("structured coding runtime vertical slice", () => {
     expect(skeleton).toMatchObject({ nodeId: "canvas-skeleton", phase: "skeleton", stage: "skeleton_pass" });
     const skeletonAttempt = runtime.executions.startAttempt({
       projectId: project.projectId, nodeId: skeleton!.nodeId, expectedTreeRevisionId: skeleton!.treeRevisionId,
+      sourceTraceEventId: refinementAnswer.eventId,
     });
     const write = await runtime.hooks.ingest(mapClaudeHook({
       hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
@@ -207,6 +208,7 @@ describe("structured coding runtime vertical slice", () => {
     expect(implementation).toMatchObject({ nodeId: "canvas-implementation", activeBranchNodeId: "canvas" });
     const implementationAttempt = runtime.executions.startAttempt({
       projectId: project.projectId, nodeId: implementation!.nodeId, expectedTreeRevisionId: implementation!.treeRevisionId,
+      sourceTraceEventId: refinementAnswer.eventId,
     });
     const implementationTrace = await runtime.hooks.ingest(mapClaudeHook({
       hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,

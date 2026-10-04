@@ -1,4 +1,5 @@
 import path from "node:path";
+import { commandArtifactLocator } from "../domain/artifact.js";
 import { buildExecutionContext, type ExecutionContext } from "../domain/execution-context.js";
 import { newId } from "../domain/ids.js";
 import { canonicalJson, createHookIdempotencyKey, redactSecrets } from "../domain/trace.js";
@@ -13,6 +14,7 @@ import type { NativePlanBindingService } from "./native-plan-binding-service.js"
 interface WorkflowContext {
   tree_id: string;
   stage: string;
+  revision: number;
   selected_node_id: string | null;
   current_revision_id: string;
 }
@@ -20,6 +22,7 @@ interface WorkflowContext {
 interface ActiveAttemptContext {
   id: string;
   task_node_id: string;
+  session_id: string | null;
 }
 
 interface ArtifactProjection {
@@ -91,7 +94,7 @@ export class HookIngestionService {
     let project = await this.projects.resolve(event.cwd, "inspect");
     let workflow = project.status === "same_project"
       ? this.database.get<WorkflowContext>(`
-          SELECT w.tree_id, w.stage, r.selected_node_id, t.current_revision_id
+          SELECT w.tree_id, w.stage, w.revision, r.selected_node_id, t.current_revision_id
           FROM workflow_states w
           JOIN task_trees t ON t.id = w.tree_id AND t.project_id = w.project_id
           LEFT JOIN runtime_states r ON r.project_id = w.project_id
@@ -120,7 +123,7 @@ export class HookIngestionService {
       project = await this.projects.resolve(event.cwd, "inspect");
       workflow = project.status === "same_project"
         ? this.database.get<WorkflowContext>(`
-            SELECT w.tree_id, w.stage, r.selected_node_id, t.current_revision_id
+            SELECT w.tree_id, w.stage, w.revision, r.selected_node_id, t.current_revision_id
             FROM workflow_states w
             JOIN task_trees t ON t.id = w.tree_id AND t.project_id = w.project_id
             LEFT JOIN runtime_states r ON r.project_id = w.project_id
@@ -134,25 +137,33 @@ export class HookIngestionService {
     if (project.status !== "same_project") project = await this.projects.resolve(event.cwd, "persist");
     if (project.status === "identity_conflict") return { recorded: false, reason: "inactive" };
     workflow ??= this.database.get<WorkflowContext>(`
-      SELECT w.tree_id, w.stage, r.selected_node_id, t.current_revision_id
+      SELECT w.tree_id, w.stage, w.revision, r.selected_node_id, t.current_revision_id
       FROM workflow_states w
       JOIN task_trees t ON t.id = w.tree_id AND t.project_id = w.project_id
       LEFT JOIN runtime_states r ON r.project_id = w.project_id
       WHERE w.project_id = ? AND w.active = 1
     `, project.projectId);
 
+    const sessionProfile = this.database.get<{ profile: string }>(`
+      SELECT profile FROM runtime_profile_states WHERE project_id = ? AND session_id = ?
+    `, project.projectId, event.sessionId)?.profile;
     const activeAttempt = workflow
       ? this.database.get<ActiveAttemptContext>(`
-          SELECT id, task_node_id FROM execution_attempts
-          WHERE project_id = ? AND tree_id = ? AND status IN ('running', 'verifying')
+          SELECT id, task_node_id, session_id FROM execution_attempts
+          WHERE project_id = ? AND tree_id = ? AND session_id = ? AND status IN ('running', 'verifying')
           ORDER BY started_at DESC, id DESC LIMIT 1
-        `, project.projectId, workflow.tree_id)
+        `, project.projectId, workflow.tree_id, event.sessionId)
       : undefined;
     const violationReason = event.eventName === "PreToolUse" && mutation
       ? this.structuredMutationViolation(project.projectId, event.sessionId, workflow, activeAttempt)
       : undefined;
     const violation = Boolean(violationReason);
-    const traceNodeId = activeAttempt?.task_node_id ?? workflow?.selected_node_id ?? null;
+    const structuredSession = sessionProfile === "structured_coding" || (!sessionProfile && Boolean(workflow));
+    const traceNodeId = structuredSession
+      ? executableStages.has(workflow?.stage ?? "")
+        ? activeAttempt?.task_node_id ?? null
+        : activeAttempt?.task_node_id ?? workflow?.selected_node_id ?? null
+      : null;
     const eventId = newId();
     const eventName = violation ? "workflow_violation" : event.eventName;
     const payload = redactSecrets({
@@ -235,6 +246,12 @@ export class HookIngestionService {
       } catch (error) {
         if (event.eventName === "PreToolUse") {
           const message = error instanceof Error ? error.message : String(error);
+          const reason = `Native Plan approval binding was rejected: ${message}. Revalidate the Task Tree and prepare a new approval block.`;
+          this.database.run(
+            "UPDATE trace_events SET event_name = 'workflow_violation', payload_json = ? WHERE id = ?",
+            canonicalJson({ ...(payload as Record<string, unknown>), reason: "native_plan_binding_rejected", directiveReason: reason }),
+            eventId,
+          );
           return {
             recorded: true,
             eventId,
@@ -242,7 +259,7 @@ export class HookIngestionService {
             blocked: true,
             directive: {
               kind: "deny",
-              reason: `Native Plan approval binding was rejected: ${message}. Revalidate the Task Tree and prepare a new approval block.`,
+              reason,
             },
           };
         }
@@ -303,6 +320,9 @@ export class HookIngestionService {
       if (payload.reason === "structured_mutation_without_active_attempt") {
         return { kind: "deny", reason: missingActiveAttemptReason };
       }
+      if (payload.reason === "native_plan_binding_rejected" && typeof (payload as { directiveReason?: unknown }).directiveReason === "string") {
+        return { kind: "deny", reason: (payload as { directiveReason: string }).directiveReason };
+      }
     } catch {
       // A malformed historical payload must not change ordinary duplicate handling.
     }
@@ -315,15 +335,28 @@ export class HookIngestionService {
       return typeof filePath === "string" && this.isProjectPath(event.cwd, filePath);
     }
     if (event.toolName !== "Bash") return false;
-    const command = typeof event.toolInput?.command === "string" ? event.toolInput.command : "";
-    const mutatingCommand = /(^|[;&|]\s*)(rm|mv|cp|touch|mkdir|rmdir|install|chmod|chown|ln|truncate|dd|tee|patch|apply_patch|sed\s+-i|perl\s+-pi|git\s+(commit|checkout|reset|clean|mv|rm)|npm\s+(install|uninstall)|pnpm\s+(add|remove|install)|yarn\s+(add|remove|install))\b/;
-    if (mutatingCommand.test(command)) return true;
+    const command = typeof event.toolInput?.command === "string" ? event.toolInput.command.trim() : "";
+    if (!command) return false;
     const redirection = /(^|[^<>])>{1,2}(?![>&])\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g;
     for (const match of command.matchAll(redirection)) {
       const target = match[2] ?? match[3] ?? match[4];
       if (target && this.isProjectPath(event.cwd, target)) return true;
     }
-    return false;
+    if (this.isSimpleExternalMutation(event.cwd, command)) return false;
+    const readOnlyCommand = /^(?:pwd|ls(?:\s|$)|rg(?:\s|$)|grep(?:\s|$)|cat(?:\s|$)|head(?:\s|$)|tail(?:\s|$)|wc(?:\s|$)|stat(?:\s|$)|which(?:\s|$)|type(?:\s|$)|git\s+(?:status|diff|log|show)(?:\s|$)|npm\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|pnpm\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|yarn\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|vitest(?:\s|$)|pytest(?:\s|$)|tsc\s+--noEmit(?:\s|$)|node\s+(?:--version|-v)(?:\s|$))[^;&|]*$/;
+    const unsafeFind = /^find\b/.test(command) && /(?:-delete|-exec|-execdir|-ok)\b/.test(command);
+    if (!unsafeFind && (/^find\b[^;&|]*$/.test(command) || readOnlyCommand.test(command))) return false;
+    // In structured mode, an unknown shell command is potentially mutating. This prevents
+    // script runners and package scripts from bypassing the lifecycle boundary.
+    return true;
+  }
+
+  private isSimpleExternalMutation(cwd: string, command: string): boolean {
+    if (/[;&|`$()]/.test(command)) return false;
+    const tokens = command.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^["']|["']$/g, "")) ?? [];
+    if (!tokens.length || !new Set(["rm", "touch", "mkdir", "rmdir", "truncate"]).has(tokens[0]!)) return false;
+    const paths = tokens.slice(1).filter((token) => !token.startsWith("-"));
+    return paths.length > 0 && paths.every((candidate) => path.isAbsolute(candidate) && !this.isProjectPath(cwd, candidate));
   }
 
   private structuredMutationViolation(
@@ -340,9 +373,9 @@ export class HookIngestionService {
       if (!workflow) return "structured_mutation_before_native_approval";
       const approval = this.database.get<{ approval_ref: string }>(`
         SELECT approval_ref FROM task_tree_approval_references
-        WHERE project_id = ? AND session_id = ? AND tree_id = ? AND tree_revision_id = ? AND status = 'consumed'
+        WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ? AND status = 'consumed'
         LIMIT 1
-      `, projectId, sessionId, workflow.tree_id, workflow.current_revision_id);
+      `, projectId, workflow.tree_id, workflow.current_revision_id);
       if (!approval) return "structured_mutation_before_native_approval";
       if (executableStages.has(workflow.stage) && !activeAttempt) {
         return "structured_mutation_without_active_attempt";
@@ -370,7 +403,7 @@ export class HookIngestionService {
       locator = this.normalizeFileLocator(event.cwd, filePath);
     } else if (event.toolName === "Bash" && typeof event.toolInput?.command === "string") {
       kind = "command";
-      locator = event.toolInput.command;
+      locator = commandArtifactLocator(event.toolInput.command);
     }
     if (!kind || !locator) return undefined;
 
@@ -380,7 +413,8 @@ export class HookIngestionService {
     );
     const failed = event.eventName === "PostToolUseFailure";
     const mutation = kind === "file" && this.isMutation(event);
-    const verified = kind === "command" && !failed && this.isVerificationCommand(locator);
+    const verified = kind === "command" && !failed
+      && typeof event.toolInput?.command === "string" && this.isVerificationCommand(event.toolInput.command);
     const status = failed
       ? "failed"
       : verified

@@ -1,5 +1,6 @@
 import { HarnessError } from "../domain/errors.js";
 import { newId, nowIso } from "../domain/ids.js";
+import { commandArtifactLocator } from "../domain/artifact.js";
 import {
   evaluateSkeletonGate,
   type SkeletonGateBranchObservation,
@@ -260,7 +261,8 @@ export class SkeletonGateService {
       };
     };
     const commandCheck = (ref: string): SkeletonGateCheck => {
-      const artifact = input.artifacts.find((value) => value.locator === ref && value.status === "verified");
+      const locator = commandArtifactLocator(ref);
+      const artifact = input.artifacts.find((value) => value.locator === locator && value.status === "verified");
       const traceId = artifact?.source_trace_event_id ?? null;
       return { ref, satisfied: Boolean(traceId && branchEvidence.has(traceId)), evidenceRefs: traceId ? [traceId] : [] };
     };

@@ -25,6 +25,7 @@ interface ApprovalRow {
   status: "prepared" | "consumed" | "rejected" | "expired" | "superseded";
   expires_at: string;
   confirmation_prompt_id: string;
+  source_trace_event_id: string | null;
 }
 
 export class TaskTreeApprovalService {
@@ -40,6 +41,7 @@ export class TaskTreeApprovalService {
     treeId: string;
     treeRevisionId: string;
     readinessResultId: string;
+    sourceTraceEventId?: string;
   }): TaskTreeApprovalPreparation {
     if (!input.sessionId.trim()) throw new HarnessError("invalid_input", "Session provenance is required for native Plan approval");
     const tree = this.database.get<{ status: string; current_revision_id: string }>(
@@ -72,6 +74,33 @@ export class TaskTreeApprovalService {
       throw new HarnessError("workflow_transition_rejected", "Task Tree approval requires an active branch-confirmation Workflow revision");
     }
     const treeView = this.trees.getRevisionById(input.projectId, input.treeId, input.treeRevisionId);
+    if (input.sourceTraceEventId) {
+      const existing = this.database.get<ApprovalRow>(`
+        SELECT approval_ref, tree_id, tree_revision_id, readiness_result_id, canonical_block_hash,
+               status, expires_at, confirmation_prompt_id, source_trace_event_id
+        FROM task_tree_approval_references
+        WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ?
+          AND readiness_result_id = ? AND source_trace_event_id = ?
+      `, input.projectId, input.treeId, input.treeRevisionId, input.readinessResultId, input.sourceTraceEventId);
+      if (existing) {
+        return {
+          approvalRef: existing.approval_ref,
+          canonicalBlock: renderCanonicalTaskTreeBlock({
+            approvalRef: existing.approval_ref,
+            tree: treeView,
+            readiness: {
+              resultId: existing.readiness_result_id, ready: true, scopeKind: "tree",
+              coveredNodeIds: treeView.document.nodes.map((node) => node.id),
+            },
+          }),
+          canonicalBlockHash: existing.canonical_block_hash,
+          treeId: existing.tree_id,
+          treeRevisionId: existing.tree_revision_id,
+          readinessResultId: existing.readiness_result_id,
+          expiresAt: existing.expires_at,
+        };
+      }
+    }
     const timestamp = this.clock().toISOString();
     const expiresAt = new Date(Date.parse(timestamp) + APPROVAL_REFERENCE_TTL_MS).toISOString();
     const approvalRef = newId();
@@ -117,11 +146,11 @@ export class TaskTreeApprovalService {
         INSERT INTO task_tree_approval_references (
           approval_ref, project_id, session_id, tree_id, tree_revision_id, readiness_result_id,
           workflow_id, workflow_revision, confirmation_prompt_id, canonical_block_hash,
-          status, expires_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)
+          status, expires_at, created_at, source_trace_event_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)
       `, approvalRef, input.projectId, input.sessionId, input.treeId, input.treeRevisionId,
       input.readinessResultId, workflow.id, workflow.revision, confirmationId, canonicalBlockHash,
-      expiresAt, timestamp);
+      expiresAt, timestamp, input.sourceTraceEventId ?? null);
     });
     return {
       approvalRef, canonicalBlock, canonicalBlockHash, treeId: input.treeId,
@@ -132,7 +161,7 @@ export class TaskTreeApprovalService {
   getPending(input: { projectId: string; sessionId: string; treeId: string }) {
     const row = this.database.get<ApprovalRow>(`
       SELECT approval_ref, tree_id, tree_revision_id, readiness_result_id, canonical_block_hash,
-             status, expires_at, confirmation_prompt_id
+             status, expires_at, confirmation_prompt_id, source_trace_event_id
       FROM task_tree_approval_references
       WHERE project_id = ? AND session_id = ? AND tree_id = ? AND status = 'prepared'
       ORDER BY created_at DESC, approval_ref DESC LIMIT 1

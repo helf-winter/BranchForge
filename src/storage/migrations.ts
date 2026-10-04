@@ -1413,4 +1413,35 @@ export const migrations: Migration[] = [{
     CREATE TRIGGER native_plan_approval_events_no_delete BEFORE DELETE ON native_plan_approval_events
       BEGIN SELECT RAISE(ABORT, 'native Plan approval events are append-only'); END;
   `,
+}, {
+  version: 24,
+  sql: `
+    ALTER TABLE execution_attempts ADD COLUMN session_id TEXT;
+    ALTER TABLE execution_attempts ADD COLUMN agent_runtime TEXT;
+    ALTER TABLE execution_attempts ADD COLUMN tree_revision_id TEXT REFERENCES task_tree_revisions(id) ON DELETE RESTRICT;
+    ALTER TABLE execution_attempts ADD COLUMN workflow_revision INTEGER;
+    ALTER TABLE execution_attempts ADD COLUMN source_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT;
+    CREATE INDEX execution_attempts_session_active_idx
+      ON execution_attempts(project_id, session_id, tree_id, status, started_at DESC);
+
+    ALTER TABLE task_tree_approval_references ADD COLUMN source_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT;
+    CREATE UNIQUE INDEX task_tree_approval_source_unique
+      ON task_tree_approval_references(project_id, tree_id, tree_revision_id, readiness_result_id, source_trace_event_id)
+      WHERE source_trace_event_id IS NOT NULL;
+    DROP TRIGGER task_tree_approval_references_guard_update;
+    CREATE TRIGGER task_tree_approval_references_guard_update
+      BEFORE UPDATE ON task_tree_approval_references
+      WHEN OLD.status <> 'prepared'
+        OR NEW.status NOT IN ('consumed', 'rejected', 'expired', 'superseded')
+        OR NEW.approval_ref <> OLD.approval_ref OR NEW.project_id <> OLD.project_id
+        OR NEW.session_id <> OLD.session_id OR NEW.tree_id <> OLD.tree_id
+        OR NEW.tree_revision_id <> OLD.tree_revision_id OR NEW.readiness_result_id <> OLD.readiness_result_id
+        OR NEW.workflow_id <> OLD.workflow_id OR NEW.workflow_revision <> OLD.workflow_revision
+        OR NEW.confirmation_prompt_id <> OLD.confirmation_prompt_id
+        OR NEW.canonical_block_hash <> OLD.canonical_block_hash OR NEW.expires_at <> OLD.expires_at
+        OR NEW.created_at <> OLD.created_at
+        OR COALESCE(NEW.source_trace_event_id, '') <> COALESCE(OLD.source_trace_event_id, '')
+        OR NEW.resolved_at IS NULL
+      BEGIN SELECT RAISE(ABORT, 'invalid Task Tree approval reference transition'); END;
+  `,
 }];

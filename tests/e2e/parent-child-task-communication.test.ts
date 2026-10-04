@@ -58,7 +58,10 @@ describe("Parent-child Task communication", () => {
       answerTraceEventId: answer.eventId, workflowRevision: 3,
     });
 
-    const childAttempt = first.executions.startAttempt({ projectId: project.projectId, nodeId: "child", expectedTreeRevisionId: revision.revisionId });
+    const childAttempt = first.executions.startAttempt({
+      projectId: project.projectId, nodeId: "child", expectedTreeRevisionId: revision.revisionId,
+      sourceTraceEventId: answer.eventId,
+    });
     const childTrace = await first.hooks.ingest(mapClaudeHook({
       hook_event_name: "PostToolUse", session_id: "parent-child-run", cwd: projectDir,
       tool_name: "Bash", tool_use_id: "child-compile", tool_input: { command: "npm run build" },
@@ -92,6 +95,7 @@ describe("Parent-child Task communication", () => {
       reopened.workflows.transition({ projectId: project.projectId, treeId: root.treeId, workflowRevision: 6, to: "root_verification" });
       const parentAttempt = reopened.executions.startAttempt({
         projectId: project.projectId, nodeId: "parent", expectedTreeRevisionId: revision.revisionId,
+        sourceTraceEventId: answer.eventId,
       });
       const parentTrace = await reopened.hooks.ingest(mapClaudeHook({
         hook_event_name: "PostToolUse", session_id: "parent-child-run", cwd: projectDir,

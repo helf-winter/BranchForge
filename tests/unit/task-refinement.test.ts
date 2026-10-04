@@ -6,10 +6,10 @@ import {
 } from "../../src/domain/task-refinement.js";
 import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
 
-const leaf = (id: string, parentId: string, title = id) => ({
+const leaf = (id: string, parentId: string, title = id, executionPhase: "skeleton" | "implementation" | "verification" = "implementation") => ({
   id, parentId, title, children: [], objectives: [`Implement ${title}`], expectedOutputs: [`src/${id}.ts`],
   acceptanceCriteria: [`${title} passes`], unresolvedQuestions: [], unresolvedDecisions: [], dependencies: [],
-  requiredEvidence: [{ key: `${id}-test`, description: `${title} test` }], executionPhase: "implementation" as const,
+  requiredEvidence: [{ key: `${id}-test`, description: `${title} test` }], executionPhase,
   stopDecompositionReason: "one independently testable output",
 });
 
@@ -21,8 +21,11 @@ function document(): TaskTreeDocument {
       unresolvedQuestions: [], unresolvedDecisions: [], plannedEffects: [],
     },
     nodes: [
-      { id: "root", parentId: null, title: "Build feature", children: ["branch-a", "branch-b"] },
-      leaf("branch-a", "root", "Branch A"), leaf("branch-b", "root", "Branch B"),
+      { id: "root", parentId: null, title: "Build feature", children: ["branch-a", "branch-b"], executionPhase: "verification", requiredEvidence: [{ key: "root-test", description: "full test" }] },
+      { id: "branch-a", parentId: "root", title: "Branch A", children: ["a-skeleton", "a-impl"], executionPhase: "verification", requiredEvidence: [{ key: "a-verify", description: "A integration" }] },
+      leaf("a-skeleton", "branch-a", "A Skeleton", "skeleton"), leaf("a-impl", "branch-a", "A Implementation"),
+      { id: "branch-b", parentId: "root", title: "Branch B", children: ["b-skeleton", "b-impl"], executionPhase: "verification", requiredEvidence: [{ key: "b-verify", description: "B integration" }] },
+      leaf("b-skeleton", "branch-b", "B Skeleton", "skeleton"), leaf("b-impl", "branch-b", "B Implementation"),
     ],
     relations: [], artifacts: [],
     skeletonCriteria: [
@@ -35,7 +38,7 @@ function document(): TaskTreeDocument {
 describe("Task refinement domain", () => {
   it("accepts incomplete drafts structurally but rejects broken topology", () => {
     const incomplete = document();
-    incomplete.nodes[1] = { ...incomplete.nodes[1]!, acceptanceCriteria: [], unresolvedQuestions: ["Which API?"] };
+    incomplete.nodes[3] = { ...incomplete.nodes[3]!, acceptanceCriteria: [], unresolvedQuestions: ["Which API?"] };
     expect(validateDraftStructure(incomplete)).toEqual([]);
     expect(validateDraftStructure({
       ...incomplete, nodes: incomplete.nodes.map((node) => node.id === "branch-a" ? { ...node, parentId: "missing" } : node),
@@ -48,7 +51,7 @@ describe("Task refinement domain", () => {
 
   it("ranks deterministic scoped blockers and does not let a sibling-only issue block a ready branch", () => {
     const draft = document();
-    draft.nodes[2] = { ...draft.nodes[2]!, acceptanceCriteria: [], unresolvedQuestions: ["Choose B storage"] };
+    draft.nodes[6] = { ...draft.nodes[6]!, acceptanceCriteria: [], unresolvedQuestions: ["Choose B storage"] };
     draft.skeletonCriteria![1] = { ...draft.skeletonCriteria![1]!, verificationCommands: [] };
     const whole = analyzePlanReadiness(draft);
     expect(whole.ready).toBe(false);
@@ -63,10 +66,25 @@ describe("Task refinement domain", () => {
 
   it("keeps semantic conjunction detection as a warning rather than a blocker", () => {
     const draft = document();
-    draft.nodes[1] = { ...draft.nodes[1]!, objectives: ["Implement A and update unrelated B"] };
+    draft.nodes[3] = { ...draft.nodes[3]!, objectives: ["Implement A and update unrelated B"] };
     const result = analyzePlanReadiness(draft, "branch-a");
     expect(result.ready).toBe(true);
     expect(result.warnings).toEqual([expect.objectContaining({ code: "semantic_cohesion_warning", severity: "warning" })]);
+  });
+
+  it("rejects a ready-looking tree whose lifecycle topology cannot be scheduled", () => {
+    const draft = document();
+    draft.nodes = draft.nodes
+      .filter((node) => node.id !== "a-skeleton")
+      .map((node) => node.id === "branch-a" ? { ...node, children: ["a-impl"] } : node);
+    const implementationIndex = draft.nodes.findIndex((node) => node.id === "a-impl");
+    draft.nodes[implementationIndex] = { ...draft.nodes[implementationIndex]!, executionPhase: "implementation", children: ["nested"] };
+    draft.nodes.push(leaf("nested", "a-impl"));
+    const result = analyzePlanReadiness(draft);
+    expect(result.ready).toBe(false);
+    expect(result.blockingIssues.map((item) => item.code)).toEqual(expect.arrayContaining([
+      "skeleton_task_missing", "implementation_container_not_executable",
+    ]));
   });
 
   it("classifies one-branch changes as direct and multi-branch/root changes as preview-required", () => {
@@ -79,7 +97,7 @@ describe("Task refinement domain", () => {
 
     const broad = document();
     broad.nodes[1] = { ...broad.nodes[1]!, title: "A2" };
-    broad.nodes[2] = { ...broad.nodes[2]!, title: "B2" };
+    broad.nodes[4] = { ...broad.nodes[4]!, title: "B2" };
     expect(analyzeDraftImpact(base, broad)).toMatchObject({
       impactLevel: "cross_branch", applyMode: "preview_required", affectedBranchIds: ["branch-a", "branch-b"],
     });

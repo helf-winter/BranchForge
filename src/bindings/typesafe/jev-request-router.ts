@@ -4,6 +4,7 @@ import type {
   RequestRouteClassification,
   TaskTreeRelationSuggestion,
 } from "../../domain/request-routing.js";
+import { redactSecrets } from "../../domain/trace.js";
 
 export interface RequestRouteSnapshot {
   prompt: string;
@@ -120,6 +121,29 @@ function questions(hasActiveTree: boolean): Record<string, unknown> {
   return result;
 }
 
+function sanitizeRoutingText(value: string, limit: number, omitSource: boolean): string {
+  let result = String(redactSecrets(value));
+  if (omitSource) {
+    result = result.replace(/```[\s\S]*?```/g, "[CODE OMITTED]");
+    result = result.split(/\r?\n/).map((line) => (
+      /^\s*(?:import|export|const|let|var|function|class|interface|type|def|public|private|#include|package|using)\b/.test(line)
+        ? "[CODE OMITTED]"
+        : line
+    )).filter((line, index, lines) => line !== "[CODE OMITTED]" || lines[index - 1] !== line).join("\n");
+  }
+  return result.slice(0, limit);
+}
+
+export function sanitizeRequestRouteSnapshot(snapshot: RequestRouteSnapshot): RequestRouteSnapshot {
+  return {
+    prompt: sanitizeRoutingText(snapshot.prompt, 2_000, true),
+    hasActiveTree: snapshot.hasActiveTree,
+    activeTreeTitle: snapshot.activeTreeTitle === null ? null : sanitizeRoutingText(snapshot.activeTreeTitle, 160, false),
+    currentNodeTitle: snapshot.currentNodeTitle === null ? null : sanitizeRoutingText(snapshot.currentNodeTitle, 160, false),
+    hasActiveWorkflow: snapshot.hasActiveWorkflow,
+  };
+}
+
 export class JevRequestRouter {
   constructor(
     private readonly config: JevRequestRoutingConfiguration,
@@ -134,6 +158,7 @@ export class JevRequestRouter {
       throw new HarnessError("provider_misconfigured", "TYPESAFE_API_KEY is not configured");
     }
 
+    const outboundSnapshot = sanitizeRequestRouteSnapshot(snapshot);
     const startedAt = Date.now();
     let response: Response;
     try {
@@ -144,9 +169,9 @@ export class JevRequestRouter {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          state: snapshot,
+          state: outboundSnapshot,
           model: this.config.model,
-          questions: questions(snapshot.hasActiveTree),
+          questions: questions(outboundSnapshot.hasActiveTree),
         }),
         signal: AbortSignal.timeout(this.config.timeoutMs),
       });
@@ -183,7 +208,7 @@ export class JevRequestRouter {
     }
 
     const requestKind = parseChoice(answers.request_kind, classifications, "request_kind");
-    const treeRelation = snapshot.hasActiveTree
+    const treeRelation = outboundSnapshot.hasActiveTree
       ? parseChoice(answers.tree_relation, treeRelations, "tree_relation").choice as TaskTreeRelationSuggestion
       : "create_new_tree";
     const classification = requestKind.choice as RequestRouteClassification;

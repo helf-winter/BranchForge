@@ -149,6 +149,27 @@ export class NativePlanBindingService {
       throw new HarnessError("confirmation_not_applicable", "native Plan approval reference has already been resolved");
     }
     const timestamp = this.clock().toISOString();
+    let expired = false;
+    this.database.transaction(() => {
+      const current = this.database.get<{ status: string; expires_at: string }>(
+        "SELECT status, expires_at FROM task_tree_approval_references WHERE approval_ref = ?",
+        approval.approval_ref,
+      );
+      if (current?.status === "prepared" && current.expires_at <= timestamp) {
+        this.database.run(
+          "UPDATE task_tree_approval_references SET status = 'expired', resolved_at = ? WHERE approval_ref = ?",
+          timestamp, approval.approval_ref,
+        );
+        this.database.run(
+          "UPDATE runtime_confirmation_prompts SET status = 'cancelled', answer = 'expired', resolved_at = ? WHERE id = ? AND status = 'pending'",
+          timestamp, approval.confirmation_prompt_id,
+        );
+        expired = true;
+      }
+    });
+    if (expired) {
+      throw new HarnessError("confirmation_not_applicable", "native Plan approval reference expired before the native approval completed");
+    }
     if (input.outcome === "rejected") {
       this.database.transaction(() => {
         this.database.run(`
