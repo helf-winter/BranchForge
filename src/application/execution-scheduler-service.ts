@@ -110,7 +110,8 @@ export class ExecutionSchedulerService {
         SELECT status FROM workflow_branch_states
         WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ? AND branch_node_id = ?
       `, input.projectId, input.treeId, workflow.current_revision_id, branchId);
-      if (!branch || branch.status !== "active") return null;
+      const requiredBranchStatus = workflow.stage === "branch_implementation" ? "active" : "implemented";
+      if (!branch || branch.status !== requiredBranchStatus) return null;
       const scope = descendants(branchId);
       const phase = workflow.stage === "branch_implementation" ? "implementation" : "verification";
       candidates = document.nodes.filter((node) => scope.has(node.id) && node.executionPhase === phase

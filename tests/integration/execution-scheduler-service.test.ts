@@ -90,7 +90,7 @@ describe("ExecutionSchedulerService", () => {
     const f = await fixture();
     f.database.run("UPDATE task_nodes SET status = 'succeeded' WHERE id IN ('a-skeleton', 'b-skeleton', 'a-impl')");
     f.database.run("UPDATE workflow_states SET stage = 'branch_verification', active_branch_node_id = 'branch-a', revision = 6 WHERE tree_id = ?", f.revision.treeId);
-    f.database.run("INSERT INTO workflow_branch_states (project_id, tree_id, tree_revision_id, branch_node_id, branch_order, status, updated_at) VALUES ('p1', ?, ?, 'branch-a', 0, 'active', 'now')", f.revision.treeId, f.revision.revisionId);
+    f.database.run("INSERT INTO workflow_branch_states (project_id, tree_id, tree_revision_id, branch_node_id, branch_order, status, updated_at) VALUES ('p1', ?, ?, 'branch-a', 0, 'implemented', 'now')", f.revision.treeId, f.revision.revisionId);
     expect(f.scheduler.next({ projectId: "p1", treeId: f.revision.treeId })).toMatchObject({ nodeId: "a-verify", phase: "verification" });
     f.database.run("UPDATE task_nodes SET status = 'succeeded' WHERE id IN ('branch-a', 'branch-b')");
     f.database.run("UPDATE workflow_states SET stage = 'root_verification', active_branch_node_id = NULL, revision = 9 WHERE tree_id = ?", f.revision.treeId);
