@@ -1,6 +1,6 @@
 # Native Plan → Task Tree Bridge Implementation Plan
 
-> **Status: SUPERSEDED — DO NOT EXECUTE.** The approved architecture now uses a first-class Task Tree Tool Provider and a canonical approval reference instead of parsing a full JSON Manifest from the native Plan. A replacement implementation plan will be written after review of `docs/superpowers/specs/2026-10-01-native-plan-task-tree-bridge-design.md`.
+> **Status: SUPERSEDED — DO NOT EXECUTE.** The approved architecture now uses a first-class Task Tree Tool Provider and a canonical approval reference instead of parsing a full JSON Manifest from the native Plan. Execute `docs/superpowers/plans/2026-10-04-structured-coding-runtime.md` instead.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
