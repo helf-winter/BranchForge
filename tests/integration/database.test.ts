@@ -18,13 +18,13 @@ describe("RuntimeDatabase", () => {
   it("applies migrations once and persists data across reopen", async () => {
     const filename = await databasePath();
     const first = new RuntimeDatabase(filename);
-    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }]);
+    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }]);
     first.run("INSERT INTO projects (id, canonical_path, created_at, updated_at) VALUES (?, ?, ?, ?)", "p1", "/work/a", "2026-01-01", "2026-01-01");
     first.close();
 
     const reopened = new RuntimeDatabase(filename);
     expect(reopened.get<{ canonical_path: string }>("SELECT canonical_path FROM projects WHERE id = ?", "p1")).toEqual({ canonical_path: "/work/a" });
-    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(22);
+    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(23);
     reopened.close();
   });
 
@@ -429,6 +429,35 @@ describe("RuntimeDatabase", () => {
       { name: "task_tree_authoring_commands_no_delete" },
       { name: "task_tree_authoring_commands_no_update" },
     ]);
+    database.close();
+  });
+
+  it("adds constrained native Plan approval and append-only binding facts", async () => {
+    const database = new RuntimeDatabase(await databasePath());
+    expect(database.all<{ name: string }>(`
+      SELECT name FROM sqlite_master WHERE type = 'table'
+        AND name IN (
+          'task_tree_approval_references', 'native_plan_snapshots',
+          'native_plan_task_tree_links', 'native_plan_approval_events'
+        ) ORDER BY name
+    `)).toEqual([
+      { name: "native_plan_approval_events" },
+      { name: "native_plan_snapshots" },
+      { name: "native_plan_task_tree_links" },
+      { name: "task_tree_approval_references" },
+    ]);
+    const approvalColumns = database.all<{ name: string }>("PRAGMA table_info(task_tree_approval_references)")
+      .map((row) => row.name);
+    expect(approvalColumns).toEqual(expect.arrayContaining([
+      "approval_ref", "project_id", "session_id", "tree_id", "tree_revision_id",
+      "readiness_result_id", "workflow_id", "workflow_revision", "confirmation_prompt_id",
+      "canonical_block_hash", "status", "expires_at", "created_at", "resolved_at",
+    ]));
+    expect(approvalColumns).not.toEqual(expect.arrayContaining(["prompt", "api_key", "raw_response"]));
+    expect(database.all<{ name: string }>(`
+      SELECT name FROM sqlite_master WHERE type = 'trigger'
+        AND name LIKE 'native_plan_%_no_%' ORDER BY name
+    `)).toHaveLength(6);
     database.close();
   });
 });

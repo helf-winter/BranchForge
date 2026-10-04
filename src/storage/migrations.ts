@@ -1327,4 +1327,90 @@ export const migrations: Migration[] = [{
       BEFORE DELETE ON task_tree_authoring_commands
       BEGIN SELECT RAISE(ABORT, 'task tree authoring commands are immutable'); END;
   `,
+}, {
+  version: 23,
+  sql: `
+    CREATE TABLE task_tree_approval_references (
+      approval_ref TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      tree_id TEXT NOT NULL REFERENCES task_trees(id) ON DELETE CASCADE,
+      tree_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      readiness_result_id TEXT NOT NULL REFERENCES plan_readiness_results(id) ON DELETE RESTRICT,
+      workflow_id TEXT NOT NULL REFERENCES workflow_states(id) ON DELETE RESTRICT,
+      workflow_revision INTEGER NOT NULL CHECK(workflow_revision > 0),
+      confirmation_prompt_id TEXT NOT NULL UNIQUE REFERENCES runtime_confirmation_prompts(id) ON DELETE RESTRICT,
+      canonical_block_hash TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('prepared', 'consumed', 'rejected', 'expired', 'superseded')),
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+    CREATE INDEX task_tree_approval_pending_idx
+      ON task_tree_approval_references(project_id, session_id, tree_id, status, created_at DESC);
+    CREATE TRIGGER task_tree_approval_references_guard_update
+      BEFORE UPDATE ON task_tree_approval_references
+      WHEN OLD.status <> 'prepared'
+        OR NEW.status NOT IN ('consumed', 'rejected', 'expired', 'superseded')
+        OR NEW.approval_ref <> OLD.approval_ref OR NEW.project_id <> OLD.project_id
+        OR NEW.session_id <> OLD.session_id OR NEW.tree_id <> OLD.tree_id
+        OR NEW.tree_revision_id <> OLD.tree_revision_id OR NEW.readiness_result_id <> OLD.readiness_result_id
+        OR NEW.workflow_id <> OLD.workflow_id OR NEW.workflow_revision <> OLD.workflow_revision
+        OR NEW.confirmation_prompt_id <> OLD.confirmation_prompt_id
+        OR NEW.canonical_block_hash <> OLD.canonical_block_hash OR NEW.expires_at <> OLD.expires_at
+        OR NEW.created_at <> OLD.created_at OR NEW.resolved_at IS NULL
+      BEGIN SELECT RAISE(ABORT, 'invalid Task Tree approval reference transition'); END;
+    CREATE TRIGGER task_tree_approval_references_no_delete
+      BEFORE DELETE ON task_tree_approval_references
+      BEGIN SELECT RAISE(ABORT, 'Task Tree approval references are immutable facts'); END;
+
+    CREATE TABLE native_plan_snapshots (
+      id TEXT PRIMARY KEY,
+      approval_ref TEXT NOT NULL REFERENCES task_tree_approval_references(approval_ref) ON DELETE RESTRICT,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      tool_use_id TEXT NOT NULL,
+      plan_hash TEXT NOT NULL,
+      canonical_block_hash TEXT NOT NULL,
+      plan_file_path TEXT,
+      trace_event_id TEXT NOT NULL REFERENCES trace_events(id) ON DELETE RESTRICT,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, session_id, tool_use_id)
+    );
+    CREATE TABLE native_plan_task_tree_links (
+      id TEXT PRIMARY KEY,
+      snapshot_id TEXT NOT NULL UNIQUE REFERENCES native_plan_snapshots(id) ON DELETE RESTRICT,
+      approval_ref TEXT NOT NULL UNIQUE REFERENCES task_tree_approval_references(approval_ref) ON DELETE RESTRICT,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      tree_id TEXT NOT NULL REFERENCES task_trees(id) ON DELETE CASCADE,
+      tree_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      confirmation_prompt_id TEXT NOT NULL REFERENCES runtime_confirmation_prompts(id) ON DELETE RESTRICT,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE native_plan_approval_events (
+      id TEXT PRIMARY KEY,
+      approval_ref TEXT NOT NULL REFERENCES task_tree_approval_references(approval_ref) ON DELETE RESTRICT,
+      snapshot_id TEXT NOT NULL REFERENCES native_plan_snapshots(id) ON DELETE RESTRICT,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      tool_use_id TEXT NOT NULL,
+      trace_event_id TEXT NOT NULL REFERENCES trace_events(id) ON DELETE RESTRICT,
+      outcome TEXT NOT NULL CHECK(outcome IN ('approved', 'rejected')),
+      plan_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, session_id, tool_use_id, outcome)
+    );
+    CREATE TRIGGER native_plan_snapshots_no_update BEFORE UPDATE ON native_plan_snapshots
+      BEGIN SELECT RAISE(ABORT, 'native Plan snapshots are append-only'); END;
+    CREATE TRIGGER native_plan_snapshots_no_delete BEFORE DELETE ON native_plan_snapshots
+      BEGIN SELECT RAISE(ABORT, 'native Plan snapshots are append-only'); END;
+    CREATE TRIGGER native_plan_task_tree_links_no_update BEFORE UPDATE ON native_plan_task_tree_links
+      BEGIN SELECT RAISE(ABORT, 'native Plan Task Tree links are append-only'); END;
+    CREATE TRIGGER native_plan_task_tree_links_no_delete BEFORE DELETE ON native_plan_task_tree_links
+      BEGIN SELECT RAISE(ABORT, 'native Plan Task Tree links are append-only'); END;
+    CREATE TRIGGER native_plan_approval_events_no_update BEFORE UPDATE ON native_plan_approval_events
+      BEGIN SELECT RAISE(ABORT, 'native Plan approval events are append-only'); END;
+    CREATE TRIGGER native_plan_approval_events_no_delete BEFORE DELETE ON native_plan_approval_events
+      BEGIN SELECT RAISE(ABORT, 'native Plan approval events are append-only'); END;
+  `,
 }];

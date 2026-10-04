@@ -27,6 +27,7 @@ import { RequestRoutingService } from "./request-routing-service.js";
 import { RuntimeProfileService } from "./runtime-profile-service.js";
 import { TaskTreeDraftService } from "./task-tree-draft-service.js";
 import { TaskTreeValidationService } from "./task-tree-validation-service.js";
+import { TaskTreeApprovalService } from "./task-tree-approval-service.js";
 
 export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
   const database = new RuntimeDatabase(path.join(resolveDataHome(environment), "runtime.db"));
@@ -63,6 +64,7 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
     taskTrees,
     taskTreeDrafts: new TaskTreeDraftService(database, taskTrees),
     taskTreeValidation: new TaskTreeValidationService(database, taskTrees),
+    taskTreeApprovals: new TaskTreeApprovalService(database, taskTrees),
     affiliations,
     workflows: new WorkflowService(database),
     executions: new NodeExecutionService(database),
