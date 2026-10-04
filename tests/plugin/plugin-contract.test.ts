@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -86,6 +86,26 @@ describe("Claude plugin contract", () => {
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout).toBe("");
       await expect(readFile(path.join(cwd, ".agent-harness-project.json"))).rejects.toThrow();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails open when the Hook runtime storage cannot be initialized", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "harness compiled fail open "));
+    try {
+      const blockedDataHome = path.join(cwd, "not-a-directory");
+      await writeFile(blockedDataHome, "occupied");
+      const input = JSON.stringify({
+        hook_event_name: "PreToolUse", session_id: "s1", cwd, tool_name: "Write", tool_use_id: "write-1",
+        tool_input: { file_path: path.join(cwd, "src", "app.ts") },
+      });
+      const result = spawnSync(process.execPath, [path.join(root, "runtime", "hook.mjs")], {
+        input, encoding: "utf8", env: { ...process.env, AGENT_HARNESS_DATA_HOME: blockedDataHome },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("hook failed open");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
