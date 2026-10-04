@@ -18,13 +18,13 @@ describe("RuntimeDatabase", () => {
   it("applies migrations once and persists data across reopen", async () => {
     const filename = await databasePath();
     const first = new RuntimeDatabase(filename);
-    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }]);
+    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }]);
     first.run("INSERT INTO projects (id, canonical_path, created_at, updated_at) VALUES (?, ?, ?, ?)", "p1", "/work/a", "2026-01-01", "2026-01-01");
     first.close();
 
     const reopened = new RuntimeDatabase(filename);
     expect(reopened.get<{ canonical_path: string }>("SELECT canonical_path FROM projects WHERE id = ?", "p1")).toEqual({ canonical_path: "/work/a" });
-    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(19);
+    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(21);
     reopened.close();
   });
 
@@ -358,6 +358,57 @@ describe("RuntimeDatabase", () => {
     expect(() => database.run("INSERT INTO task_tree_collection_transitions (id, project_id, tree_id, action, from_status, to_status, created_at) VALUES ('bad', 'p1', 't1', 'deleted', 'draft', 'deleted', 'now')")).toThrow();
     expect(() => database.run("UPDATE task_tree_collection_transitions SET to_status = 'confirmed' WHERE id = 'c1'")).toThrow();
     expect(() => database.run("DELETE FROM task_tree_collection_transitions WHERE id = 'c1'")).toThrow();
+    database.close();
+  });
+
+  it("persists immutable request routes and runtime profile transitions without provider secrets", async () => {
+    const database = new RuntimeDatabase(await databasePath());
+    expect(database.all<{ name: string }>(`
+      SELECT name FROM sqlite_master WHERE type = 'table'
+        AND name IN ('request_route_decisions', 'runtime_profile_states', 'runtime_profile_transitions')
+      ORDER BY name
+    `)).toEqual([
+      { name: "request_route_decisions" },
+      { name: "runtime_profile_states" },
+      { name: "runtime_profile_transitions" },
+    ]);
+    const routeColumns = database.all<{ name: string }>("PRAGMA table_info(request_route_decisions)").map((row) => row.name);
+    expect(routeColumns).toEqual(expect.arrayContaining([
+      "project_id", "session_id", "prompt_fingerprint", "classification", "tree_relation",
+      "confidence", "probabilities_json", "reason_codes_json", "disposition", "provider",
+      "model_requested", "model_resolved", "fallback_reason", "policy_version", "created_at",
+    ]));
+    expect(routeColumns).not.toEqual(expect.arrayContaining(["api_key", "raw_response", "prompt"]));
+
+    database.run("INSERT INTO projects (id, canonical_path, created_at, updated_at) VALUES ('p1', '/work/a', 'now', 'now')");
+    database.run(`
+      INSERT INTO request_route_decisions (
+        id, project_id, session_id, prompt_fingerprint, classification, tree_relation,
+        confidence, probabilities_json, reason_codes_json, disposition, provider,
+        model_requested, model_resolved, fallback_reason, policy_version, created_at
+      ) VALUES ('route-1', 'p1', 'session-1', 'hash', 'task_tree_workflow', 'create_new_tree',
+        0.95, '{}', '["complex"]', 'accepted', 'typesafe_jev', 'jev-1.13.0', 'jev-1.13.0', NULL, 'request-routing-v1', 'now')
+    `);
+    database.run(`
+      INSERT INTO runtime_profile_states (
+        project_id, session_id, profile, source_route_decision_id, reason_code, updated_at
+      ) VALUES ('p1', 'session-1', 'structured_coding', 'route-1', 'route:task_tree_workflow', 'now')
+    `);
+    database.run(`
+      INSERT INTO runtime_profile_transitions (
+        id, project_id, session_id, prior_profile, next_profile,
+        source_route_decision_id, reason_code, created_at
+      ) VALUES ('transition-1', 'p1', 'session-1', NULL, 'structured_coding',
+        'route-1', 'route:task_tree_workflow', 'now')
+    `);
+    expect(() => database.run("UPDATE request_route_decisions SET confidence = 0 WHERE id = 'route-1'")).toThrow();
+    expect(() => database.run("DELETE FROM request_route_decisions WHERE id = 'route-1'")).toThrow();
+    expect(() => database.run("UPDATE runtime_profile_transitions SET next_profile = 'conversation' WHERE id = 'transition-1'")).toThrow();
+    expect(() => database.run("DELETE FROM runtime_profile_transitions WHERE id = 'transition-1'")).toThrow();
+    expect(() => database.run(`
+      INSERT INTO runtime_profile_states (project_id, session_id, profile, reason_code, updated_at)
+      VALUES ('missing', 'session-1', 'conversation', 'test', 'now')
+    `)).toThrow();
     database.close();
   });
 });

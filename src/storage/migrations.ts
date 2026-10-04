@@ -1194,4 +1194,110 @@ export const migrations: Migration[] = [{
       BEFORE DELETE ON verification_invalidations
       BEGIN SELECT RAISE(ABORT, 'verification invalidations are immutable'); END;
   `,
+}, {
+  version: 20,
+  sql: `
+    ALTER TABLE task_affiliation_decisions RENAME TO task_affiliation_decisions_v14;
+    CREATE TABLE task_affiliation_decisions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      request_trace_event_id TEXT NOT NULL UNIQUE REFERENCES trace_events(id) ON DELETE RESTRICT,
+      request_title TEXT NOT NULL,
+      candidate_query TEXT NOT NULL,
+      candidate_snapshot_json TEXT NOT NULL,
+      recommendation TEXT NOT NULL CHECK(recommendation IN ('new_tree', 'merge')),
+      recommended_tree_id TEXT REFERENCES task_trees(id) ON DELETE SET NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'direct_execution', 'new_tree', 'merged', 'paused')),
+      confirmation_prompt_id TEXT NOT NULL UNIQUE REFERENCES runtime_confirmation_prompts(id) ON DELETE RESTRICT,
+      runtime_action_id TEXT NOT NULL UNIQUE REFERENCES runtime_actions(id) ON DELETE RESTRICT,
+      answer_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT,
+      resolved_tree_id TEXT REFERENCES task_trees(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+    INSERT INTO task_affiliation_decisions (
+      id, project_id, request_trace_event_id, request_title, candidate_query,
+      candidate_snapshot_json, recommendation, recommended_tree_id, status,
+      confirmation_prompt_id, runtime_action_id, answer_trace_event_id,
+      resolved_tree_id, created_at, resolved_at
+    ) SELECT
+      id, project_id, request_trace_event_id, request_title, candidate_query,
+      candidate_snapshot_json, recommendation, recommended_tree_id, status,
+      confirmation_prompt_id, runtime_action_id, answer_trace_event_id,
+      resolved_tree_id, created_at, resolved_at
+    FROM task_affiliation_decisions_v14;
+    DROP TABLE task_affiliation_decisions_v14;
+    CREATE UNIQUE INDEX one_pending_task_affiliation_per_project
+      ON task_affiliation_decisions(project_id) WHERE status = 'pending';
+    CREATE INDEX task_affiliation_history_idx
+      ON task_affiliation_decisions(project_id, created_at DESC, id DESC);
+  `,
+}, {
+  version: 21,
+  sql: `
+    CREATE TABLE request_route_decisions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      prompt_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE SET NULL,
+      prompt_fingerprint TEXT NOT NULL,
+      classification TEXT NOT NULL CHECK(classification IN ('direct_response', 'direct_execution', 'task_tree_workflow')),
+      tree_relation TEXT CHECK(tree_relation IN ('continue_existing_tree', 'change_existing_tree', 'create_new_tree', 'unclear')),
+      confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+      probabilities_json TEXT NOT NULL,
+      reason_codes_json TEXT NOT NULL,
+      disposition TEXT NOT NULL CHECK(disposition IN ('accepted', 'advisory', 'native_fallback', 'explicit_override')),
+      provider TEXT NOT NULL,
+      model_requested TEXT NOT NULL,
+      model_resolved TEXT,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      latency_ms INTEGER,
+      fallback_reason TEXT,
+      policy_version TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, session_id, prompt_fingerprint, policy_version)
+    );
+    CREATE INDEX request_route_history_idx
+      ON request_route_decisions(project_id, session_id, created_at DESC, id DESC);
+    CREATE TRIGGER request_route_decisions_no_update
+      BEFORE UPDATE ON request_route_decisions
+      BEGIN SELECT RAISE(ABORT, 'request route decisions are immutable'); END;
+    CREATE TRIGGER request_route_decisions_no_delete
+      BEFORE DELETE ON request_route_decisions
+      BEGIN SELECT RAISE(ABORT, 'request route decisions are immutable'); END;
+
+    CREATE TABLE runtime_profile_states (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      profile TEXT NOT NULL CHECK(profile IN ('conversation', 'direct_coding', 'structured_coding')),
+      source_route_decision_id TEXT REFERENCES request_route_decisions(id) ON DELETE SET NULL,
+      source_affiliation_decision_id TEXT REFERENCES task_affiliation_decisions(id) ON DELETE SET NULL,
+      reason_code TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(project_id, session_id)
+    );
+    CREATE INDEX runtime_profile_state_profile_idx
+      ON runtime_profile_states(project_id, profile, updated_at DESC);
+
+    CREATE TABLE runtime_profile_transitions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      prior_profile TEXT CHECK(prior_profile IN ('conversation', 'direct_coding', 'structured_coding')),
+      next_profile TEXT NOT NULL CHECK(next_profile IN ('conversation', 'direct_coding', 'structured_coding')),
+      source_route_decision_id TEXT REFERENCES request_route_decisions(id) ON DELETE SET NULL,
+      source_affiliation_decision_id TEXT REFERENCES task_affiliation_decisions(id) ON DELETE SET NULL,
+      reason_code TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX runtime_profile_transition_history_idx
+      ON runtime_profile_transitions(project_id, session_id, created_at DESC, id DESC);
+    CREATE TRIGGER runtime_profile_transitions_no_update
+      BEFORE UPDATE ON runtime_profile_transitions
+      BEGIN SELECT RAISE(ABORT, 'runtime profile transitions are immutable'); END;
+    CREATE TRIGGER runtime_profile_transitions_no_delete
+      BEFORE DELETE ON runtime_profile_transitions
+      BEGIN SELECT RAISE(ABORT, 'runtime profile transitions are immutable'); END;
+  `,
 }];
