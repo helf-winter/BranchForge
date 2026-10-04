@@ -50,6 +50,14 @@ describe("Claude plugin contract", () => {
     const planning = await readFile(path.join(root, "skills", "task-tree-planning", "SKILL.md"), "utf8");
     expect(planning.match(/^description: ([^\r\n]+)/m)?.[1]).toContain("complex, multi-stage, cross-module");
     expect(planning.match(/^description: ([^\r\n]+)/m)?.[1]).toContain("execute directly without a Task Tree");
+    for (const required of [
+      "AskUserQuestion", "harness_create_task_tree_draft", "harness_patch_task_tree",
+      "harness_validate_task_tree", "harness_prepare_task_tree_approval",
+    ]) expect(planning).toContain(required);
+    expect(planning).toContain("canonical block unchanged");
+    expect(planning).toContain("native Plan approval exactly once");
+    expect(planning).toContain("Never write a JSON manifest");
+    expect(planning).toContain("Never ask for a second Harness confirmation");
   });
 
   it("runs the compiled CLI from a non-ASCII plugin path", () => {

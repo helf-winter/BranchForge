@@ -1,24 +1,34 @@
 ---
 name: task-tree-planning
-description: Use when a coding request may modify project assets and needs a new or existing Task Tree plan before execution.
+description: Use when a coding request is complex, multi-stage, cross-module, has unresolved design decisions, or the user explicitly requests structured planning; skip it for small self-contained changes and whenever the user explicitly asks to execute directly without a Task Tree.
 ---
 
 # Task Tree Planning
 
-Treat Task Tree planning as the Agent's native planning workflow, with the Runtime Layer preserving durable facts. A planning draft may be incomplete; execution readiness may not.
+Use Claude's native discussion, reasoning, Plan Mode, and `AskUserQuestion`. The Runtime preserves durable planning facts; it does not replace native planning.
 
-1. Do not create a Task Tree for explanation-only conversation.
-2. For a coding request, inspect Project identity with `harness_get_project_identity`. If a copied directory is detected, let the Runtime create its independent Project before planning; use `harness_get_project_clones` when provenance or inherited state matters.
-3. Call `harness_propose_task_affiliation` with a concise request title, deterministic candidate query, and your `new_tree` or `merge` recommendation. Use a returned candidate ID when recommending merge. This persists the candidate snapshot and confirmation prompt but does not create or select a tree.
-4. Present the returned candidates, recommendation, and explicit `new_tree`, `merge`, or `pause` choices. Never decide this silently.
-5. After the user answers, find that later `UserPromptSubmit` with `harness_get_trace_events` and call `harness_resolve_task_affiliation` with the exact decision ID and answer Trace ID. Continue with the returned new or selected tree; stop if the choice is `pause`. Only the explicit `/taskroot` command may bypass this ordinary-request affiliation flow.
-6. Build the full goal-level tree with `planningVersion: 1`, root planning context, planned Effects, and per-branch Skeleton Acceptance Criteria. Save structurally valid intermediate drafts with `harness_save_draft_revision`; unresolved details belong in the draft rather than hidden conversation state.
-7. Run `harness_scan_plan_readiness`. Discuss its deterministic `recommendedNextIssue`, one local issue at a time; the user may redirect the branch. A leaf is ready only with one objective, explicit outputs and acceptance criteria, no unresolved question or decision, valid dependencies, completion evidence, an execution phase, and a stop-decomposition reason.
-8. Model calls, data exchange, and shared contracts as Task relation edges backed by planned Artifacts. Model high-risk planned Effects with mitigation before readiness can pass.
-9. Before applying a refined document, identify the triggering `UserPromptSubmit` with `harness_get_trace_events`. Use `harness_preview_draft_change_set` when impact is cross-branch. Apply through `harness_apply_draft_change_set` with that Trace ID and a user-visible Decision Record; never include hidden reasoning.
-10. Use `harness_get_task_refinement_history` and `harness_get_planning_decision_detail` when prior decisions or impact must be recovered instead of replaying the whole conversation.
-11. When scoped readiness passes, show the complete tree and request confirmation through `harness_create_confirmation_prompt` before project mutation.
+## Choose the path
 
-If a revision conflict occurs, query current state and reconcile; never overwrite it.
-If a discussion produces no structural change, do not create a revision.
-After a Project Clone, treat inherited execution evidence as provenance only: revalidate paused or previously successful nodes in the target Project before continuing execution.
+- Explanation-only or small self-contained change: answer or execute directly. Do not create a Task Tree.
+- Explicit “execute directly/no Task Tree”: resolve any pending affiliation as `direct_execution`, then obey it.
+- Complex, multi-stage, cross-module, or explicitly planned work: follow the workflow below.
+
+## Structured planning workflow
+
+1. Inspect Project identity and propose `new_tree` or `merge` with `harness_propose_task_affiliation`.
+2. Show the candidates and recommendation. Use `AskUserQuestion` so the user explicitly chooses `direct_execution`, `new_tree`, `merge`, or `pause`.
+3. Find the later answer through `harness_get_trace_events`, then call `harness_resolve_task_affiliation`. Do not draft before affiliation is resolved.
+4. Discuss requirements natively. Build one full goal-level `planningVersion: 1` document with planning context, nodes, Leaf Task Contracts, relations, planned Artifacts/Effects, and per-branch Skeleton Acceptance Criteria.
+5. Call `harness_create_task_tree_draft` once for that complete goal-level document. Unresolved details belong in the document, not hidden conversation state.
+6. Continue question-driven local refinement. After a user-visible decision changes structure, call `harness_patch_task_tree` with exactly one operation, the answer Trace ID, the exact base revision, and a concise Decision Record. Do not create a revision when nothing structural changed.
+7. Call `harness_validate_task_tree`. Discuss its highest-impact blocker with the user and repeat patch/validate until `ready: true`.
+8. Call `harness_prepare_task_tree_approval` using a later `UserPromptSubmit`. Insert its canonical block unchanged into the native Plan.
+9. Use native Plan approval exactly once. After approval, continue with the executable node supplied by the Runtime.
+
+## Planning contract
+
+- A leaf has one objective, explicit outputs and acceptance criteria, no unresolved question or decision, valid dependencies, completion evidence, an execution phase, and a stop-decomposition reason.
+- Calls, data exchange, and shared contracts are relations backed by planned Artifacts. High-risk Effects include mitigation.
+- Never write a JSON manifest into the native Plan.
+- Never ask for a second Harness confirmation; native Plan approval is the confirmation surface.
+- On revision conflict, read current state and reconcile. Never overwrite a newer revision.
