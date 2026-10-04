@@ -1300,4 +1300,31 @@ export const migrations: Migration[] = [{
       BEFORE DELETE ON runtime_profile_transitions
       BEGIN SELECT RAISE(ABORT, 'runtime profile transitions are immutable'); END;
   `,
+}, {
+  version: 22,
+  sql: `
+    CREATE TABLE task_tree_authoring_commands (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      tree_id TEXT NOT NULL REFERENCES task_trees(id) ON DELETE CASCADE,
+      affiliation_decision_id TEXT REFERENCES task_affiliation_decisions(id) ON DELETE SET NULL,
+      command_kind TEXT NOT NULL CHECK(command_kind IN ('create_draft', 'patch')),
+      idempotency_key TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      base_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      result_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      source_session_id TEXT NOT NULL,
+      source_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, idempotency_key)
+    );
+    CREATE INDEX task_tree_authoring_history_idx
+      ON task_tree_authoring_commands(project_id, tree_id, created_at DESC, id DESC);
+    CREATE TRIGGER task_tree_authoring_commands_no_update
+      BEFORE UPDATE ON task_tree_authoring_commands
+      BEGIN SELECT RAISE(ABORT, 'task tree authoring commands are immutable'); END;
+    CREATE TRIGGER task_tree_authoring_commands_no_delete
+      BEFORE DELETE ON task_tree_authoring_commands
+      BEGIN SELECT RAISE(ABORT, 'task tree authoring commands are immutable'); END;
+  `,
 }];

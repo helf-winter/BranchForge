@@ -18,13 +18,13 @@ describe("RuntimeDatabase", () => {
   it("applies migrations once and persists data across reopen", async () => {
     const filename = await databasePath();
     const first = new RuntimeDatabase(filename);
-    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }]);
+    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }]);
     first.run("INSERT INTO projects (id, canonical_path, created_at, updated_at) VALUES (?, ?, ?, ?)", "p1", "/work/a", "2026-01-01", "2026-01-01");
     first.close();
 
     const reopened = new RuntimeDatabase(filename);
     expect(reopened.get<{ canonical_path: string }>("SELECT canonical_path FROM projects WHERE id = ?", "p1")).toEqual({ canonical_path: "/work/a" });
-    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(21);
+    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(22);
     reopened.close();
   });
 
@@ -409,6 +409,26 @@ describe("RuntimeDatabase", () => {
       INSERT INTO runtime_profile_states (project_id, session_id, profile, reason_code, updated_at)
       VALUES ('missing', 'session-1', 'conversation', 'test', 'now')
     `)).toThrow();
+    database.close();
+  });
+
+  it("adds revision-scoped immutable Task Tree authoring commands", async () => {
+    const database = new RuntimeDatabase(await databasePath());
+    const columns = database.all<{ name: string }>("PRAGMA table_info(task_tree_authoring_commands)")
+      .map((row) => row.name);
+    expect(columns).toEqual([
+      "id", "project_id", "tree_id", "affiliation_decision_id", "command_kind",
+      "idempotency_key", "input_hash", "base_revision_id", "result_revision_id",
+      "source_session_id", "source_trace_event_id", "created_at",
+    ]);
+    expect(database.all<{ name: string }>(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'trigger' AND tbl_name = 'task_tree_authoring_commands'
+      ORDER BY name
+    `)).toEqual([
+      { name: "task_tree_authoring_commands_no_delete" },
+      { name: "task_tree_authoring_commands_no_update" },
+    ]);
     database.close();
   });
 });

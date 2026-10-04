@@ -135,11 +135,19 @@ export class TaskTreeService {
   }
 
   saveDraftRevision(input: { projectId: string; treeId: string; baseRevisionId: string; document: TaskTreeDocument }): TaskTreeRevisionView {
+    return this.saveDraftRevisionRecord(input, true);
+  }
+
+  saveDraftRevisionWithinTransaction(input: { projectId: string; treeId: string; baseRevisionId: string; document: TaskTreeDocument }): TaskTreeRevisionView {
+    return this.saveDraftRevisionRecord(input, false);
+  }
+
+  private saveDraftRevisionRecord(input: { projectId: string; treeId: string; baseRevisionId: string; document: TaskTreeDocument }, wrap: boolean): TaskTreeRevisionView {
     const tree = this.requireTree(input.projectId, input.treeId);
     this.assertTreeMutable(tree);
     if (tree.current_revision_id !== input.baseRevisionId) throw new HarnessError("revision_conflict", "the Task Tree changed after this draft was based on it");
     this.assertValidDocument(input.document);
-    return this.persistRevision(tree, input.projectId, input.document);
+    return this.persistRevision(tree, input.projectId, input.document, wrap);
   }
 
   applyDraftChangeSet(input: {
@@ -214,7 +222,10 @@ export class TaskTreeService {
   }
 
   applyRefinementChangeSet(input: RefinementChangeSetInput): TaskTreeRevisionView {
-    return this.database.transaction(() => {
+    return this.database.transaction(() => this.applyRefinementChangeSetWithinTransaction(input));
+  }
+
+  applyRefinementChangeSetWithinTransaction(input: RefinementChangeSetInput): TaskTreeRevisionView {
       const tree = this.requireTree(input.projectId, input.treeId);
       this.assertTreeMutable(tree);
       if (tree.current_revision_id !== input.baseRevisionId) {
@@ -311,7 +322,6 @@ export class TaskTreeService {
         timestamp, previewId,
       );
       return result;
-    });
   }
 
   scanPlanReadiness(input: { projectId: string; treeId: string; scopeRootNodeId?: string }) {
@@ -354,6 +364,22 @@ export class TaskTreeService {
     const tree = this.requireTree(projectId, treeId);
     const revision = this.requireRevision(tree.current_revision_id);
     return { treeId, revisionId: revision.id, revision: revision.revision, title: tree.title, status: tree.status, document: JSON.parse(revision.document_json) as TaskTreeDocument };
+  }
+
+  getRevisionById(projectId: string, treeId: string, revisionId: string): TaskTreeRevisionView {
+    const tree = this.requireTree(projectId, treeId);
+    const revision = this.requireRevision(revisionId);
+    if (!this.database.get("SELECT id FROM task_tree_revisions WHERE id = ? AND tree_id = ?", revisionId, treeId)) {
+      throw new HarnessError("not_found", "Task Tree revision was not found in the requested tree");
+    }
+    return {
+      treeId,
+      revisionId: revision.id,
+      revision: revision.revision,
+      title: tree.title,
+      status: tree.status,
+      document: JSON.parse(revision.document_json) as TaskTreeDocument,
+    };
   }
 
   selectTaskTree(input: { projectId: string; treeId: string }) {

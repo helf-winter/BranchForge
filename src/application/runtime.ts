@@ -25,6 +25,8 @@ import { resolveJevRequestRoutingConfiguration } from "../domain/request-routing
 import { JevRequestRouter } from "../bindings/typesafe/jev-request-router.js";
 import { RequestRoutingService } from "./request-routing-service.js";
 import { RuntimeProfileService } from "./runtime-profile-service.js";
+import { TaskTreeDraftService } from "./task-tree-draft-service.js";
+import { TaskTreeValidationService } from "./task-tree-validation-service.js";
 
 export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
   const database = new RuntimeDatabase(path.join(resolveDataHome(environment), "runtime.db"));
@@ -48,6 +50,7 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
     requestRoutingConfiguration,
   );
   const affiliations = new TaskAffiliationService(database, runtimeProfiles);
+  const taskTrees = new TaskTreeService(database);
   const semanticEvaluations = new SemanticEvaluationService(
     database,
     jevConfiguration,
@@ -57,7 +60,9 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
   return {
     database,
     projects,
-    taskTrees: new TaskTreeService(database),
+    taskTrees,
+    taskTreeDrafts: new TaskTreeDraftService(database, taskTrees),
+    taskTreeValidation: new TaskTreeValidationService(database, taskTrees),
     affiliations,
     workflows: new WorkflowService(database),
     executions: new NodeExecutionService(database),
