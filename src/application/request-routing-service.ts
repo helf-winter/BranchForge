@@ -217,4 +217,35 @@ export class RequestRoutingService {
     }
     return decision;
   }
+
+  persistTransient(input: {
+    projectId: string;
+    decision: RequestRouteDecisionView;
+    promptTraceEventId?: string;
+  }): RequestRouteDecisionView {
+    if (input.decision.persisted) return input.decision;
+    const existing = this.database.get<RouteRow>(`
+      SELECT * FROM request_route_decisions
+      WHERE project_id = ? AND session_id = ? AND prompt_fingerprint = ? AND policy_version = ?
+    `, input.projectId, input.decision.sessionId, input.decision.promptFingerprint, input.decision.policyVersion);
+    if (existing) return viewFromRow(existing);
+
+    const id = newId();
+    this.database.run(`
+      INSERT INTO request_route_decisions (
+        id, project_id, session_id, prompt_trace_event_id, prompt_fingerprint,
+        classification, tree_relation, confidence, probabilities_json, reason_codes_json,
+        disposition, provider, model_requested, model_resolved, input_tokens, output_tokens,
+        latency_ms, fallback_reason, policy_version, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, id, input.projectId, input.decision.sessionId, input.promptTraceEventId ?? null,
+    input.decision.promptFingerprint, input.decision.classification, input.decision.treeRelation,
+    input.decision.confidence, canonicalJson(input.decision.probabilities),
+    canonicalJson(input.decision.reasonCodes), input.decision.disposition, input.decision.provider,
+    input.decision.modelRequested, input.decision.modelResolved,
+    input.decision.usage?.inputTokens ?? null, input.decision.usage?.outputTokens ?? null,
+    input.decision.latencyMs, input.decision.fallbackReason, input.decision.policyVersion,
+    input.decision.createdAt);
+    return { ...input.decision, id, projectId: input.projectId, persisted: true };
+  }
 }

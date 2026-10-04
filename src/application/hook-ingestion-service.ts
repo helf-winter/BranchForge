@@ -7,6 +7,7 @@ import type { RuntimeDatabase } from "../storage/database.js";
 import { PlanDriftService } from "./plan-drift-service.js";
 import type { ProjectIdentityService } from "./project-identity-service.js";
 import { VerificationFreshnessService } from "./verification-freshness-service.js";
+import type { RuntimeProfileDecisionView, RuntimeProfileService } from "./runtime-profile-service.js";
 
 interface WorkflowContext {
   tree_id: string;
@@ -21,7 +22,26 @@ interface ArtifactProjection {
 }
 
 const mutationTools = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+const mutationLifecycleEvents = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure"]);
 const executableStages = new Set(["skeleton_pass", "skeleton_gate", "branch_implementation", "branch_verification", "root_verification", "final_report"]);
+const unconfirmedMutationReason = [
+  "Agent Harness blocked this project mutation because an active Task Tree is still awaiting executable-scope confirmation.",
+  "Do not retry the mutation.",
+  "Continue its confirmation workflow, or honor an explicit user request to leave Task Tree planning before executing directly.",
+  "Do not suggest shell escapes or other ways to bypass Harness.",
+].join(" ");
+const nativePlanModeReason = [
+  "Agent Harness blocked Claude Plan Mode because Task Tree planning is the active project planning workflow.",
+  "Do not enter native Plan Mode.",
+  "Use the agent-harness:task-tree-planning Skill to resolve Task affiliation, refine the Task Tree, and request scoped confirmation.",
+].join(" ");
+export type HookDirective =
+  | { kind: "deny"; reason: string }
+  | { kind: "context"; context: string };
+
+export type HookIngestionResult =
+  | { recorded: false; reason: "inactive" | "duplicate"; directive?: HookDirective }
+  | { recorded: true; eventId: string; violation: boolean; blocked: boolean; directive?: HookDirective };
 
 export class HookIngestionService {
   private readonly drifts: PlanDriftService;
@@ -32,22 +52,32 @@ export class HookIngestionService {
     private readonly projects: ProjectIdentityService,
     drifts?: PlanDriftService,
     freshness?: VerificationFreshnessService,
+    private readonly profiles?: RuntimeProfileService,
   ) {
     this.drifts = drifts ?? new PlanDriftService(database);
     this.freshness = freshness ?? new VerificationFreshnessService(database);
   }
 
-  async ingest(event: ClaudeHookEvent): Promise<
-    | { recorded: false; reason: "inactive" | "duplicate" }
-    | { recorded: true; eventId: string; violation: boolean; blocked: false }
-  > {
+  async ingest(event: ClaudeHookEvent): Promise<HookIngestionResult> {
     const key = createHookIdempotencyKey({
       sessionId: event.sessionId,
       eventName: event.eventName,
       ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
       payload: event,
     });
-    if (this.database.get("SELECT idempotency_key FROM hook_receipts WHERE idempotency_key = ?", key)) return { recorded: false, reason: "duplicate" };
+    if (this.database.get("SELECT idempotency_key FROM hook_receipts WHERE idempotency_key = ?", key)) {
+      let directive = this.recordedViolationDirective(key);
+      if (!directive && event.eventName === "UserPromptSubmit" && this.profiles) {
+        const inspected = await this.projects.resolve(event.cwd, "inspect");
+        if (inspected.status === "same_project") {
+          const current = this.profiles.current(inspected.projectId, event.sessionId);
+          if (current?.additionalContext) {
+            directive = { kind: "context" as const, context: current.additionalContext };
+          }
+        }
+      }
+      return { recorded: false, reason: "duplicate", ...(directive ? { directive } : {}) };
+    }
 
     let project = await this.projects.resolve(event.cwd, "inspect");
     let workflow = project.status === "same_project"
@@ -58,14 +88,39 @@ export class HookIngestionService {
           WHERE w.project_id = ? AND w.active = 1
         `, project.projectId)
       : undefined;
-    const mutation = event.eventName === "PreToolUse" && this.isMutation(event);
+    const mutation = mutationLifecycleEvents.has(event.eventName) && this.isMutation(event);
+    const nativePlanMode = event.eventName === "PreToolUse" && event.toolName === "EnterPlanMode";
     const pendingAffiliationAnswer = project.status === "same_project" && event.eventName === "UserPromptSubmit" && Boolean(
       this.database.get(`
         SELECT id FROM task_affiliation_decisions
         WHERE project_id = ? AND status = 'pending' LIMIT 1
       `, project.projectId),
     );
-    if (!workflow && !mutation && !pendingAffiliationAnswer) return { recorded: false, reason: "inactive" };
+    let profileDecision: RuntimeProfileDecisionView | undefined;
+    const routablePrompt = event.eventName === "UserPromptSubmit"
+      && Boolean(event.prompt?.trim())
+      && Boolean(this.profiles)
+      && !pendingAffiliationAnswer;
+    if (routablePrompt && project.status !== "same_project") {
+      profileDecision = await this.profiles!.resolveForPrompt({
+        cwd: event.cwd,
+        sessionId: event.sessionId,
+        prompt: event.prompt!,
+      });
+      if (!profileDecision.projectId) return { recorded: false, reason: "inactive" };
+      project = await this.projects.resolve(event.cwd, "inspect");
+      workflow = project.status === "same_project"
+        ? this.database.get<WorkflowContext>(`
+            SELECT w.tree_id, w.stage, r.selected_node_id
+            FROM workflow_states w
+            LEFT JOIN runtime_states r ON r.project_id = w.project_id
+            WHERE w.project_id = ? AND w.active = 1
+          `, project.projectId)
+        : undefined;
+    }
+    if (!workflow && !mutation && !pendingAffiliationAnswer && !routablePrompt) {
+      return { recorded: false, reason: "inactive" };
+    }
     if (project.status !== "same_project") project = await this.projects.resolve(event.cwd, "persist");
     if (project.status === "identity_conflict") return { recorded: false, reason: "inactive" };
     workflow ??= this.database.get<WorkflowContext>(`
@@ -75,7 +130,12 @@ export class HookIngestionService {
       WHERE w.project_id = ? AND w.active = 1
     `, project.projectId);
 
-    const violation = mutation && (!workflow || !executableStages.has(workflow.stage));
+    const violationReason = nativePlanMode && workflow
+      ? "native_plan_mode_bypasses_task_tree"
+      : event.eventName === "PreToolUse" && mutation && workflow && !executableStages.has(workflow.stage)
+        ? "mutation_before_confirmed_executable_scope"
+        : undefined;
+    const violation = Boolean(violationReason);
     const eventId = newId();
     const eventName = violation ? "workflow_violation" : event.eventName;
     const payload = redactSecrets({
@@ -84,7 +144,7 @@ export class HookIngestionService {
       ...(event.toolInput ? { toolInput: event.toolInput } : {}),
       ...(event.toolResponse !== undefined ? { toolResponse: event.toolResponse } : {}),
       ...(event.prompt ? { prompt: event.prompt } : {}),
-      ...(violation ? { reason: "mutation_before_confirmed_executable_scope" } : {}),
+      ...(violationReason ? { reason: violationReason } : {}),
     });
     const previousContext = this.latestExecutionContext(project.projectId, event.sessionId);
     const executionContext = redactSecrets(buildExecutionContext({
@@ -124,14 +184,39 @@ export class HookIngestionService {
         }
       }
     });
-    return { recorded: true, eventId, violation, blocked: false };
+    if (routablePrompt && !profileDecision) {
+      profileDecision = await this.profiles!.resolveForPrompt({
+        cwd: event.cwd,
+        sessionId: event.sessionId,
+        prompt: event.prompt!,
+        promptTraceEventId: eventId,
+      });
+    }
+    if (violation) {
+      return {
+        recorded: true,
+        eventId,
+        violation: true,
+        blocked: true,
+        directive: { kind: "deny", reason: nativePlanMode ? nativePlanModeReason : unconfirmedMutationReason },
+      };
+    }
+    return {
+      recorded: true,
+      eventId,
+      violation: false,
+      blocked: false,
+      ...(profileDecision?.additionalContext
+        ? { directive: { kind: "context" as const, context: profileDecision.additionalContext } }
+        : {}),
+    };
   }
 
   private latestExecutionContext(projectId: string, runId: string): Partial<ExecutionContext> | undefined {
     const row = this.database.get<{ execution_context_json: string }>(
       `SELECT execution_context_json FROM trace_events
        WHERE project_id = ? AND session_id = ? AND execution_context_json <> '{}'
-       ORDER BY occurred_at DESC, id DESC LIMIT 1`,
+       ORDER BY occurred_at DESC, rowid DESC LIMIT 1`,
       projectId, runId,
     );
     if (!row) return undefined;
@@ -143,13 +228,48 @@ export class HookIngestionService {
     }
   }
 
+  private recordedViolationDirective(idempotencyKey: string): HookDirective | undefined {
+    const row = this.database.get<{ event_name: string; payload_json: string }>(
+      "SELECT event_name, payload_json FROM trace_events WHERE idempotency_key = ?",
+      idempotencyKey,
+    );
+    if (row?.event_name !== "workflow_violation") return undefined;
+    try {
+      const payload = JSON.parse(row.payload_json) as { reason?: unknown };
+      if (payload.reason === "native_plan_mode_bypasses_task_tree") {
+        return { kind: "deny", reason: nativePlanModeReason };
+      }
+      if (payload.reason === "mutation_before_confirmed_executable_scope") {
+        return { kind: "deny", reason: unconfirmedMutationReason };
+      }
+    } catch {
+      // A malformed historical payload must not change ordinary duplicate handling.
+    }
+    return undefined;
+  }
+
   private isMutation(event: ClaudeHookEvent): boolean {
-    if (event.toolName && mutationTools.has(event.toolName)) return true;
+    if (event.toolName && mutationTools.has(event.toolName)) {
+      const filePath = event.toolInput?.file_path ?? event.toolInput?.path ?? event.toolInput?.notebook_path;
+      return typeof filePath === "string" && this.isProjectPath(event.cwd, filePath);
+    }
     if (event.toolName !== "Bash") return false;
     const command = typeof event.toolInput?.command === "string" ? event.toolInput.command : "";
     const mutatingCommand = /(^|[;&|]\s*)(rm|mv|cp|touch|mkdir|rmdir|install|chmod|chown|ln|truncate|dd|tee|patch|apply_patch|sed\s+-i|perl\s+-pi|git\s+(commit|checkout|reset|clean|mv|rm)|npm\s+(install|uninstall)|pnpm\s+(add|remove|install)|yarn\s+(add|remove|install))\b/;
-    const outputRedirection = /(^|[^<>])>{1,2}(?![>&])\s*[^&]/;
-    return mutatingCommand.test(command) || outputRedirection.test(command);
+    if (mutatingCommand.test(command)) return true;
+    const redirection = /(^|[^<>])>{1,2}(?![>&])\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g;
+    for (const match of command.matchAll(redirection)) {
+      const target = match[2] ?? match[3] ?? match[4];
+      if (target && this.isProjectPath(event.cwd, target)) return true;
+    }
+    return false;
+  }
+
+  private isProjectPath(cwd: string, candidate: string): boolean {
+    const projectRoot = path.resolve(cwd);
+    const absolute = path.isAbsolute(candidate) ? path.resolve(candidate) : path.resolve(projectRoot, candidate);
+    const relative = path.relative(projectRoot, absolute);
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
   }
 
   private projectArtifact(projectId: string, treeId: string | undefined, eventId: string, event: ClaudeHookEvent): ArtifactProjection | undefined {

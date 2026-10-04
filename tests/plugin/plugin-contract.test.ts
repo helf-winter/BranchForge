@@ -5,8 +5,23 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const root = path.resolve("plugin");
+const repositoryRoot = path.resolve(".");
 
 describe("Claude plugin contract", () => {
+  it("can be installed globally from the repository as a local marketplace", async () => {
+    const marketplace = JSON.parse(
+      await readFile(path.join(repositoryRoot, ".claude-plugin", "marketplace.json"), "utf8"),
+    ) as {
+      name: string;
+      plugins: Array<{ name: string; source: string }>;
+    };
+
+    expect(marketplace.name).toBe("agent-harness-local");
+    expect(marketplace.plugins).toEqual([
+      expect.objectContaining({ name: "agent-harness", source: "./plugin" }),
+    ]);
+  });
+
   it("has valid metadata and self-contained MCP and hook commands", async () => {
     const manifest = JSON.parse(await readFile(path.join(root, ".claude-plugin", "plugin.json"), "utf8")) as { name: string };
     expect(manifest.name).toBe("agent-harness");
@@ -32,6 +47,9 @@ describe("Claude plugin contract", () => {
       expect(match?.[1]).toBe(name);
       expect(match?.[2]).toMatch(/^Use when /);
     }
+    const planning = await readFile(path.join(root, "skills", "task-tree-planning", "SKILL.md"), "utf8");
+    expect(planning.match(/^description: ([^\r\n]+)/m)?.[1]).toContain("complex, multi-stage, cross-module");
+    expect(planning.match(/^description: ([^\r\n]+)/m)?.[1]).toContain("execute directly without a Task Tree");
   });
 
   it("runs the compiled CLI from a non-ASCII plugin path", () => {
@@ -50,6 +68,45 @@ describe("Claude plugin contract", () => {
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout).toBe("");
       await expect(readFile(path.join(cwd, ".agent-harness-project.json"))).rejects.toThrow();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps SessionStart silent instead of forcing generic Task Tree activation context", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "harness compiled session "));
+    try {
+      const input = JSON.stringify({ hook_event_name: "SessionStart", session_id: "s1", cwd, source: "startup" });
+      const result = spawnSync(process.execPath, [path.join(root, "runtime", "hook.mjs")], {
+        input, encoding: "utf8", env: { ...process.env, AGENT_HARNESS_DATA_HOME: path.join(cwd, "data") },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe("");
+      await expect(readFile(path.join(cwd, ".agent-harness-project.json"))).rejects.toThrow();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not impose Task Tree gates when no Task Tree workflow is active", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "harness compiled guard "));
+    try {
+      for (const input of [
+        {
+          hook_event_name: "PreToolUse", session_id: "s1", cwd, tool_name: "Write", tool_use_id: "write-1",
+          tool_input: { file_path: path.join(cwd, "src", "app.ts") },
+        },
+        {
+          hook_event_name: "PreToolUse", session_id: "s1", cwd, tool_name: "EnterPlanMode", tool_use_id: "plan-1",
+          tool_input: {},
+        },
+      ]) {
+        const result = spawnSync(process.execPath, [path.join(root, "runtime", "hook.mjs")], {
+          input: JSON.stringify(input), encoding: "utf8", env: { ...process.env, AGENT_HARNESS_DATA_HOME: path.join(cwd, "data") },
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toBe("");
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

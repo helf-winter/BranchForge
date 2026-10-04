@@ -7,7 +7,24 @@ for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
 const runtime = openRuntime();
 try {
   const raw = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
-  await runtime.hooks.ingest(mapClaudeHook(raw));
+  const event = mapClaudeHook(raw);
+  const result = await runtime.hooks.ingest(event);
+  if (result.directive?.kind === "deny") {
+    process.stdout.write(`${JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: result.directive.reason,
+      },
+    })}\n`);
+  } else if (result.directive?.kind === "context") {
+    process.stdout.write(`${JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: event.eventName,
+        additionalContext: result.directive.context,
+      },
+    })}\n`);
+  }
 } catch (error) {
   const normalized = error instanceof HarnessError ? error : new HarnessError("storage_failure", error instanceof Error ? error.message : String(error));
   process.stderr.write(`${JSON.stringify({ error: { code: normalized.code, message: normalized.message } })}\n`);

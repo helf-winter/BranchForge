@@ -9,6 +9,7 @@ import {
 import { canonicalJson } from "../domain/trace.js";
 import type { RuntimeDatabase } from "../storage/database.js";
 import { TaskTreeService } from "./task-tree-service.js";
+import type { RuntimeProfileService } from "./runtime-profile-service.js";
 
 interface AffiliationRow {
   id: string;
@@ -19,7 +20,7 @@ interface AffiliationRow {
   candidate_snapshot_json: string;
   recommendation: TaskAffiliationRecommendation;
   recommended_tree_id: string | null;
-  status: "pending" | "new_tree" | "merged" | "paused";
+  status: "pending" | "direct_execution" | "new_tree" | "merged" | "paused";
   confirmation_prompt_id: string;
   runtime_action_id: string;
   answer_trace_event_id: string | null;
@@ -31,7 +32,10 @@ interface AffiliationRow {
 export class TaskAffiliationService {
   private readonly trees: TaskTreeService;
 
-  constructor(private readonly database: RuntimeDatabase) {
+  constructor(
+    private readonly database: RuntimeDatabase,
+    private readonly profiles?: RuntimeProfileService,
+  ) {
     this.trees = new TaskTreeService(database);
   }
 
@@ -64,7 +68,9 @@ export class TaskAffiliationService {
     const actionId = newId();
     const confirmationId = newId();
     const createdAt = nowIso();
-    const options = candidates.length ? ["new_tree", "merge", "pause"] : ["new_tree", "pause"];
+    const options = candidates.length
+      ? ["direct_execution", "new_tree", "merge", "pause"]
+      : ["direct_execution", "new_tree", "pause"];
     this.database.transaction(() => {
       this.database.run(`
         INSERT INTO trace_events (
@@ -91,7 +97,7 @@ export class TaskAffiliationService {
           prompt_type, related_artifact_ids_json, options_json, runtime_action_id
         ) VALUES (?, ?, NULL, ?, ?, 'pending', ?, 'high_risk_action', '[]', ?, ?)
       `, confirmationId, input.projectId, decisionId,
-      `Should "${requestTitle}" create a new Task Tree or merge into an existing candidate?`,
+      `Should "${requestTitle}" run directly, create a new Task Tree, merge into an existing candidate, or pause?`,
       createdAt, canonicalJson(options), actionId);
       this.database.run(`
         INSERT INTO task_affiliation_decisions (
@@ -133,8 +139,8 @@ export class TaskAffiliationService {
         }
         return this.mapDecision(decision);
       }
-      const answer = this.database.get<{ occurred_at: string }>(`
-        SELECT occurred_at FROM trace_events
+      const answer = this.database.get<{ occurred_at: string; session_id: string }>(`
+        SELECT occurred_at, session_id FROM trace_events
         WHERE id = ? AND project_id = ? AND event_name = 'UserPromptSubmit'
       `, input.answerTraceEventId, input.projectId);
       if (!answer || answer.occurred_at < decision.created_at) {
@@ -142,7 +148,7 @@ export class TaskAffiliationService {
       }
 
       let resolvedTreeId: string | null = null;
-      let result: unknown = { paused: true };
+      let result: unknown = input.choice === "direct_execution" ? { directExecution: true } : { paused: true };
       if (input.choice === "new_tree") {
         const created = this.trees.createTaskRootWithinTransaction({
           projectId: input.projectId,
@@ -186,6 +192,12 @@ export class TaskAffiliationService {
           FROM trace_events WHERE id = ?
       `, newId(), resolvedTreeId, canonicalJson({ decisionId: input.decisionId, choice: input.choice, resolvedTreeId }),
       resolvedAt, `task-affiliation:${input.decisionId}:resolved`, input.answerTraceEventId);
+      this.profiles?.applyAffiliationChoice({
+        projectId: input.projectId,
+        sessionId: answer.session_id,
+        affiliationDecisionId: input.decisionId,
+        choice: input.choice,
+      });
       return this.mapDecision(this.requireDecision(input.projectId, input.decisionId));
     });
   }

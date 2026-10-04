@@ -6,7 +6,10 @@ import { HookIngestionService } from "../../src/application/hook-ingestion-servi
 import { ProjectIdentityService } from "../../src/application/project-identity-service.js";
 import { TaskAffiliationService } from "../../src/application/task-affiliation-service.js";
 import { TaskTreeService } from "../../src/application/task-tree-service.js";
+import { RequestRoutingService } from "../../src/application/request-routing-service.js";
+import { RuntimeProfileService } from "../../src/application/runtime-profile-service.js";
 import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
+import { resolveJevRequestRoutingConfiguration } from "../../src/domain/request-routing.js";
 import { RuntimeDatabase } from "../../src/storage/database.js";
 
 const dirs: string[] = [];
@@ -99,6 +102,82 @@ describe("Claude hook ingestion", () => {
     expect(result).toEqual({ recorded: false, reason: "inactive" });
     expect(database.all("SELECT id FROM projects")).toEqual([]);
     await expect(readFile(path.join(directory, ".agent-harness-project.json"))).rejects.toThrow();
+    database.close();
+  });
+
+  it("does not inject generic lifecycle context at session start", async () => {
+    const { directory, database, service } = await fixture();
+    const result = await service.ingest(mapClaudeHook({
+      hook_event_name: "SessionStart", session_id: "s1", cwd: directory, source: "startup",
+    }));
+
+    expect(result).toEqual({ recorded: false, reason: "inactive" });
+    expect(database.all("SELECT id FROM projects")).toEqual([]);
+    await expect(readFile(path.join(directory, ".agent-harness-project.json"))).rejects.toThrow();
+    database.close();
+  });
+
+  it("records an existing Project prompt before routing and returns only structured Profile context", async () => {
+    const { directory, database } = await fixture();
+    const projects = new ProjectIdentityService(database);
+    await projects.resolve(directory, "persist");
+    const config = resolveJevRequestRoutingConfiguration({
+      HARNESS_JEV_ROUTING_ENABLED: "true",
+      TYPESAFE_API_KEY: "secret",
+    });
+    let observedPromptTrace = false;
+    const provider = {
+      async route() {
+        observedPromptTrace = Boolean(database.get(`
+          SELECT id FROM trace_events
+          WHERE session_id = 'profile-session' AND event_name = 'UserPromptSubmit'
+        `));
+        return {
+          classification: "task_tree_workflow" as const,
+          treeRelation: "create_new_tree" as const,
+          confidence: 0.95,
+          probabilities: { task_tree_workflow: 0.95 },
+          reasonCodes: ["route:task_tree_workflow"],
+          model: "jev-1.13.0",
+          usage: { inputTokens: 10, outputTokens: 2 },
+          latencyMs: 1,
+        };
+      },
+    };
+    const profiles = new RuntimeProfileService(
+      database,
+      projects,
+      new RequestRoutingService(database, config, provider),
+      config,
+    );
+    const service = new HookIngestionService(database, projects, undefined, undefined, profiles);
+    const event = mapClaudeHook({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "profile-session",
+      cwd: directory,
+      prompt: "实现一个完整的拼豆网页",
+      timestamp: "2030-01-01T00:00:00.000Z",
+    });
+    const first = await service.ingest(event);
+    expect(observedPromptTrace).toBe(true);
+    expect(first).toMatchObject({
+      recorded: true,
+      blocked: false,
+      directive: {
+        kind: "context",
+        context: [
+          "Harness runtime profile: structured_coding.",
+          "Establish and obtain native approval for a first-class Task Tree revision before project mutation.",
+        ].join("\n"),
+      },
+    });
+    expect(await service.ingest(event)).toMatchObject({
+      recorded: false,
+      reason: "duplicate",
+      directive: { kind: "context" },
+    });
+    expect(database.all("SELECT id FROM trace_events WHERE session_id = 'profile-session'")).toHaveLength(1);
+    expect(database.all("SELECT id FROM runtime_profile_transitions WHERE session_id = 'profile-session'")).toHaveLength(1);
     database.close();
   });
 
@@ -267,19 +346,125 @@ describe("Claude hook ingestion", () => {
     database.close();
   });
 
-  it("records an early mutation violation but never blocks the tool", async () => {
+  it("records and allows direct project mutation when no Task Tree workflow is active", async () => {
     const { directory, database, service } = await fixture();
     const event = mapClaudeHook({ hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "u1", tool_input: { file_path: path.join(directory, "a.ts"), apiKey: "secret" } });
-    expect(await service.ingest(event)).toMatchObject({ recorded: true, violation: true, blocked: false });
+    expect(await service.ingest(event)).toMatchObject({
+      recorded: true,
+      violation: false,
+      blocked: false,
+    });
+    expect(await service.ingest(event)).toEqual({ recorded: false, reason: "duplicate" });
     const trace = database.get<{ event_name: string; payload_json: string }>("SELECT event_name, payload_json FROM trace_events");
-    expect(trace?.event_name).toBe("workflow_violation");
+    expect(trace?.event_name).toBe("PreToolUse");
     expect(trace?.payload_json).not.toContain("secret");
     expect(trace?.payload_json).toContain("[REDACTED]");
     const bashMutation = mapClaudeHook({
       hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Bash", tool_use_id: "u2",
       tool_input: { command: "printf 'x' > src/a.ts" },
     });
-    expect(await service.ingest(bashMutation)).toMatchObject({ recorded: true, violation: true, blocked: false });
+    expect(await service.ingest(bashMutation)).toMatchObject({ recorded: true, violation: false, blocked: false });
+    database.close();
+  });
+
+  it("records the outcome and Artifact of direct work without a Task Tree", async () => {
+    const { directory, database, service } = await fixture();
+    const result = await service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "direct-write",
+      tool_input: { file_path: path.join(directory, "direct.txt") }, tool_response: { ok: true },
+    }));
+
+    expect(result).toMatchObject({ recorded: true, violation: false, blocked: false });
+    if (!result.recorded) throw new Error("direct work outcome was not recorded");
+    expect(database.get<{ tree_id: string | null; event_name: string }>(
+      "SELECT tree_id, event_name FROM trace_events WHERE id = ?", result.eventId,
+    )).toEqual({ tree_id: null, event_name: "PostToolUse" });
+    expect(database.get<{ tree_id: string | null; status: string; source_trace_event_id: string }>(
+      "SELECT tree_id, status, source_trace_event_id FROM artifacts WHERE locator = 'direct.txt'",
+    )).toEqual({ tree_id: null, status: "created", source_trace_event_id: result.eventId });
+    database.close();
+  });
+
+  it("blocks a project mutation while an active Task Tree is still awaiting confirmation", async () => {
+    const { directory, database, service } = await fixture();
+    await activeTree(directory, database);
+    const event = mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "u1",
+      tool_input: { file_path: path.join(directory, "a.ts") },
+    });
+
+    expect(await service.ingest(event)).toMatchObject({
+      recorded: true,
+      violation: true,
+      blocked: true,
+      directive: { kind: "deny", reason: expect.stringContaining("active Task Tree") },
+    });
+    expect(await service.ingest(event)).toMatchObject({ recorded: false, reason: "duplicate", directive: { kind: "deny" } });
+    database.close();
+  });
+
+  it("blocks Claude native Plan Mode from bypassing Task Tree planning", async () => {
+    const { directory, database, service } = await fixture();
+    await activeTree(directory, database);
+    const result = await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "EnterPlanMode", tool_use_id: "plan-mode", tool_input: {},
+    }));
+
+    expect(result).toMatchObject({
+      recorded: true,
+      violation: true,
+      blocked: true,
+      directive: {
+        kind: "deny",
+        reason: expect.stringContaining("agent-harness:task-tree-planning"),
+      },
+    });
+    expect(JSON.parse(database.get<{ payload_json: string }>(
+      "SELECT payload_json FROM trace_events WHERE event_name = 'workflow_violation'",
+    )!.payload_json)).toMatchObject({ reason: "native_plan_mode_bypasses_task_tree" });
+    database.close();
+  });
+
+  it("leaves native Plan Mode available when no Task Tree workflow is active", async () => {
+    const { directory, database, service } = await fixture();
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "EnterPlanMode", tool_use_id: "plan-mode", tool_input: {},
+    }))).toEqual({ recorded: false, reason: "inactive" });
+    expect(database.all("SELECT id FROM projects")).toEqual([]);
+    database.close();
+  });
+
+  it("does not treat project-external planning files or read-only tools as project mutations", async () => {
+    const { directory, database, service } = await fixture();
+    const externalPlan = path.join(tmpdir(), "claude-plan.md");
+
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "plan",
+      tool_input: { file_path: externalPlan },
+    }))).toEqual({ recorded: false, reason: "inactive" });
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Read", tool_use_id: "read",
+      tool_input: { file_path: path.join(directory, "README.md") },
+    }))).toEqual({ recorded: false, reason: "inactive" });
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Bash", tool_use_id: "tmp-log",
+      tool_input: { command: "npm run dev > /tmp/project-dev.log 2>&1" },
+    }))).toEqual({ recorded: false, reason: "inactive" });
+    expect(database.all("SELECT id FROM projects")).toEqual([]);
+    database.close();
+  });
+
+  it("allows project mutation after the Workflow reaches an executable stage", async () => {
+    const { directory, database, service } = await fixture();
+    const { project } = await activeTree(directory, database);
+    database.run("UPDATE workflow_states SET stage = 'skeleton_pass' WHERE project_id = ? AND active = 1", project.projectId);
+
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "allowed-write",
+      tool_input: { file_path: path.join(directory, "src", "planned.ts") },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
     database.close();
   });
 
