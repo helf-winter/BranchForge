@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../../src/bindings/claude/mcp-server.js";
+import { RuntimeDatabase } from "../../src/storage/database.js";
+import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
 
 const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));
@@ -48,12 +50,37 @@ describe("Harness MCP binding", () => {
       "harness_preview_task_node_replacement", "harness_confirm_task_node_replacement",
       "harness_execute_task_node_replacement", "harness_recover_task_node_replacement",
       "harness_get_task_node_replacements", "harness_get_task_node_replacement_detail",
+      "harness_get_next_executable_node",
       "harness_get_project_identity", "harness_get_project_clones", "harness_get_project_clone_detail",
       "harness_register_plugin_revision", "harness_reconcile_plugins", "harness_get_plugins", "harness_get_plugin_detail",
       "harness_preview_plugin_replacement", "harness_execute_plugin_replacement", "harness_recover_plugin_replacement",
       "harness_get_plugin_replacement_detail", "harness_dispose_plugin", "harness_reactivate_plugin",
       "harness_preview_draft_change_set", "harness_get_task_refinement_history", "harness_get_planning_decision_detail",
+      "harness_create_task_tree_draft", "harness_patch_task_tree", "harness_validate_task_tree",
+      "harness_prepare_task_tree_approval",
     ].sort());
+    expect(tools.find((tool) => tool.name === "harness_create_task_tree_draft")?.inputSchema).toMatchObject({
+      required: expect.arrayContaining(["affiliationDecisionId", "document", "idempotencyKey"]),
+      properties: { expectedTreeRevisionId: { type: "string" } },
+    });
+    expect(tools.find((tool) => tool.name === "harness_patch_task_tree")?.inputSchema).toMatchObject({
+      required: expect.arrayContaining(["treeId", "expectedTreeRevisionId", "operations", "idempotencyKey"]),
+      properties: { operations: { type: "array", minItems: 1, maxItems: 1 } },
+    });
+    expect(tools.find((tool) => tool.name === "harness_validate_task_tree")?.inputSchema).toMatchObject({
+      required: expect.arrayContaining(["treeId", "treeRevisionId"]),
+    });
+    expect(tools.find((tool) => tool.name === "harness_prepare_task_tree_approval")?.inputSchema).toMatchObject({
+      required: expect.arrayContaining(["treeId", "treeRevisionId", "readinessResultId", "sourceUserMessageTraceEventId"]),
+      properties: expect.not.objectContaining({ sessionId: expect.anything() }),
+    });
+    expect(tools.find((tool) => tool.name === "harness_get_next_executable_node")?.inputSchema).toMatchObject({
+      required: expect.arrayContaining(["treeId"]), properties: { treeId: { type: "string" } },
+    });
+    expect(tools.find((tool) => tool.name === "harness_start_node_attempt")?.inputSchema).toMatchObject({
+      required: expect.arrayContaining(["nodeId", "expectedTreeRevisionId", "sourceTraceEventId"]),
+      properties: { sourceTraceEventId: { type: "string" } },
+    });
     expect(tools.find((tool) => tool.name === "harness_scan_plan_readiness")?.inputSchema).toMatchObject({
       properties: { scopeRootNodeId: { type: "string" } },
     });
@@ -62,11 +89,11 @@ describe("Harness MCP binding", () => {
     });
     expect(tools.find((tool) => tool.name === "harness_propose_task_affiliation")?.inputSchema).toMatchObject({
       required: expect.arrayContaining(["requestTitle", "recommendation"]),
-      properties: { recommendation: { enum: ["new_tree", "merge"] }, recommendedTreeId: { type: "string" } },
+      properties: { recommendation: { enum: ["new_tree", "merge", "direct_execution", "pause"] }, recommendedTreeId: { type: "string" } },
     });
     expect(tools.find((tool) => tool.name === "harness_resolve_task_affiliation")?.inputSchema).toMatchObject({
       required: expect.arrayContaining(["decisionId", "choice", "answerTraceEventId"]),
-      properties: { choice: { enum: ["new_tree", "merge", "pause"] }, chosenTreeId: { type: "string" } },
+      properties: { choice: { enum: ["direct_execution", "new_tree", "merge", "pause"] }, chosenTreeId: { type: "string" } },
     });
     expect(tools.find((tool) => tool.name === "harness_evaluate_attempt_semantics")?.inputSchema).toMatchObject({
       required: expect.arrayContaining(["attemptId"]), properties: { attemptId: { type: "string" } },
@@ -234,6 +261,118 @@ describe("Harness MCP binding", () => {
       workflow: { stage: "draft_task_tree" }, pendingAffiliationCount: 1,
       availableActions: expect.arrayContaining(["resolve_task_affiliation"]),
     });
+    await client.close();
+    await harness.close();
+  });
+
+  it("authors, validates, and prepares one Task Tree without exposing Session IDs", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "harness-mcp-authoring-")); dirs.push(directory);
+    const project = path.join(directory, "project");
+    const dataHome = path.join(directory, "data");
+    await import("node:fs/promises").then((fs) => fs.mkdir(project));
+    const harness = createMcpServer({ ...process.env, AGENT_HARNESS_DATA_HOME: dataHome });
+    const client = new Client({ name: "test", version: "1" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([harness.server.connect(serverTransport), client.connect(clientTransport)]);
+    const parse = (response: Awaited<ReturnType<typeof client.callTool>>) => {
+      const content = (response as { content: Array<{ type: string; text?: string }> }).content;
+      return JSON.parse(content[0]?.type === "text" ? content[0].text ?? "null" : "null") as Record<string, unknown>;
+    };
+    const proposal = parse(await client.callTool({
+      name: "harness_propose_task_affiliation",
+      arguments: { cwd: project, requestTitle: "Build editor", recommendation: "new_tree" },
+    }));
+    const identity = parse(await client.callTool({
+      name: "harness_get_project_identity", arguments: { cwd: project },
+    })) as { projectId: string };
+    const database = new RuntimeDatabase(path.join(dataHome, "runtime.db"));
+    const addAnswer = (id: string, treeId: string | null = null) => database.run(`
+      INSERT INTO trace_events (
+        id, project_id, tree_id, session_id, event_name, payload_json,
+        execution_context_json, occurred_at, idempotency_key
+      ) VALUES (?, ?, ?, 'session-private', 'UserPromptSubmit', '{}', '{}', ?, ?)
+    `, id, identity.projectId, treeId, id === "affiliation-answer" ? proposal.createdAt as string : "9999-01-01", id);
+    addAnswer("affiliation-answer");
+    const affiliation = parse(await client.callTool({
+      name: "harness_resolve_task_affiliation",
+      arguments: {
+        cwd: project, decisionId: proposal.decisionId, choice: "new_tree",
+        answerTraceEventId: "affiliation-answer",
+      },
+    }));
+    const document: TaskTreeDocument = {
+      planningVersion: 1,
+      planningContext: {
+        goal: "Build editor", scopeBoundaries: ["browser"], exclusions: ["server"],
+        unresolvedQuestions: [], unresolvedDecisions: [], plannedEffects: [],
+      },
+      nodes: [
+        { id: "root", parentId: null, title: "Editor", children: ["canvas"], executionPhase: "verification", requiredEvidence: [{ key: "root-test", description: "Full test" }] },
+        {
+          id: "canvas", parentId: "root", title: "Canvas", children: ["canvas-skeleton", "canvas-implementation"],
+          executionPhase: "verification", requiredEvidence: [{ key: "branch-test", description: "Canvas integration" }],
+        },
+        {
+          id: "canvas-skeleton", parentId: "canvas", title: "Canvas skeleton", children: [], objectives: ["Wire canvas"],
+          expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["module imports"], unresolvedQuestions: [],
+          unresolvedDecisions: [], dependencies: [], requiredEvidence: [{ key: "skeleton-test", description: "Skeleton test" }],
+          executionPhase: "skeleton", stopDecompositionReason: "One verifiable skeleton",
+        },
+        {
+          id: "canvas-implementation", parentId: "canvas", title: "Canvas implementation", children: [], objectives: ["Render beads"],
+          expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["test passes"], unresolvedQuestions: [],
+          unresolvedDecisions: [], dependencies: ["canvas-skeleton"], requiredEvidence: [{ key: "test", description: "Canvas test" }],
+          executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
+        },
+      ],
+      relations: [], artifacts: [],
+      skeletonCriteria: [{
+        id: "canvas-skeleton", branchNodeId: "canvas", expectedArtifacts: ["canvas.ts"],
+        requiredContracts: ["canvas-api"], verificationCommands: ["npm test"], readinessConditions: ["module imports"],
+      }],
+    };
+    const draft = parse(await client.callTool({
+      name: "harness_create_task_tree_draft",
+      arguments: { cwd: project, affiliationDecisionId: proposal.decisionId, document, idempotencyKey: "draft-1" },
+    }));
+    addAnswer("patch-answer", draft.treeId as string);
+    const patchedDocument = structuredClone(document);
+    patchedDocument.nodes[1]!.title = "Canvas renderer";
+    const patched = parse(await client.callTool({
+      name: "harness_patch_task_tree",
+      arguments: {
+        cwd: project, treeId: draft.treeId, expectedTreeRevisionId: draft.revisionId,
+        idempotencyKey: "patch-1", operations: [{
+          op: "replace_document", document: patchedDocument, sourceUserMessageTraceEventId: "patch-answer",
+          decision: {
+            discussionTopic: "Canvas naming", currentUnderstanding: "The node owns rendering",
+            consideredOptions: ["Canvas", "Canvas renderer"], agentRecommendation: "Canvas renderer",
+            userDecision: "Use Canvas renderer",
+          },
+        }],
+      },
+    }));
+    const readiness = parse(await client.callTool({
+      name: "harness_validate_task_tree",
+      arguments: { cwd: project, treeId: patched.treeId, treeRevisionId: patched.revisionId },
+    }));
+    expect(readiness).toMatchObject({ ready: true, revisionId: patched.revisionId });
+    addAnswer("approval-answer", patched.treeId as string);
+    const approval = parse(await client.callTool({
+      name: "harness_prepare_task_tree_approval",
+      arguments: {
+        cwd: project, treeId: patched.treeId, treeRevisionId: patched.revisionId,
+        readinessResultId: readiness.resultId, sourceUserMessageTraceEventId: "affiliation-answer",
+      },
+    }));
+    expect(approval).toMatchObject({
+      approvalRef: expect.any(String), canonicalBlock: expect.stringContaining("## Task Tree"),
+      canonicalBlockHash: expect.stringMatching(/^[0-9a-f]{64}$/), treeRevisionId: patched.revisionId,
+      expiresAt: expect.any(String),
+    });
+    expect(approval).not.toHaveProperty("sessionId");
+    expect(affiliation).toMatchObject({ resolvedTreeId: draft.treeId });
+    database.close();
     await client.close();
     await harness.close();
   });

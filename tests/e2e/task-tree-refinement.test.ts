@@ -27,17 +27,37 @@ describe("Task Tree refinement vertical slice", () => {
         unresolvedQuestions: [], unresolvedDecisions: [], plannedEffects: [],
       },
       nodes: [
-        { id: "root", parentId: null, title: "Runtime", children: ["branch-a", "branch-b"] },
+        { id: "root", parentId: null, title: "Runtime", children: ["branch-a", "branch-b"], executionPhase: "verification", requiredEvidence: [{ key: "root-test", description: "Root test" }] },
         {
-          id: "branch-a", parentId: "root", title: "Branch A", children: [], objectives: ["Implement A"],
+          id: "branch-a", parentId: "root", title: "Branch A", children: ["a-skeleton", "a-implementation"],
+          executionPhase: "verification", requiredEvidence: [{ key: "a-verify", description: "A integration" }],
+        },
+        {
+          id: "a-skeleton", parentId: "branch-a", title: "A skeleton", children: [], objectives: ["Wire A"],
+          expectedOutputs: ["a.ts"], acceptanceCriteria: ["A compiles"], unresolvedQuestions: [], unresolvedDecisions: [],
+          dependencies: [], requiredEvidence: [{ key: "a-skeleton-test", description: "A skeleton test" }],
+          executionPhase: "skeleton", stopDecompositionReason: "one verifiable skeleton",
+        },
+        {
+          id: "a-implementation", parentId: "branch-a", title: "A implementation", children: [], objectives: ["Implement A"],
           expectedOutputs: ["a.ts"], acceptanceCriteria: ["A passes"], unresolvedQuestions: [], unresolvedDecisions: [],
-          dependencies: [], requiredEvidence: [{ key: "a-test", description: "A test" }],
+          dependencies: ["a-skeleton"], requiredEvidence: [{ key: "a-test", description: "A test" }],
           executionPhase: "implementation", stopDecompositionReason: "one verifiable result",
         },
         {
-          id: "branch-b", parentId: "root", title: "Branch B", children: [], objectives: ["Implement B"],
+          id: "branch-b", parentId: "root", title: "Branch B", children: ["b-skeleton", "b-implementation"],
+          executionPhase: "verification", requiredEvidence: [{ key: "b-verify", description: "B integration" }],
+        },
+        {
+          id: "b-skeleton", parentId: "branch-b", title: "B skeleton", children: [], objectives: ["Wire B"],
+          expectedOutputs: ["b.ts"], acceptanceCriteria: ["B compiles"], unresolvedQuestions: [], unresolvedDecisions: [],
+          dependencies: [], requiredEvidence: [{ key: "b-skeleton-test", description: "B skeleton test" }],
+          executionPhase: "skeleton", stopDecompositionReason: "one verifiable skeleton",
+        },
+        {
+          id: "b-implementation", parentId: "branch-b", title: "B implementation", children: [], objectives: ["Implement B"],
           expectedOutputs: ["b.ts"], acceptanceCriteria: ["B passes"], unresolvedQuestions: [], unresolvedDecisions: [],
-          dependencies: [], requiredEvidence: [{ key: "b-test", description: "B test" }],
+          dependencies: ["b-skeleton"], requiredEvidence: [{ key: "b-test", description: "B test" }],
           executionPhase: "implementation", stopDecompositionReason: "one verifiable result",
         },
       ],

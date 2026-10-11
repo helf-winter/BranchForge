@@ -43,7 +43,10 @@ describe("Node execution and evaluation vertical slice", () => {
     if (!answer.recorded) throw new Error("confirmation trace was not recorded");
     first.workflows.confirmScope({ projectId: project.projectId, confirmationId: confirmation.confirmationId, answer: "yes", answerTraceEventId: answer.eventId, workflowRevision: 3 });
 
-    const skeleton = first.executions.startAttempt({ projectId: project.projectId, nodeId: "skeleton", expectedTreeRevisionId: revision.revisionId });
+    const skeleton = first.executions.startAttempt({
+      projectId: project.projectId, nodeId: "skeleton", expectedTreeRevisionId: revision.revisionId,
+      sourceTraceEventId: answer.eventId,
+    });
     const compile = await first.hooks.ingest(mapClaudeHook({ hook_event_name: "PostToolUse", session_id: "s1", cwd: projectDir, tool_name: "Bash", tool_use_id: "compile", tool_input: { command: "npm run build" }, tool_response: { exitCode: 0 } }));
     if (!compile.recorded) throw new Error("compile trace was not recorded");
     first.executions.attachEvidence({ projectId: project.projectId, attemptId: skeleton.attemptId, requiredEvidenceKey: "compile", traceEventId: compile.eventId });
@@ -53,11 +56,17 @@ describe("Node execution and evaluation vertical slice", () => {
       .toMatchObject({ status: "passed", workflow: { stage: "branch_implementation", revision: 5 } });
 
     for (const index of [1, 2]) {
-      const attempt = first.executions.startAttempt({ projectId: project.projectId, nodeId: "implementation", expectedTreeRevisionId: revision.revisionId });
+      const attempt = first.executions.startAttempt({
+        projectId: project.projectId, nodeId: "implementation", expectedTreeRevisionId: revision.revisionId,
+        sourceTraceEventId: answer.eventId,
+      });
       first.executions.beginVerification({ projectId: project.projectId, attemptId: attempt.attemptId, expectedStatus: "running" });
       first.evaluations.evaluateAttempt({ projectId: project.projectId, attemptId: attempt.attemptId, proposedVerdict: "failed", riskSummary: `failure ${index}` });
     }
-    const success = first.executions.startAttempt({ projectId: project.projectId, nodeId: "implementation", expectedTreeRevisionId: revision.revisionId });
+    const success = first.executions.startAttempt({
+      projectId: project.projectId, nodeId: "implementation", expectedTreeRevisionId: revision.revisionId,
+      sourceTraceEventId: answer.eventId,
+    });
     const test = await first.hooks.ingest(mapClaudeHook({ hook_event_name: "PostToolUse", session_id: "s1", cwd: projectDir, tool_name: "Bash", tool_use_id: "test", tool_input: { command: "npm test" }, tool_response: { exitCode: 0 } }));
     if (!test.recorded) throw new Error("test trace was not recorded");
     first.executions.attachEvidence({ projectId: project.projectId, attemptId: success.attemptId, requiredEvidenceKey: "test", traceEventId: test.eventId });

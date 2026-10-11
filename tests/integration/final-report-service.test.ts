@@ -109,6 +109,34 @@ async function sharedBranchesFixture() {
 }
 
 describe("FinalReportService", () => {
+  it.each(["unchanged", "changed", "invalidated"])("retains only valid prior-revision evidence (%s)", async (scenario) => {
+    const unchanged = scenario !== "changed";
+    const f = await finalStageFixture();
+    const current = f.runtime.database.get<{ body_json: string }>("SELECT body_json FROM task_node_revisions WHERE node_id = ? AND tree_revision_id = ?", f.rootNodeId, f.tree.revisionId)!;
+    const body = JSON.parse(current.body_json);
+    if (!unchanged) body.title = "Obsolete objective";
+    const priorDocument = structuredClone(f.tree.document);
+    priorDocument.nodes = [body];
+    f.runtime.database.run("INSERT INTO task_tree_revisions (id, tree_id, revision, document_json, created_at) VALUES ('prior-tree', ?, 0, ?, '2020')", f.tree.treeId, JSON.stringify(priorDocument));
+    f.runtime.database.run("INSERT INTO task_node_revisions (id, node_id, tree_revision_id, body_json, created_at) VALUES ('prior-node', ?, 'prior-tree', ?, '2020')", f.rootNodeId, JSON.stringify(body));
+    f.runtime.database.run("INSERT INTO execution_attempts (id, project_id, tree_id, task_node_id, task_node_revision_id, attempt_number, status, started_at) VALUES ('prior-attempt', ?, ?, ?, 'prior-node', 1, 'succeeded', '2020')", f.project.projectId, f.tree.treeId, f.rootNodeId);
+    f.runtime.database.run("INSERT INTO trace_events (id, project_id, tree_id, node_id, session_id, event_name, payload_json, occurred_at, idempotency_key) VALUES ('prior-trace', ?, ?, ?, 'prior-session', 'PostToolUse', '{}', '2020', 'prior-trace')", f.project.projectId, f.tree.treeId, f.rootNodeId);
+    f.runtime.database.run("INSERT INTO execution_attempt_evidence (attempt_id, required_evidence_key, trace_event_id, created_at) VALUES ('prior-attempt', 'test', 'prior-trace', '2020')");
+    f.runtime.database.run("INSERT INTO evaluations (id, project_id, tree_id, task_node_id, task_node_revision_id, execution_attempt_id, verdict, evidence_refs_json, covered_required_evidence_json, missing_required_evidence_json, risk_summary, created_at) VALUES ('prior-eval', ?, ?, ?, 'prior-node', 'prior-attempt', 'succeeded', '[\"prior-trace\"]', '[\"test\"]', '[]', '', '2020')", f.project.projectId, f.tree.treeId, f.rootNodeId);
+    if (scenario === "invalidated") f.runtime.database.run(`
+      INSERT INTO verification_invalidations (id, project_id, tree_id, tree_revision_id, source_trace_event_id,
+        artifact_id, workflow_revision, prior_stage, next_stage, affected_node_ids_json,
+        invalidated_evaluation_ids_json, invalidated_gate_result_ids_json, created_at)
+      VALUES ('prior-invalidation', ?, ?, 'prior-tree', 'prior-trace', NULL, 1, 'final_report', 'root_verification', '[]', '["prior-eval"]', '[]', '2021')
+    `, f.project.projectId, f.tree.treeId);
+    const valid = scenario === "unchanged";
+    const report = f.runtime.finalReports.finalize({ projectId: f.project.projectId, treeId: f.tree.treeId, workflowRevision: 8, idempotencyKey: "prior-evidence" });
+    expect(report.evidenceRefs.evaluationIds).toEqual(valid ? ["prior-eval"] : []);
+    expect(report.evidenceRefs.traceEventIds).toEqual(valid ? ["prior-trace"] : []);
+    expect(report.summary).toMatchObject({ evaluations: { succeeded: unchanged ? 1 : 0 } });
+    expect(f.runtime.database.get("SELECT task_node_revision_id FROM execution_attempts WHERE id = 'prior-attempt'")).toEqual({ task_node_revision_id: "prior-node" });
+  });
+
   it("atomically persists an immutable fact report and completes the Task Tree", async () => {
     const fixture = await finalStageFixture();
     expect(fixture.runtime.queries.getRuntimeSnapshot(fixture.project.projectId)).toMatchObject({
@@ -379,6 +407,17 @@ describe("FinalReportService", () => {
     )).toEqual({ status: "needs_revalidation" });
   });
 
+  it("does not invalidate a provider merely because its data-exchange consumer changes", async () => {
+    const f = await sharedBranchesFixture();
+    f.runtime.database.run("DELETE FROM artifact_graph_relations");
+    f.runtime.database.run("DELETE FROM task_node_artifact_links WHERE id = 'shared-branch-a'");
+    f.runtime.database.run("UPDATE task_node_artifact_links SET artifact_id = 'shared-file' WHERE id = 'shared-branch-b'");
+    f.runtime.database.run("INSERT INTO task_relation_edges (id, tree_revision_id, from_node_id, to_node_id, kind, artifact_id) VALUES ('exchange', ?, 'branch-a-impl', 'branch-b-impl', 'exchanges_data_with', 'shared-contract')", f.tree.revisionId);
+    await f.runtime.hooks.ingest(mapClaudeHook({ hook_event_name: "PostToolUse", session_id: "consumer-change", cwd: f.projectDir, tool_name: "Edit", tool_use_id: "consumer-edit", tool_input: { file_path: "src/shared.ts" }, tool_response: { ok: true } }));
+    expect(f.runtime.database.get("SELECT status FROM task_nodes WHERE id = 'branch-a-impl'")).toEqual({ status: "succeeded" });
+    expect(f.runtime.database.get("SELECT status FROM task_nodes WHERE id = 'branch-b-impl'")).toEqual({ status: "needs_revalidation" });
+  });
+
   it("invalidates an earlier verified branch without interrupting the current implementation Attempt", async () => {
     const fixture = await sharedBranchesFixture();
     fixture.runtime.database.run(`
@@ -483,6 +522,25 @@ describe("FinalReportService", () => {
     expect(fixture.runtime.database.get<{ stage: string; revision: number; active_branch_node_id: string }>(
       "SELECT stage, revision, active_branch_node_id FROM workflow_states WHERE tree_id = ?", fixture.tree.treeId,
     )).toEqual({ stage: "branch_implementation", revision: 7, active_branch_node_id: "branch-a" });
+  });
+
+  it("releases a same-phase dependent Attempt when its completed provider is invalidated", async () => {
+    const f = await sharedBranchesFixture();
+    f.runtime.database.run("UPDATE workflow_states SET stage = 'branch_implementation', revision = 6, active_branch_node_id = 'branch-b' WHERE tree_id = ?", f.tree.treeId);
+    f.runtime.database.run("UPDATE workflow_branch_states SET status = 'active' WHERE branch_node_id = 'branch-b'");
+    f.runtime.database.run("UPDATE task_nodes SET status = 'verifying' WHERE id = 'branch-b-impl'");
+    f.runtime.database.run(`INSERT INTO task_relation_edges (tree_revision_id, from_node_id, to_node_id, kind)
+      VALUES (?, 'branch-b-impl', 'branch-a-impl', 'depends_on')`, f.tree.revisionId);
+    f.runtime.database.run(`INSERT INTO execution_attempts (id, project_id, tree_id, task_node_id, task_node_revision_id, attempt_number, status, started_at)
+      VALUES ('dependent-attempt', ?, ?, 'branch-b-impl', 'branch-b-impl-revision', 1, 'verifying', '2030')`, f.project.projectId, f.tree.treeId);
+    f.runtime.database.run(`INSERT INTO trace_events (id, project_id, tree_id, node_id, session_id, event_name, payload_json, occurred_at, idempotency_key)
+      VALUES ('provider-change', ?, ?, 'branch-a-impl', 'provider-session', 'PostToolUse', '{}', '2030', 'provider-change')`, f.project.projectId, f.tree.treeId);
+    f.runtime.database.transaction(() => f.runtime.freshness.invalidateMutationWithinTransaction({
+      projectId: f.project.projectId, treeId: f.tree.treeId, artifactId: 'shared-file', sourceTraceEventId: 'provider-change', fallbackNodeId: 'branch-a-impl',
+    }));
+    expect(f.runtime.database.get("SELECT status FROM execution_attempts WHERE id = 'dependent-attempt'")).toEqual({ status: 'aborted' });
+    expect(f.runtime.database.get("SELECT status FROM task_nodes WHERE id = 'branch-b-impl'")).toEqual({ status: 'needs_revalidation' });
+    expect(f.runtime.database.get("SELECT active_branch_node_id FROM workflow_states WHERE tree_id = ?", f.tree.treeId)).toEqual({ active_branch_node_id: 'branch-a' });
   });
 
   it("rejects stale revisions, non-final workflows, and another Project's tree", async () => {

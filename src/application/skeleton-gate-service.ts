@@ -1,5 +1,6 @@
 import { HarnessError } from "../domain/errors.js";
 import { newId, nowIso } from "../domain/ids.js";
+import { commandArtifactLocator } from "../domain/artifact.js";
 import {
   evaluateSkeletonGate,
   type SkeletonGateBranchObservation,
@@ -8,6 +9,7 @@ import {
 } from "../domain/skeleton-gate.js";
 import type { SkeletonAcceptanceInput, TaskNodeInput, TaskTreeDocument } from "../domain/task-tree.js";
 import { canonicalJson } from "../domain/trace.js";
+import { taskNodeEvidenceContext } from "../domain/task-node-evidence-context.js";
 import type { RuntimeDatabase } from "../storage/database.js";
 
 interface WorkflowRow {
@@ -27,6 +29,7 @@ interface CurrentNodeRow {
 interface AttemptRow {
   id: string;
   task_node_id: string;
+  document_json: string;
 }
 
 interface ArtifactRow {
@@ -105,13 +108,24 @@ export class SkeletonGateService {
     const confirmedBranches = structured
       ? (root?.children ?? []).filter((nodeId) => nodeById.get(nodeId)?.confirmation_state === "confirmed")
       : root ? [root.id] : [];
+    const invalidatedAttemptIds = new Set(this.database.all<{ execution_attempt_id: string }>(`
+      SELECT DISTINCT e.execution_attempt_id FROM evaluations e
+      JOIN verification_invalidations v ON v.project_id = e.project_id AND v.tree_id = e.tree_id
+      JOIN json_each(v.invalidated_evaluation_ids_json) invalidated ON invalidated.value = e.id
+      WHERE e.project_id = ? AND e.tree_id = ?
+    `, input.projectId, input.treeId).map((row) => row.execution_attempt_id));
     const attempts = this.database.all<AttemptRow>(`
-      SELECT a.id, a.task_node_id
+      SELECT a.id, a.task_node_id, prior.document_json
       FROM execution_attempts a
       JOIN task_node_revisions nr ON nr.id = a.task_node_revision_id
-      WHERE a.project_id = ? AND a.tree_id = ? AND nr.tree_revision_id = ? AND a.status = 'succeeded'
-      ORDER BY a.attempt_number DESC, a.id DESC
-    `, input.projectId, input.treeId, tree.current_revision_id);
+      JOIN task_tree_revisions prior ON prior.id = nr.tree_revision_id
+      JOIN task_node_revisions current ON current.node_id = a.task_node_id AND current.tree_revision_id = ?
+      WHERE a.project_id = ? AND a.tree_id = ? AND nr.body_json = current.body_json AND a.status = 'succeeded'
+      ORDER BY prior.revision DESC, a.attempt_number DESC, a.started_at DESC, a.id DESC
+    `, tree.current_revision_id, input.projectId, input.treeId).filter((attempt) =>
+      !invalidatedAttemptIds.has(attempt.id)
+      && taskNodeEvidenceContext(JSON.parse(attempt.document_json) as TaskTreeDocument, attempt.task_node_id)
+        === taskNodeEvidenceContext(document, attempt.task_node_id));
     const attemptByNode = new Map<string, string>();
     for (const attempt of attempts) if (!attemptByNode.has(attempt.task_node_id)) attemptByNode.set(attempt.task_node_id, attempt.id);
     const evidenceRows = this.database.all<{ attempt_id: string; required_evidence_key: string; trace_event_id: string }>(`
@@ -119,9 +133,10 @@ export class SkeletonGateService {
       FROM execution_attempt_evidence e
       JOIN execution_attempts a ON a.id = e.attempt_id
       JOIN task_node_revisions nr ON nr.id = a.task_node_revision_id
-      WHERE a.project_id = ? AND a.tree_id = ? AND nr.tree_revision_id = ? AND a.status = 'succeeded'
+      JOIN task_node_revisions current ON current.node_id = a.task_node_id AND current.tree_revision_id = ?
+      WHERE a.project_id = ? AND a.tree_id = ? AND nr.body_json = current.body_json AND a.status = 'succeeded'
       ORDER BY e.attempt_id, e.trace_event_id
-    `, input.projectId, input.treeId, tree.current_revision_id);
+    `, tree.current_revision_id, input.projectId, input.treeId);
     const evidenceByAttempt = new Map<string, Set<string>>();
     const evidenceKeysByAttempt = new Map<string, Set<string>>();
     for (const row of evidenceRows) {
@@ -260,7 +275,8 @@ export class SkeletonGateService {
       };
     };
     const commandCheck = (ref: string): SkeletonGateCheck => {
-      const artifact = input.artifacts.find((value) => value.locator === ref && value.status === "verified");
+      const locator = commandArtifactLocator(ref);
+      const artifact = input.artifacts.find((value) => value.locator === locator && value.status === "verified");
       const traceId = artifact?.source_trace_event_id ?? null;
       return { ref, satisfied: Boolean(traceId && branchEvidence.has(traceId)), evidenceRefs: traceId ? [traceId] : [] };
     };

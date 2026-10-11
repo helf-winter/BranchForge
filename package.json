@@ -1,6 +1,6 @@
 {
   "name": "self-evolving-agent-harness",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "private": true,
   "type": "module",
   "engines": {
@@ -15,7 +15,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "plugin:validate:official": "claude plugin validate ./plugin",
+    "plugin:validate:official": "claude plugin validate ./plugin && claude plugin validate .",
     "plugin:validate": "npm run build && npm run plugin:validate:official && vitest run tests/plugin",
     "check": "npm run typecheck && npm test && npm run plugin:validate"
   },

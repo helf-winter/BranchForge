@@ -17,4 +17,11 @@ jobs:
           node-version: "22.20.0"
           cache: npm
       - run: npm ci
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code@2.1.296
+
+      - name: Verify Claude Code CLI
+        run: claude --version
+
       - run: npm run check

@@ -1,9 +1,11 @@
 import { HarnessError } from "../domain/errors.js";
+import { loadNodeCompletion } from "./node-completion.js";
 import type { ExecutionAttemptStatus } from "../domain/execution.js";
 import { newId, nowIso } from "../domain/ids.js";
 import type { RequiredEvidence, TaskNodeInput } from "../domain/task-tree.js";
 import type { WorkflowStage } from "../domain/workflow.js";
 import type { RuntimeDatabase } from "../storage/database.js";
+import { ExecutionSchedulerService } from "./execution-scheduler-service.js";
 
 interface ExecutableNodeRow {
   node_id: string;
@@ -14,6 +16,7 @@ interface ExecutableNodeRow {
   node_revision_id: string;
   body_json: string;
   workflow_stage: WorkflowStage;
+  workflow_revision: number;
   confirmation_state: string;
   active_branch_node_id: string | null;
 }
@@ -28,6 +31,11 @@ interface AttemptRow {
   status: ExecutionAttemptStatus;
   started_at: string;
   completed_at: string | null;
+  session_id: string | null;
+  agent_runtime: string | null;
+  tree_revision_id: string | null;
+  workflow_revision: number | null;
+  source_trace_event_id: string | null;
 }
 
 interface TraceRow {
@@ -36,6 +44,7 @@ interface TraceRow {
   tree_id: string | null;
   node_id: string | null;
   occurred_at: string;
+  session_id: string;
 }
 
 export interface ExecutionAttemptView {
@@ -48,6 +57,10 @@ export interface ExecutionAttemptView {
   status: ExecutionAttemptStatus;
   startedAt: string;
   completedAt: string | null;
+  sessionId: string | null;
+  agentRuntime: string | null;
+  treeRevisionId: string | null;
+  workflowRevision: number | null;
 }
 
 export interface AttemptEvidenceView {
@@ -65,9 +78,18 @@ const stagePhase: Partial<Record<WorkflowStage, TaskNodeInput["executionPhase"]>
 };
 
 export class NodeExecutionService {
-  constructor(private readonly database: RuntimeDatabase) {}
+  private readonly scheduler: ExecutionSchedulerService;
 
-  startAttempt(input: { projectId: string; nodeId: string; expectedTreeRevisionId: string }): ExecutionAttemptView {
+  constructor(private readonly database: RuntimeDatabase, scheduler?: ExecutionSchedulerService) {
+    this.scheduler = scheduler ?? new ExecutionSchedulerService(database);
+  }
+
+  startAttempt(input: {
+    projectId: string;
+    nodeId: string;
+    expectedTreeRevisionId: string;
+    sourceTraceEventId?: string;
+  }): ExecutionAttemptView {
     const attemptId = newId();
     const startedAt = nowIso();
     this.database.transaction(() => {
@@ -91,6 +113,23 @@ export class NodeExecutionService {
       if (stagePhase[node.workflow_stage] !== body.executionPhase) {
         throw new HarnessError("attempt_not_executable", `Task Node phase ${body.executionPhase ?? "undefined"} is not allowed during ${node.workflow_stage}`);
       }
+      const document = this.database.get<{ document_json: string }>(
+        "SELECT document_json FROM task_tree_revisions WHERE id = ?",
+        node.current_revision_id,
+      );
+      let hasSchedulableDocument = false;
+      try {
+        const parsed = JSON.parse(document?.document_json ?? "{}") as { planningVersion?: unknown; nodes?: unknown };
+        hasSchedulableDocument = parsed.planningVersion === 1 && Array.isArray(parsed.nodes);
+      } catch {
+        hasSchedulableDocument = false;
+      }
+      if (hasSchedulableDocument) {
+        const scheduled = this.scheduler.next({ projectId: input.projectId, treeId: node.tree_id });
+        if (!scheduled || scheduled.nodeId !== node.node_id || scheduled.treeRevisionId !== input.expectedTreeRevisionId) {
+          throw new HarnessError("attempt_not_executable", "Task Node is not the deterministic next scheduled node");
+        }
+      }
       this.requireWorkflowScope(node);
       this.requireSucceededDependencies(node.tree_id, body.dependencies ?? []);
       if (body.executionPhase === "verification") {
@@ -100,9 +139,17 @@ export class NodeExecutionService {
         "SELECT MAX(attempt_number) AS maximum FROM execution_attempts WHERE task_node_revision_id = ?",
         node.node_revision_id,
       )?.maximum ?? 0) + 1;
+      const provenance = input.sourceTraceEventId
+        ? this.requireAttemptSource(input.projectId, input.sourceTraceEventId)
+        : { sessionId: null, agentRuntime: null };
       this.database.run(
-        "INSERT INTO execution_attempts (id, project_id, tree_id, task_node_id, task_node_revision_id, attempt_number, status, started_at) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
+        `INSERT INTO execution_attempts (
+          id, project_id, tree_id, task_node_id, task_node_revision_id, attempt_number, status, started_at,
+          session_id, agent_runtime, tree_revision_id, workflow_revision, source_trace_event_id
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)`,
         attemptId, input.projectId, node.tree_id, node.node_id, node.node_revision_id, attemptNumber, startedAt,
+        provenance.sessionId, provenance.agentRuntime, node.current_revision_id, node.workflow_revision,
+        input.sourceTraceEventId ?? null,
       );
       this.database.run("UPDATE task_nodes SET status = 'running' WHERE id = ?", node.node_id);
       this.database.run(
@@ -133,9 +180,10 @@ export class NodeExecutionService {
     if (!requiredEvidence.some((item: RequiredEvidence) => item.key === input.requiredEvidenceKey)) {
       throw new HarnessError("invalid_input", "required evidence key is not declared by this Task Node revision");
     }
-    const trace = this.database.get<TraceRow>("SELECT id, project_id, tree_id, node_id, occurred_at FROM trace_events WHERE id = ?", input.traceEventId);
+    const trace = this.database.get<TraceRow>("SELECT id, project_id, tree_id, node_id, session_id, occurred_at FROM trace_events WHERE id = ?", input.traceEventId);
     if (!trace) throw new HarnessError("evidence_not_found", "Trace evidence was not found");
-    if (trace.project_id !== attempt.project_id || trace.tree_id !== attempt.tree_id || trace.node_id !== attempt.task_node_id || trace.occurred_at < attempt.started_at) {
+    if (trace.project_id !== attempt.project_id || trace.tree_id !== attempt.tree_id || trace.node_id !== attempt.task_node_id
+      || (attempt.session_id !== null && trace.session_id !== attempt.session_id) || trace.occurred_at < attempt.started_at) {
       throw new HarnessError("evidence_scope_mismatch", "Trace evidence must belong to this Task Node attempt and occur after it starts");
     }
     const createdAt = nowIso();
@@ -163,7 +211,8 @@ export class NodeExecutionService {
     const row = this.database.get<ExecutableNodeRow>(`
       SELECT n.id AS node_id, n.parent_id, n.tree_id, n.status AS node_status,
              t.current_revision_id, nr.id AS node_revision_id, nr.body_json,
-             w.stage AS workflow_stage, cs.state AS confirmation_state, w.active_branch_node_id
+             w.stage AS workflow_stage, w.revision AS workflow_revision,
+             cs.state AS confirmation_state, w.active_branch_node_id
       FROM task_nodes n
       JOIN task_trees t ON t.id = n.tree_id
       JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
@@ -204,6 +253,7 @@ export class NodeExecutionService {
   }
 
   private requireSucceededDependencies(treeId: string, dependencyIds: string[]): void {
+    const complete = loadNodeCompletion(this.database, treeId);
     for (const dependencyId of dependencyIds) {
       const dependency = this.database.get<{ status: string }>(`
         SELECT n.status
@@ -212,21 +262,22 @@ export class NodeExecutionService {
         JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
         WHERE n.id = ? AND n.tree_id = ?
       `, dependencyId, treeId);
-      if (dependency?.status !== "succeeded") {
+      if (!dependency || !complete(dependencyId)) {
         throw new HarnessError("attempt_not_executable", `dependency ${dependencyId} has not succeeded`);
       }
     }
   }
 
   private requireSucceededCurrentChildren(treeId: string, parentNodeId: string): void {
-    const incompleteChild = this.database.get<{ id: string; status: string }>(`
+    const complete = loadNodeCompletion(this.database, treeId);
+    const incompleteChild = this.database.all<{ id: string; status: string }>(`
       SELECT n.id, n.status
       FROM task_nodes n
       JOIN task_trees t ON t.id = n.tree_id
       JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
-      WHERE n.tree_id = ? AND n.parent_id = ? AND n.status <> 'succeeded'
-      ORDER BY n.id LIMIT 1
-    `, treeId, parentNodeId);
+      WHERE n.tree_id = ? AND n.parent_id = ?
+      ORDER BY n.id
+    `, treeId, parentNodeId).find((child) => !complete(child.id));
     if (incompleteChild) {
       throw new HarnessError(
         "attempt_not_executable",
@@ -239,7 +290,8 @@ export class NodeExecutionService {
   private requireAttemptRow(projectId: string, attemptId: string): AttemptRow {
     const attempt = this.database.get<AttemptRow>(`
       SELECT id, project_id, tree_id, task_node_id, task_node_revision_id,
-             attempt_number, status, started_at, completed_at
+             attempt_number, status, started_at, completed_at, session_id, agent_runtime,
+             tree_revision_id, workflow_revision, source_trace_event_id
       FROM execution_attempts WHERE id = ? AND project_id = ?
     `, attemptId, projectId);
     if (!attempt) throw new HarnessError("not_found", "Execution Attempt was not found in this Project");
@@ -258,7 +310,26 @@ export class NodeExecutionService {
       status: attempt.status,
       startedAt: attempt.started_at,
       completedAt: attempt.completed_at,
+      sessionId: attempt.session_id,
+      agentRuntime: attempt.agent_runtime,
+      treeRevisionId: attempt.tree_revision_id,
+      workflowRevision: attempt.workflow_revision,
     };
+  }
+
+  private requireAttemptSource(projectId: string, traceEventId: string): { sessionId: string; agentRuntime: string } {
+    const trace = this.database.get<{ session_id: string; execution_context_json: string }>(`
+      SELECT session_id, execution_context_json FROM trace_events WHERE id = ? AND project_id = ?
+    `, traceEventId, projectId);
+    if (!trace) throw new HarnessError("evidence_scope_mismatch", "Attempt provenance requires a same-Project Trace Event");
+    let agentRuntime = "claude-code";
+    try {
+      const context = JSON.parse(trace.execution_context_json) as { agentType?: unknown };
+      if (typeof context.agentType === "string" && context.agentType.trim()) agentRuntime = context.agentType;
+    } catch {
+      // Historical Trace context may be empty; the Claude binding remains the safe default.
+    }
+    return { sessionId: trace.session_id, agentRuntime };
   }
 
   private assertAttemptStatus(attempt: AttemptRow, expectedStatus: ExecutionAttemptStatus): void {

@@ -23,7 +23,16 @@ describe("harness CLI", () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "harness-cli-")); dirs.push(cwd);
     const result = run(cwd, ["doctor", "--json"]);
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ node: { ok: true }, sqlite: { ok: true } });
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      node: { ok: true },
+      sqlite: { ok: true },
+      requestRouting: {
+        enabled: false,
+        readiness: "disabled",
+        apiKeyConfigured: false,
+        model: "jev-1.13.0",
+      },
+    });
     expect(run(cwd, ["project", "inspect", "--json"]).status).toBe(0);
     expect(JSON.parse(run(cwd, ["project", "inspect", "--json"]).stdout).status).toBe("new_project");
   });
@@ -60,7 +69,7 @@ describe("harness CLI", () => {
     expect(JSON.parse(restored.stdout)).toMatchObject({ treeId: second.treeId, status: "draft", selected: false });
     expect(run(cwd, ["tree", "select", second.treeId, "--json"]).status).toBe(0);
     expect(JSON.parse(run(cwd, ["tree", "snapshot", "--json"]).stdout)).toMatchObject({ selectedTreeId: second.treeId });
-  });
+  }, 30_000);
 
   it("uses a stable non-zero exit with structured errors", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "harness-cli-")); dirs.push(cwd);

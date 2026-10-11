@@ -5,7 +5,8 @@ const secretKey = /(authorization|api[-_]?key|token|credential|cookie|password|s
 function redactInlineSecrets(value: string): string {
   return value
     .replace(/((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]")
-    .replace(/((?:--?)?(?:api[-_]?key|token|password|secret)(?:\s+|\s*[:=]\s*)["']?)[^\s"';&]+/gi, "$1[REDACTED]");
+    .replace(/((?:--?)?(?:api[-_]?key|token|password|secret)(?:\s+|\s*[:=]\s*)["']?)[^\s"';&]+/gi, "$1[REDACTED]")
+    .replace(/\b(?:ghp_|github_pat_|glpat-|xox[baprs]-|sk-)[A-Za-z0-9_-]{16,}\b/g, "[REDACTED]");
 }
 
 function canonical(value: unknown): string {

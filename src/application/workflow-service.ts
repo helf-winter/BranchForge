@@ -88,6 +88,8 @@ export class WorkflowService {
     answer: "yes" | "no";
     answerTraceEventId: string;
     workflowRevision: number;
+    evidenceEventName?: "UserPromptSubmit" | "PostToolUse";
+    withinTransaction?: boolean;
   }) {
     const confirmation = this.database.get<ConfirmationRow>(
       `SELECT id, project_id, tree_id, scope_id, status, tree_revision_id, readiness_result_id,
@@ -108,8 +110,9 @@ export class WorkflowService {
     }
     const evidence = this.database.get<{ id: string }>(
       `SELECT id FROM trace_events
-       WHERE id = ? AND project_id = ? AND tree_id = ? AND event_name = 'UserPromptSubmit' AND occurred_at >= ?`,
-      input.answerTraceEventId, input.projectId, confirmation.tree_id, confirmation.created_at,
+       WHERE id = ? AND project_id = ? AND tree_id = ? AND event_name = ? AND occurred_at >= ?`,
+      input.answerTraceEventId, input.projectId, confirmation.tree_id,
+      input.evidenceEventName ?? "UserPromptSubmit", confirmation.created_at,
     );
     if (!evidence) throw new HarnessError("workflow_transition_rejected", "a recorded user answer Trace Event is required");
 
@@ -131,7 +134,7 @@ export class WorkflowService {
     const confirmationRecordId = newId();
     const timestamp = nowIso();
     let allConfirmed = false;
-    this.database.transaction(() => {
+    const activate = () => {
       this.database.run(
         "UPDATE runtime_confirmation_prompts SET status = 'confirmed', answer = ?, answer_trace_event_id = ?, resolved_at = ? WHERE id = ?",
         input.answer, input.answerTraceEventId, timestamp, confirmation.id,
@@ -209,7 +212,9 @@ export class WorkflowService {
       } else {
         this.database.run("UPDATE task_trees SET status = 'partially_confirmed', updated_at = ? WHERE id = ?", timestamp, confirmation.tree_id);
       }
-    });
+    };
+    if (input.withinTransaction) activate();
+    else this.database.transaction(activate);
     return {
       stage: allConfirmed ? "skeleton_pass" as const : workflow.stage,
       workflowRevision: allConfirmed ? workflow.revision + 1 : workflow.revision,
@@ -218,6 +223,37 @@ export class WorkflowService {
       scopeRootNodeId: confirmation.scope_root_node_id,
       coveredNodeIds: [...covered],
     };
+  }
+
+  confirmNativePlan(input: {
+    projectId: string;
+    confirmationId: string;
+    nativeApprovalTraceEventId: string;
+    workflowRevision: number;
+    withinTransaction?: boolean;
+  }) {
+    const trace = this.database.get<{ payload_json: string }>(
+      "SELECT payload_json FROM trace_events WHERE id = ? AND project_id = ? AND event_name = 'PostToolUse'",
+      input.nativeApprovalTraceEventId, input.projectId,
+    );
+    let exitPlanMode = false;
+    try {
+      exitPlanMode = Boolean(trace && (JSON.parse(trace.payload_json) as { toolName?: unknown }).toolName === "ExitPlanMode");
+    } catch {
+      exitPlanMode = false;
+    }
+    if (!exitPlanMode) {
+      throw new HarnessError("workflow_transition_rejected", "native Plan confirmation requires a successful PostToolUse(ExitPlanMode) Trace Event");
+    }
+    return this.confirmScope({
+      projectId: input.projectId,
+      confirmationId: input.confirmationId,
+      answer: "yes",
+      answerTraceEventId: input.nativeApprovalTraceEventId,
+      workflowRevision: input.workflowRevision,
+      evidenceEventName: "PostToolUse",
+      ...(input.withinTransaction ? { withinTransaction: true } : {}),
+    });
   }
 
   transition(input: {

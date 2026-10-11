@@ -1,10 +1,12 @@
 import { HarnessError } from "../domain/errors.js";
+import { findUserDecisionEvidence } from "./user-decision-evidence.js";
 import { deriveConfirmationStates, resolveConfirmationScope, type ConfirmationState } from "../domain/confirmation.js";
 import { normalizeArtifactInput } from "../domain/artifact-graph.js";
 import { newId, nowIso } from "../domain/ids.js";
 import { canonicalJson } from "../domain/trace.js";
 import { normalizeTaskTreeDocument, validateTaskTree, type TaskTreeDocument } from "../domain/task-tree.js";
 import { analyzeDraftImpact, analyzePlanReadiness, validateDraftStructure } from "../domain/task-refinement.js";
+import { taskNodeEvidenceContext } from "../domain/task-node-evidence-context.js";
 import { restoredTaskTreeStatus, type TaskTreeCollectionAction } from "../domain/task-collection.js";
 import type { RuntimeDatabase } from "../storage/database.js";
 
@@ -135,11 +137,19 @@ export class TaskTreeService {
   }
 
   saveDraftRevision(input: { projectId: string; treeId: string; baseRevisionId: string; document: TaskTreeDocument }): TaskTreeRevisionView {
+    return this.saveDraftRevisionRecord(input, true);
+  }
+
+  saveDraftRevisionWithinTransaction(input: { projectId: string; treeId: string; baseRevisionId: string; document: TaskTreeDocument }): TaskTreeRevisionView {
+    return this.saveDraftRevisionRecord(input, false);
+  }
+
+  private saveDraftRevisionRecord(input: { projectId: string; treeId: string; baseRevisionId: string; document: TaskTreeDocument }, wrap: boolean): TaskTreeRevisionView {
     const tree = this.requireTree(input.projectId, input.treeId);
     this.assertTreeMutable(tree);
     if (tree.current_revision_id !== input.baseRevisionId) throw new HarnessError("revision_conflict", "the Task Tree changed after this draft was based on it");
     this.assertValidDocument(input.document);
-    return this.persistRevision(tree, input.projectId, input.document);
+    return this.persistRevision(tree, input.projectId, input.document, wrap);
   }
 
   applyDraftChangeSet(input: {
@@ -214,7 +224,10 @@ export class TaskTreeService {
   }
 
   applyRefinementChangeSet(input: RefinementChangeSetInput): TaskTreeRevisionView {
-    return this.database.transaction(() => {
+    return this.database.transaction(() => this.applyRefinementChangeSetWithinTransaction(input));
+  }
+
+  applyRefinementChangeSetWithinTransaction(input: RefinementChangeSetInput): TaskTreeRevisionView {
       const tree = this.requireTree(input.projectId, input.treeId);
       this.assertTreeMutable(tree);
       if (tree.current_revision_id !== input.baseRevisionId) {
@@ -236,11 +249,8 @@ export class TaskTreeService {
       if (!impact.hasStructuralChange) {
         throw new HarnessError("invalid_input", "the refinement Change Set does not contain a structural change");
       }
-      const sourceTrace = this.database.get<{ id: string; occurred_at: string }>(`
-        SELECT id, occurred_at FROM trace_events
-        WHERE id = ? AND project_id = ? AND tree_id = ? AND event_name = 'UserPromptSubmit'
-      `, input.sourceUserMessageTraceEventId, input.projectId, input.treeId);
-      if (!sourceTrace || sourceTrace.occurred_at < base.created_at) {
+      const sourceTrace = findUserDecisionEvidence(this.database, input.projectId, input.sourceUserMessageTraceEventId);
+      if (!sourceTrace || sourceTrace.tree_id !== input.treeId || sourceTrace.occurred_at < base.created_at) {
         throw new HarnessError("evidence_scope_mismatch", "the source user message must belong to this tree and follow the base revision");
       }
 
@@ -311,7 +321,6 @@ export class TaskTreeService {
         timestamp, previewId,
       );
       return result;
-    });
   }
 
   scanPlanReadiness(input: { projectId: string; treeId: string; scopeRootNodeId?: string }) {
@@ -340,6 +349,42 @@ export class TaskTreeService {
         scopeKind, input.scopeRootNodeId ?? null, canonicalJson(result.blockingIssues), canonicalJson(result.warnings),
         result.recommendedNextIssue ? canonicalJson(result.recommendedNextIssue) : null,
       );
+      const workflow = this.database.get<{ stage: string }>(`
+        SELECT stage FROM workflow_states
+        WHERE project_id = ? AND tree_id = ? AND active = 1
+      `, input.projectId, input.treeId);
+      const pendingConfirmationCount = this.database.get<{ count: number }>(`
+        SELECT count(*) AS count FROM task_node_confirmation_states
+        WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ?
+          AND state IN ('draft', 'pending_user_confirmation', 'partial_confirmed')
+      `, input.projectId, input.treeId, revision.id)?.count ?? 0;
+      const confirmedCount = this.database.get<{ count: number }>(`
+        SELECT count(*) AS count FROM task_node_confirmation_states
+        WHERE tree_revision_id = ? AND state = 'confirmed'
+      `, revision.id)?.count ?? 0;
+      const totalConfirmationCount = this.database.get<{ count: number }>(`
+        SELECT count(*) AS count FROM task_node_confirmation_states WHERE tree_revision_id = ?
+      `, revision.id)?.count ?? 0;
+      const synchronizedTreeStatus = pendingConfirmationCount > 0
+        ? confirmedCount > 0 ? "partially_confirmed" : "draft"
+        : totalConfirmationCount > 0 && confirmedCount === totalConfirmationCount ? "confirmed" : "draft";
+      this.database.run(
+        "UPDATE task_trees SET status = ?, updated_at = ? WHERE id = ?",
+        synchronizedTreeStatus, timestamp, input.treeId,
+      );
+      const activeAttemptCount = this.database.get<{ count: number }>(`
+        SELECT count(*) AS count FROM execution_attempts
+        WHERE project_id = ? AND tree_id = ? AND status IN ('running', 'verifying')
+      `, input.projectId, input.treeId)?.count ?? 0;
+      if (workflow && pendingConfirmationCount > 0 && activeAttemptCount === 0
+        && ["skeleton_pass", "skeleton_gate", "branch_implementation", "branch_verification", "root_verification", "final_report"].includes(workflow.stage)) {
+        this.database.run(`
+          UPDATE workflow_states
+          SET stage = 'task_tree_refinement', active_branch_node_id = NULL,
+              revision = revision + 1, updated_at = ?
+          WHERE project_id = ? AND tree_id = ? AND active = 1
+        `, timestamp, input.projectId, input.treeId);
+      }
       if (result.ready) {
         this.database.run(
           "UPDATE workflow_states SET stage = 'branch_confirmation', revision = revision + 1, updated_at = ? WHERE project_id = ? AND tree_id = ? AND active = 1 AND stage = 'task_tree_refinement'",
@@ -354,6 +399,22 @@ export class TaskTreeService {
     const tree = this.requireTree(projectId, treeId);
     const revision = this.requireRevision(tree.current_revision_id);
     return { treeId, revisionId: revision.id, revision: revision.revision, title: tree.title, status: tree.status, document: JSON.parse(revision.document_json) as TaskTreeDocument };
+  }
+
+  getRevisionById(projectId: string, treeId: string, revisionId: string): TaskTreeRevisionView {
+    const tree = this.requireTree(projectId, treeId);
+    const revision = this.requireRevision(revisionId);
+    if (!this.database.get("SELECT id FROM task_tree_revisions WHERE id = ? AND tree_id = ?", revisionId, treeId)) {
+      throw new HarnessError("not_found", "Task Tree revision was not found in the requested tree");
+    }
+    return {
+      treeId,
+      revisionId: revision.id,
+      revision: revision.revision,
+      title: tree.title,
+      status: tree.status,
+      document: JSON.parse(revision.document_json) as TaskTreeDocument,
+    };
   }
 
   selectTaskTree(input: { projectId: string; treeId: string }) {
@@ -428,6 +489,24 @@ export class TaskTreeService {
         "UPDATE workflow_states SET active = 0, updated_at = ? WHERE project_id = ? AND tree_id = ?",
         timestamp, input.projectId, tree.id,
       );
+      // Archiving is the end of this workflow, not a new coding request. Clear
+      // its session policy without erasing historical routes or evidence.
+      if (!this.database.get("SELECT id FROM workflow_states WHERE project_id = ? AND active = 1", input.projectId)
+        && !this.database.get("SELECT id FROM task_affiliation_decisions WHERE project_id = ? AND status = 'pending'", input.projectId)) {
+        const profiles = this.database.all<{ session_id: string; source_route_decision_id: string | null; source_affiliation_decision_id: string | null }>(`
+          SELECT session_id, source_route_decision_id, source_affiliation_decision_id
+          FROM runtime_profile_states WHERE project_id = ? AND profile = 'structured_coding'
+        `, input.projectId);
+        for (const profile of profiles) {
+          this.database.run(`
+            INSERT INTO runtime_profile_transitions (id, project_id, session_id, prior_profile, next_profile,
+              source_route_decision_id, source_affiliation_decision_id, reason_code, created_at)
+            VALUES (?, ?, ?, 'structured_coding', 'conversation', ?, ?, 'task_tree:archived', ?)
+          `, newId(), input.projectId, profile.session_id, profile.source_route_decision_id, profile.source_affiliation_decision_id, timestamp);
+          this.database.run(`UPDATE runtime_profile_states SET profile = 'conversation', reason_code = 'task_tree:archived', updated_at = ?
+            WHERE project_id = ? AND session_id = ?`, timestamp, input.projectId, profile.session_id);
+        }
+      }
       if (previousSelectedTreeId === tree.id) this.upsertRuntimeSelection(input.projectId, null, null, timestamp);
       const transitionId = this.appendCollectionTransition({
         projectId: input.projectId, treeId: tree.id, action: "archived", fromStatus: tree.status,
@@ -471,9 +550,11 @@ export class TaskTreeService {
   private persistRevision(tree: TreeRow, projectId: string, document: TaskTreeDocument, wrap = true): TaskTreeRevisionView {
     document = normalizeTaskTreeDocument(document);
     const current = this.requireRevision(tree.current_revision_id);
+    const documentChanged = current.document_json !== canonicalJson(document);
     const revisionId = newId();
     const revision = current.revision + 1;
     const timestamp = nowIso();
+    let persistedTreeStatus = tree.status;
     const work = () => {
       const previousStates = new Map(this.database.all<{
         task_node_id: string; state: ConfirmationState; source_confirmation_id: string | null;
@@ -485,8 +566,10 @@ export class TaskTreeService {
         "SELECT node_id, body_json FROM task_node_revisions WHERE tree_revision_id = ?",
         current.id,
       ).map((row) => [row.node_id, row.body_json]));
+      const previousDocument = JSON.parse(current.document_json) as TaskTreeDocument;
       const changedNodeIds = new Set(document.nodes.flatMap((node) =>
-        previousBodies.get(node.id) !== canonicalJson(node) ? [node.id] : []));
+        previousBodies.get(node.id) !== canonicalJson(node)
+          || taskNodeEvidenceContext(previousDocument, node.id) !== taskNodeEvidenceContext(document, node.id) ? [node.id] : []));
       const byId = new Map(document.nodes.map((node) => [node.id, node]));
       const invalidatedConfirmedAncestors = new Set<string>();
       for (const changedNodeId of changedNodeIds) {
@@ -518,7 +601,7 @@ export class TaskTreeService {
         `, current.id, node.id, tree.id);
         const nextStatus = !previous || previous.status === "draft"
           ? "draft"
-          : previous.body_json === bodyJson
+          : !changedNodeIds.has(node.id)
             ? previous.status
             : previous.status === "succeeded" ? "needs_revalidation" : "pending_user_confirmation";
         this.database.run(
@@ -546,10 +629,13 @@ export class TaskTreeService {
             current_hash_or_version, source_planning_revision_id
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
           ON CONFLICT(project_id, kind, locator) DO UPDATE SET
-            tree_id = excluded.tree_id, status = excluded.status, metadata_json = excluded.metadata_json,
+            tree_id = excluded.tree_id,
+            status = CASE WHEN artifacts.source_trace_event_id IS NOT NULL THEN artifacts.status ELSE excluded.status END,
+            metadata_json = CASE WHEN artifacts.source_trace_event_id IS NOT NULL THEN artifacts.metadata_json ELSE excluded.metadata_json END,
             granularity = excluded.granularity, artifact_type = excluded.artifact_type,
             path_or_name = excluded.path_or_name, identity_strategy = excluded.identity_strategy,
-            confidence = excluded.confidence, current_hash_or_version = excluded.current_hash_or_version,
+            confidence = CASE WHEN artifacts.source_trace_event_id IS NOT NULL THEN artifacts.confidence ELSE excluded.confidence END,
+            current_hash_or_version = CASE WHEN artifacts.source_trace_event_id IS NOT NULL THEN artifacts.current_hash_or_version ELSE excluded.current_hash_or_version END,
             source_planning_revision_id = excluded.source_planning_revision_id, updated_at = excluded.updated_at`,
           artifact.id, projectId, tree.id, artifact.kind, artifact.locator, artifact.status,
           canonicalJson(artifact.metadata), timestamp, timestamp, artifact.granularity, artifact.artifactType,
@@ -620,13 +706,46 @@ export class TaskTreeService {
         canonicalJson(criterion), revisionId);
       }
       this.database.run("UPDATE task_trees SET current_revision_id = ?, updated_at = ? WHERE id = ?", revisionId, timestamp, tree.id);
-      this.database.run(
-        "UPDATE workflow_states SET stage = 'task_tree_refinement', revision = revision + 1, updated_at = ? WHERE project_id = ? AND tree_id = ? AND active = 1 AND stage IN ('draft_task_tree', 'branch_confirmation')",
-        timestamp, projectId, tree.id,
-      );
+      if (documentChanged) {
+        const confirmedCount = Object.values(confirmationStates).filter((state) => state === "confirmed").length;
+        const nextTreeStatus = confirmedCount === document.nodes.length
+          ? "confirmed"
+          : confirmedCount > 0 ? "partially_confirmed" : "draft";
+        persistedTreeStatus = nextTreeStatus;
+        this.database.run(
+          "UPDATE task_trees SET status = ?, updated_at = ? WHERE id = ?",
+          nextTreeStatus, timestamp, tree.id,
+        );
+        const preparedApprovals = this.database.all<{ approval_ref: string; confirmation_prompt_id: string }>(`
+          SELECT approval_ref, confirmation_prompt_id FROM task_tree_approval_references
+          WHERE project_id = ? AND tree_id = ? AND status = 'prepared'
+        `, projectId, tree.id);
+        for (const approval of preparedApprovals) {
+          this.database.run(
+            "UPDATE task_tree_approval_references SET status = 'superseded', resolved_at = ? WHERE approval_ref = ?",
+            timestamp, approval.approval_ref,
+          );
+          this.database.run(`
+            UPDATE runtime_confirmation_prompts
+            SET status = 'cancelled', answer = 'superseded', resolved_at = ?
+            WHERE id = ? AND status = 'pending'
+          `, timestamp, approval.confirmation_prompt_id);
+        }
+        this.database.run(`
+          UPDATE runtime_confirmation_prompts
+          SET status = 'cancelled', answer = 'superseded', resolved_at = ?
+          WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ? AND status = 'pending'
+        `, timestamp, projectId, tree.id, current.id);
+        this.database.run(`
+          UPDATE workflow_states
+          SET stage = 'task_tree_refinement', active_branch_node_id = NULL,
+              revision = revision + 1, updated_at = ?
+          WHERE project_id = ? AND tree_id = ? AND active = 1
+        `, timestamp, projectId, tree.id);
+      }
     };
     if (wrap) this.database.transaction(work); else work();
-    return { treeId: tree.id, revisionId, revision, title: tree.title, status: tree.status, document };
+    return { treeId: tree.id, revisionId, revision, title: tree.title, status: persistedTreeStatus, document };
   }
 
   private assertValidDocument(document: TaskTreeDocument): void {

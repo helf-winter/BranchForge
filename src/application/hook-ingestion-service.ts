@@ -1,4 +1,6 @@
 import path from "node:path";
+import { hasNativeQuestionAnswer } from "./user-decision-evidence.js";
+import { commandArtifactLocator } from "../domain/artifact.js";
 import { buildExecutionContext, type ExecutionContext } from "../domain/execution-context.js";
 import { newId } from "../domain/ids.js";
 import { canonicalJson, createHookIdempotencyKey, redactSecrets } from "../domain/trace.js";
@@ -7,11 +9,21 @@ import type { RuntimeDatabase } from "../storage/database.js";
 import { PlanDriftService } from "./plan-drift-service.js";
 import type { ProjectIdentityService } from "./project-identity-service.js";
 import { VerificationFreshnessService } from "./verification-freshness-service.js";
+import type { RuntimeProfileDecisionView, RuntimeProfileService } from "./runtime-profile-service.js";
+import type { NativePlanBindingService } from "./native-plan-binding-service.js";
 
 interface WorkflowContext {
   tree_id: string;
   stage: string;
+  revision: number;
   selected_node_id: string | null;
+  current_revision_id: string;
+}
+
+interface ActiveAttemptContext {
+  id: string;
+  task_node_id: string;
+  session_id: string | null;
 }
 
 interface ArtifactProjection {
@@ -21,7 +33,34 @@ interface ArtifactProjection {
 }
 
 const mutationTools = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+const mutationLifecycleEvents = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure"]);
 const executableStages = new Set(["skeleton_pass", "skeleton_gate", "branch_implementation", "branch_verification", "root_verification", "final_report"]);
+const missingNativeApprovalReason = [
+  "This structured-coding mutation has no consumed native Plan approval for the active Task Tree revision.",
+  "Do not retry the mutation.",
+  "Validate the current revision, call harness_prepare_task_tree_approval, place its canonical block unchanged in the native Plan, and obtain native Plan approval.",
+  "If the user explicitly wants this change outside the workflow, record a direct-execution affiliation instead.",
+].join(" ");
+const missingActiveAttemptReason = [
+  "This approved structured-coding mutation is not bound to an active Task Node Attempt.",
+  "Do not retry the mutation.",
+  "Call harness_get_next_executable_node, then harness_start_node_attempt for that exact revision before changing project files.",
+  "If the user explicitly wants this change outside the workflow, record a direct-execution affiliation instead.",
+].join(" ");
+const missingWorkflowActivationReason = [
+  "This turn entered Harness structured_coding but is about to stop without starting its planning workflow.",
+  "Continue the same native conversation and load agent-harness:task-tree-planning now.",
+  "Call harness_propose_task_affiliation before ordinary requirement-detail questions, then use AskUserQuestion for the user's affiliation choice.",
+  "Do not create a Task Tree until that choice is resolved.",
+].join(" ");
+export type HookDirective =
+  | { kind: "deny"; reason: string }
+  | { kind: "context"; context: string }
+  | { kind: "stop"; reason: string };
+
+export type HookIngestionResult =
+  | { recorded: false; reason: "inactive" | "duplicate"; directive?: HookDirective }
+  | { recorded: true; eventId: string; violation: boolean; blocked: boolean; directive?: HookDirective };
 
 export class HookIngestionService {
   private readonly drifts: PlanDriftService;
@@ -32,59 +71,140 @@ export class HookIngestionService {
     private readonly projects: ProjectIdentityService,
     drifts?: PlanDriftService,
     freshness?: VerificationFreshnessService,
+    private readonly profiles?: RuntimeProfileService,
+    private readonly nativePlans?: NativePlanBindingService,
   ) {
     this.drifts = drifts ?? new PlanDriftService(database);
     this.freshness = freshness ?? new VerificationFreshnessService(database);
   }
 
-  async ingest(event: ClaudeHookEvent): Promise<
-    | { recorded: false; reason: "inactive" | "duplicate" }
-    | { recorded: true; eventId: string; violation: boolean; blocked: false }
-  > {
+  async ingest(event: ClaudeHookEvent): Promise<HookIngestionResult> {
     const key = createHookIdempotencyKey({
       sessionId: event.sessionId,
       eventName: event.eventName,
       ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
       payload: event,
     });
-    if (this.database.get("SELECT idempotency_key FROM hook_receipts WHERE idempotency_key = ?", key)) return { recorded: false, reason: "duplicate" };
+    if (this.database.get("SELECT idempotency_key FROM hook_receipts WHERE idempotency_key = ?", key)) {
+      let directive = this.recordedViolationDirective(key);
+      if (!directive && event.eventName === "UserPromptSubmit" && this.profiles) {
+        const inspected = await this.projects.resolve(event.cwd, "inspect");
+        if (inspected.status === "same_project") {
+          const current = this.profiles.current(inspected.projectId, event.sessionId);
+          if (current?.additionalContext) {
+            directive = { kind: "context" as const, context: current.additionalContext };
+          }
+        }
+      }
+      return { recorded: false, reason: "duplicate", ...(directive ? { directive } : {}) };
+    }
 
     let project = await this.projects.resolve(event.cwd, "inspect");
     let workflow = project.status === "same_project"
       ? this.database.get<WorkflowContext>(`
-          SELECT w.tree_id, w.stage, r.selected_node_id
+          SELECT w.tree_id, w.stage, w.revision, r.selected_node_id, t.current_revision_id
           FROM workflow_states w
+          JOIN task_trees t ON t.id = w.tree_id AND t.project_id = w.project_id
           LEFT JOIN runtime_states r ON r.project_id = w.project_id
           WHERE w.project_id = ? AND w.active = 1
         `, project.projectId)
       : undefined;
-    const mutation = event.eventName === "PreToolUse" && this.isMutation(event);
-    const pendingAffiliationAnswer = project.status === "same_project" && event.eventName === "UserPromptSubmit" && Boolean(
+    const mutation = mutationLifecycleEvents.has(event.eventName) && this.isMutation(event);
+    const pendingAffiliation = project.status === "same_project" && Boolean(
       this.database.get(`
         SELECT id FROM task_affiliation_decisions
         WHERE project_id = ? AND status = 'pending' LIMIT 1
       `, project.projectId),
     );
-    if (!workflow && !mutation && !pendingAffiliationAnswer) return { recorded: false, reason: "inactive" };
+    const nativeQuestionAnswer = event.eventName === "PostToolUse"
+      && hasNativeQuestionAnswer({ toolName: event.toolName, toolResponse: event.toolResponse });
+    const pendingAffiliationAnswer = pendingAffiliation && (event.eventName === "UserPromptSubmit" || nativeQuestionAnswer);
+    let profileDecision: RuntimeProfileDecisionView | undefined;
+    const routablePrompt = event.eventName === "UserPromptSubmit"
+      && Boolean(event.prompt?.trim())
+      && Boolean(this.profiles)
+      && !pendingAffiliationAnswer;
+    if (routablePrompt && project.status !== "same_project") {
+      profileDecision = await this.profiles!.resolveForPrompt({
+        cwd: event.cwd,
+        sessionId: event.sessionId,
+        prompt: event.prompt!,
+      });
+      if (!profileDecision.projectId) return { recorded: false, reason: "inactive" };
+      project = await this.projects.resolve(event.cwd, "inspect");
+      workflow = project.status === "same_project"
+        ? this.database.get<WorkflowContext>(`
+            SELECT w.tree_id, w.stage, w.revision, r.selected_node_id, t.current_revision_id
+            FROM workflow_states w
+            JOIN task_trees t ON t.id = w.tree_id AND t.project_id = w.project_id
+            LEFT JOIN runtime_states r ON r.project_id = w.project_id
+            WHERE w.project_id = ? AND w.active = 1
+          `, project.projectId)
+        : undefined;
+    }
+    const sessionProfile = project.status === "same_project"
+      ? this.database.get<{ profile: string }>(`
+          SELECT profile FROM runtime_profile_states WHERE project_id = ? AND session_id = ?
+        `, project.projectId, event.sessionId)?.profile
+      : undefined;
+    const workflowActivationReminderSent = project.status === "same_project" && Boolean(
+      this.database.get(`
+        SELECT id FROM trace_events
+        WHERE project_id = ? AND session_id = ? AND event_name = 'workflow_activation_required'
+        LIMIT 1
+      `, project.projectId, event.sessionId),
+    );
+    const workflowActivationRequired = event.eventName === "Stop"
+      && sessionProfile === "structured_coding"
+      && !workflow
+      && !pendingAffiliation
+      && !workflowActivationReminderSent;
+    if (!workflow && !mutation && !pendingAffiliationAnswer && !routablePrompt && !workflowActivationRequired) {
+      return { recorded: false, reason: "inactive" };
+    }
     if (project.status !== "same_project") project = await this.projects.resolve(event.cwd, "persist");
     if (project.status === "identity_conflict") return { recorded: false, reason: "inactive" };
     workflow ??= this.database.get<WorkflowContext>(`
-      SELECT w.tree_id, w.stage, r.selected_node_id
+      SELECT w.tree_id, w.stage, w.revision, r.selected_node_id, t.current_revision_id
       FROM workflow_states w
+      JOIN task_trees t ON t.id = w.tree_id AND t.project_id = w.project_id
       LEFT JOIN runtime_states r ON r.project_id = w.project_id
       WHERE w.project_id = ? AND w.active = 1
     `, project.projectId);
 
-    const violation = mutation && (!workflow || !executableStages.has(workflow.stage));
+    const persistedSessionProfile = sessionProfile ?? this.database.get<{ profile: string }>(`
+      SELECT profile FROM runtime_profile_states WHERE project_id = ? AND session_id = ?
+    `, project.projectId, event.sessionId)?.profile;
+    const activeAttempt = workflow
+      ? this.database.get<ActiveAttemptContext>(`
+          SELECT id, task_node_id, session_id FROM execution_attempts
+          WHERE project_id = ? AND tree_id = ? AND session_id = ? AND status IN ('running', 'verifying')
+          ORDER BY started_at DESC, id DESC LIMIT 1
+        `, project.projectId, workflow.tree_id, event.sessionId)
+      : undefined;
+    const violationReason = event.eventName === "PreToolUse" && mutation
+      ? this.structuredMutationViolation(project.projectId, event.sessionId, workflow, activeAttempt)
+      : undefined;
+    const violation = Boolean(violationReason);
+    const structuredSession = persistedSessionProfile === "structured_coding" || (!persistedSessionProfile && Boolean(workflow));
+    const traceNodeId = structuredSession
+      ? executableStages.has(workflow?.stage ?? "")
+        ? activeAttempt?.task_node_id ?? null
+        : activeAttempt?.task_node_id ?? workflow?.selected_node_id ?? null
+      : null;
     const eventId = newId();
-    const eventName = violation ? "workflow_violation" : event.eventName;
+    const eventName = workflowActivationRequired
+      ? "workflow_activation_required"
+      : violation ? "workflow_violation" : event.eventName;
     const payload = redactSecrets({
       sourceEvent: event.eventName,
       ...(event.toolName ? { toolName: event.toolName } : {}),
+      ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
       ...(event.toolInput ? { toolInput: event.toolInput } : {}),
       ...(event.toolResponse !== undefined ? { toolResponse: event.toolResponse } : {}),
       ...(event.prompt ? { prompt: event.prompt } : {}),
-      ...(violation ? { reason: "mutation_before_confirmed_executable_scope" } : {}),
+      ...(violationReason ? { reason: violationReason } : {}),
+      ...(workflowActivationRequired ? { reason: "structured_workflow_not_started" } : {}),
     });
     const previousContext = this.latestExecutionContext(project.projectId, event.sessionId);
     const executionContext = redactSecrets(buildExecutionContext({
@@ -98,7 +218,7 @@ export class HookIngestionService {
       this.database.run("INSERT INTO hook_receipts (idempotency_key, event_name, received_at) VALUES (?, ?, ?)", key, event.eventName, event.occurredAt);
       this.database.run(
         "INSERT INTO trace_events (id, project_id, tree_id, node_id, session_id, event_name, payload_json, execution_context_json, occurred_at, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        eventId, project.projectId, workflow?.tree_id ?? null, workflow?.selected_node_id ?? null, event.sessionId, eventName,
+        eventId, project.projectId, workflow?.tree_id ?? null, traceNodeId, event.sessionId, eventName,
         canonicalJson(payload), canonicalJson(executionContext), event.occurredAt, key,
       );
       if (event.eventName === "PostToolUse" || event.eventName === "PostToolUseFailure") {
@@ -109,8 +229,8 @@ export class HookIngestionService {
             canonicalJson({ ...(payload as Record<string, unknown>), artifactRefs: [artifact.artifactId] }),
             eventId,
           );
-          if (event.eventName === "PostToolUse" && artifact.kind === "file" && this.isMutation(event) && workflow?.tree_id && workflow.selected_node_id) {
-            this.recordAutomaticDrift(project.projectId, workflow.tree_id, workflow.selected_node_id, eventId, artifact);
+          if (event.eventName === "PostToolUse" && artifact.kind === "file" && this.isMutation(event) && workflow?.tree_id && traceNodeId) {
+            this.recordAutomaticDrift(project.projectId, workflow.tree_id, traceNodeId, eventId, artifact);
           }
           if (event.eventName === "PostToolUse" && this.isMutation(event) && workflow?.tree_id) {
             this.freshness.invalidateMutationWithinTransaction({
@@ -118,20 +238,103 @@ export class HookIngestionService {
               treeId: workflow.tree_id,
               sourceTraceEventId: eventId,
               artifactId: artifact.artifactId,
-              ...(workflow.selected_node_id ? { fallbackNodeId: workflow.selected_node_id } : {}),
+              ...(traceNodeId ? { fallbackNodeId: traceNodeId } : {}),
             });
           }
         }
       }
     });
-    return { recorded: true, eventId, violation, blocked: false };
+    if (routablePrompt && !profileDecision) {
+      profileDecision = await this.profiles!.resolveForPrompt({
+        cwd: event.cwd,
+        sessionId: event.sessionId,
+        prompt: event.prompt!,
+        promptTraceEventId: eventId,
+      });
+    }
+    if (this.nativePlans && workflow && event.toolName === "ExitPlanMode" && event.toolUseId) {
+      try {
+        if (event.eventName === "PreToolUse") {
+          const planMarkdown = typeof event.toolInput?.plan === "string" ? event.toolInput.plan : "";
+          const planFilePath = typeof event.toolInput?.plan_file_path === "string" ? event.toolInput.plan_file_path : undefined;
+          this.nativePlans.preExit({
+            projectId: project.projectId,
+            sessionId: event.sessionId,
+            toolUseId: event.toolUseId,
+            planMarkdown,
+            ...(planFilePath ? { planFilePath } : {}),
+            traceEventId: eventId,
+          });
+        } else if (event.eventName === "PostToolUse" || event.eventName === "PostToolUseFailure") {
+          this.nativePlans.postExit({
+            projectId: project.projectId,
+            sessionId: event.sessionId,
+            toolUseId: event.toolUseId,
+            traceEventId: eventId,
+            outcome: event.eventName === "PostToolUse" ? "approved" : "rejected",
+          });
+        }
+      } catch (error) {
+        if (event.eventName === "PreToolUse") {
+          const message = error instanceof Error ? error.message : String(error);
+          const reason = `Native Plan approval binding was rejected: ${message}. Revalidate the Task Tree and prepare a new approval block.`;
+          this.database.run(
+            "UPDATE trace_events SET event_name = 'workflow_violation', payload_json = ? WHERE id = ?",
+            canonicalJson({ ...(payload as Record<string, unknown>), reason: "native_plan_binding_rejected", directiveReason: reason }),
+            eventId,
+          );
+          return {
+            recorded: true,
+            eventId,
+            violation: true,
+            blocked: true,
+            directive: {
+              kind: "deny",
+              reason,
+            },
+          };
+        }
+      }
+    }
+    if (violation) {
+      return {
+        recorded: true,
+        eventId,
+        violation: true,
+        blocked: true,
+        directive: {
+          kind: "deny",
+          reason: violationReason === "structured_mutation_without_active_attempt"
+            ? missingActiveAttemptReason
+            : missingNativeApprovalReason,
+        },
+      };
+    }
+    if (workflowActivationRequired) {
+      return {
+        recorded: true,
+        eventId,
+        violation: false,
+        blocked: false,
+        directive: { kind: "stop", reason: missingWorkflowActivationReason },
+      };
+    }
+    return {
+      recorded: true,
+      eventId,
+      violation: false,
+      blocked: false,
+      ...(profileDecision?.additionalContext
+        ? { directive: { kind: "context" as const, context: profileDecision.additionalContext } }
+        : {}),
+    };
   }
 
   private latestExecutionContext(projectId: string, runId: string): Partial<ExecutionContext> | undefined {
     const row = this.database.get<{ execution_context_json: string }>(
       `SELECT execution_context_json FROM trace_events
        WHERE project_id = ? AND session_id = ? AND execution_context_json <> '{}'
-       ORDER BY occurred_at DESC, id DESC LIMIT 1`,
+       ORDER BY occurred_at DESC, rowid DESC LIMIT 1`,
       projectId, runId,
     );
     if (!row) return undefined;
@@ -143,13 +346,92 @@ export class HookIngestionService {
     }
   }
 
+  private recordedViolationDirective(idempotencyKey: string): HookDirective | undefined {
+    const row = this.database.get<{ event_name: string; payload_json: string }>(
+      "SELECT event_name, payload_json FROM trace_events WHERE idempotency_key = ?",
+      idempotencyKey,
+    );
+    if (row?.event_name !== "workflow_violation") return undefined;
+    try {
+      const payload = JSON.parse(row.payload_json) as { reason?: unknown };
+      if (payload.reason === "structured_mutation_before_native_approval") {
+        return { kind: "deny", reason: missingNativeApprovalReason };
+      }
+      if (payload.reason === "structured_mutation_without_active_attempt") {
+        return { kind: "deny", reason: missingActiveAttemptReason };
+      }
+      if (payload.reason === "native_plan_binding_rejected" && typeof (payload as { directiveReason?: unknown }).directiveReason === "string") {
+        return { kind: "deny", reason: (payload as { directiveReason: string }).directiveReason };
+      }
+    } catch {
+      // A malformed historical payload must not change ordinary duplicate handling.
+    }
+    return undefined;
+  }
+
   private isMutation(event: ClaudeHookEvent): boolean {
-    if (event.toolName && mutationTools.has(event.toolName)) return true;
+    if (event.toolName && mutationTools.has(event.toolName)) {
+      const filePath = event.toolInput?.file_path ?? event.toolInput?.path ?? event.toolInput?.notebook_path;
+      return typeof filePath === "string" && this.isProjectPath(event.cwd, filePath);
+    }
     if (event.toolName !== "Bash") return false;
-    const command = typeof event.toolInput?.command === "string" ? event.toolInput.command : "";
-    const mutatingCommand = /(^|[;&|]\s*)(rm|mv|cp|touch|mkdir|rmdir|install|chmod|chown|ln|truncate|dd|tee|patch|apply_patch|sed\s+-i|perl\s+-pi|git\s+(commit|checkout|reset|clean|mv|rm)|npm\s+(install|uninstall)|pnpm\s+(add|remove|install)|yarn\s+(add|remove|install))\b/;
-    const outputRedirection = /(^|[^<>])>{1,2}(?![>&])\s*[^&]/;
-    return mutatingCommand.test(command) || outputRedirection.test(command);
+    const command = typeof event.toolInput?.command === "string" ? event.toolInput.command.trim() : "";
+    if (!command) return false;
+    const redirection = /(^|[^<>])>{1,2}(?![>&])\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g;
+    for (const match of command.matchAll(redirection)) {
+      const target = match[2] ?? match[3] ?? match[4];
+      if (target && this.isProjectPath(event.cwd, target)) return true;
+    }
+    if (this.isSimpleExternalMutation(event.cwd, command)) return false;
+    const readOnlyCommand = /^(?:pwd|ls(?:\s|$)|rg(?:\s|$)|grep(?:\s|$)|cat(?:\s|$)|head(?:\s|$)|tail(?:\s|$)|wc(?:\s|$)|stat(?:\s|$)|which(?:\s|$)|type(?:\s|$)|git\s+(?:status|diff|log|show)(?:\s|$)|npm\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|pnpm\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|yarn\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|vitest(?:\s|$)|pytest(?:\s|$)|tsc\s+--noEmit(?:\s|$)|node\s+(?:--version|-v)(?:\s|$))[^;&|]*$/;
+    const unsafeFind = /^find\b/.test(command) && /(?:-delete|-exec|-execdir|-ok)\b/.test(command);
+    if (!unsafeFind && (/^find\b[^;&|]*$/.test(command) || readOnlyCommand.test(command))) return false;
+    // In structured mode, an unknown shell command is potentially mutating. This prevents
+    // script runners and package scripts from bypassing the lifecycle boundary.
+    return true;
+  }
+
+  private isSimpleExternalMutation(cwd: string, command: string): boolean {
+    if (/[;&|`$()]/.test(command)) return false;
+    const tokens = command.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^["']|["']$/g, "")) ?? [];
+    if (!tokens.length || !new Set(["rm", "touch", "mkdir", "rmdir", "truncate"]).has(tokens[0]!)) return false;
+    const paths = tokens.slice(1).filter((token) => !token.startsWith("-"));
+    return paths.length > 0 && paths.every((candidate) => path.isAbsolute(candidate) && !this.isProjectPath(cwd, candidate));
+  }
+
+  private structuredMutationViolation(
+    projectId: string,
+    sessionId: string,
+    workflow: WorkflowContext | undefined,
+    activeAttempt: ActiveAttemptContext | undefined,
+  ): "structured_mutation_before_native_approval" | "structured_mutation_without_active_attempt" | undefined {
+    try {
+      const profile = this.database.get<{ profile: string }>(`
+        SELECT profile FROM runtime_profile_states WHERE project_id = ? AND session_id = ?
+      `, projectId, sessionId)?.profile;
+      if (profile !== "structured_coding") return undefined;
+      if (!workflow) return "structured_mutation_before_native_approval";
+      const approval = this.database.get<{ approval_ref: string }>(`
+        SELECT approval_ref FROM task_tree_approval_references
+        WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ? AND status = 'consumed'
+        LIMIT 1
+      `, projectId, workflow.tree_id, workflow.current_revision_id);
+      if (!approval) return "structured_mutation_before_native_approval";
+      if (executableStages.has(workflow.stage) && !activeAttempt) {
+        return "structured_mutation_without_active_attempt";
+      }
+      return undefined;
+    } catch {
+      // Runtime projection failures must not globally terminate the native Agent.
+      return undefined;
+    }
+  }
+
+  private isProjectPath(cwd: string, candidate: string): boolean {
+    const projectRoot = path.resolve(cwd);
+    const absolute = path.isAbsolute(candidate) ? path.resolve(candidate) : path.resolve(projectRoot, candidate);
+    const relative = path.relative(projectRoot, absolute);
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
   }
 
   private projectArtifact(projectId: string, treeId: string | undefined, eventId: string, event: ClaudeHookEvent): ArtifactProjection | undefined {
@@ -161,7 +443,7 @@ export class HookIngestionService {
       locator = this.normalizeFileLocator(event.cwd, filePath);
     } else if (event.toolName === "Bash" && typeof event.toolInput?.command === "string") {
       kind = "command";
-      locator = event.toolInput.command;
+      locator = commandArtifactLocator(event.toolInput.command);
     }
     if (!kind || !locator) return undefined;
 
@@ -171,7 +453,8 @@ export class HookIngestionService {
     );
     const failed = event.eventName === "PostToolUseFailure";
     const mutation = kind === "file" && this.isMutation(event);
-    const verified = kind === "command" && !failed && this.isVerificationCommand(locator);
+    const verified = kind === "command" && !failed
+      && typeof event.toolInput?.command === "string" && this.isVerificationCommand(event.toolInput.command);
     const status = failed
       ? "failed"
       : verified

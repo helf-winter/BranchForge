@@ -15,16 +15,57 @@ async function databasePath(): Promise<string> {
 afterEach(async () => Promise.all(dirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));
 
 describe("RuntimeDatabase", () => {
+  it("upgrades populated v24 affiliation records without nulling profile or authoring references", async () => {
+    const filename = await databasePath();
+    const legacy = new DatabaseSync(filename);
+    legacy.exec("PRAGMA foreign_keys = ON; CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    for (const migration of migrations.filter(({ version }) => version <= 24)) {
+      legacy.exec(migration.sql);
+      legacy.prepare("INSERT INTO schema_migrations VALUES (?, 'now')").run(migration.version);
+    }
+    legacy.exec(`
+      INSERT INTO projects (id, canonical_path, created_at, updated_at) VALUES ('p', '/project', 'now', 'now');
+      INSERT INTO task_trees (id, project_id, title, status, created_at, updated_at) VALUES ('t', 'p', 'Tree', 'draft', 'now', 'now');
+      INSERT INTO task_tree_revisions (id, tree_id, revision, document_json, created_at) VALUES ('r', 't', 1, '{}', 'now');
+      UPDATE task_trees SET current_revision_id = 'r' WHERE id = 't';
+      INSERT INTO trace_events (id, project_id, session_id, event_name, payload_json, occurred_at, idempotency_key)
+        VALUES ('trace', 'p', 'session', 'UserPromptSubmit', '{}', 'now', 'trace');
+      INSERT INTO runtime_actions (id, project_id, kind, input_json, result_json, created_at) VALUES ('action', 'p', 'affiliation', '{}', '{}', 'now');
+      INSERT INTO runtime_confirmation_prompts (id, project_id, scope_id, prompt, status, created_at) VALUES ('prompt', 'p', 'p', 'Choice?', 'pending', 'now');
+      INSERT INTO task_affiliation_decisions (id, project_id, request_trace_event_id, request_title, candidate_query, candidate_snapshot_json,
+        recommendation, status, confirmation_prompt_id, runtime_action_id, created_at)
+        VALUES ('decision', 'p', 'trace', 'Task', '', '[]', 'new_tree', 'pending', 'prompt', 'action', 'now');
+      INSERT INTO runtime_profile_states (project_id, session_id, profile, source_affiliation_decision_id, reason_code, updated_at)
+        VALUES ('p', 'session', 'structured_coding', 'decision', 'test', 'now');
+      INSERT INTO runtime_profile_transitions (id, project_id, session_id, next_profile, source_affiliation_decision_id, reason_code, created_at)
+        VALUES ('transition', 'p', 'session', 'structured_coding', 'decision', 'test', 'now');
+      INSERT INTO task_tree_authoring_commands (id, project_id, tree_id, affiliation_decision_id, command_kind, idempotency_key, input_hash,
+        base_revision_id, result_revision_id, source_session_id, source_trace_event_id, created_at)
+        VALUES ('authoring', 'p', 't', 'decision', 'create_draft', 'command', 'hash', 'r', 'r', 'session', 'trace', 'now');
+    `);
+    legacy.close();
+    const upgraded = new RuntimeDatabase(filename);
+    expect(upgraded.all("PRAGMA foreign_key_check")).toEqual([]);
+    expect(upgraded.get("PRAGMA foreign_keys")).toEqual({ foreign_keys: 1 });
+    for (const table of ["runtime_profile_states", "runtime_profile_transitions"]) {
+      expect(upgraded.get(`SELECT source_affiliation_decision_id FROM ${table}`)).toEqual({ source_affiliation_decision_id: "decision" });
+    }
+    expect(upgraded.get("SELECT affiliation_decision_id FROM task_tree_authoring_commands")).toEqual({ affiliation_decision_id: "decision" });
+    expect(upgraded.get("SELECT recommendation, status FROM task_affiliation_decisions")).toEqual({ recommendation: "new_tree", status: "pending" });
+    upgraded.run("UPDATE task_affiliation_decisions SET recommendation = 'pause' WHERE id = 'decision'");
+    expect(() => upgraded.run("UPDATE task_affiliation_decisions SET project_id = 'missing' WHERE id = 'decision'")).toThrow();
+    upgraded.close();
+  });
   it("applies migrations once and persists data across reopen", async () => {
     const filename = await databasePath();
     const first = new RuntimeDatabase(filename);
-    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }]);
+    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual(migrations.map(({ version }) => ({ version })));
     first.run("INSERT INTO projects (id, canonical_path, created_at, updated_at) VALUES (?, ?, ?, ?)", "p1", "/work/a", "2026-01-01", "2026-01-01");
     first.close();
 
     const reopened = new RuntimeDatabase(filename);
     expect(reopened.get<{ canonical_path: string }>("SELECT canonical_path FROM projects WHERE id = ?", "p1")).toEqual({ canonical_path: "/work/a" });
-    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(19);
+    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(migrations.length);
     reopened.close();
   });
 
@@ -358,6 +399,106 @@ describe("RuntimeDatabase", () => {
     expect(() => database.run("INSERT INTO task_tree_collection_transitions (id, project_id, tree_id, action, from_status, to_status, created_at) VALUES ('bad', 'p1', 't1', 'deleted', 'draft', 'deleted', 'now')")).toThrow();
     expect(() => database.run("UPDATE task_tree_collection_transitions SET to_status = 'confirmed' WHERE id = 'c1'")).toThrow();
     expect(() => database.run("DELETE FROM task_tree_collection_transitions WHERE id = 'c1'")).toThrow();
+    database.close();
+  });
+
+  it("persists immutable request routes and runtime profile transitions without provider secrets", async () => {
+    const database = new RuntimeDatabase(await databasePath());
+    expect(database.all<{ name: string }>(`
+      SELECT name FROM sqlite_master WHERE type = 'table'
+        AND name IN ('request_route_decisions', 'runtime_profile_states', 'runtime_profile_transitions')
+      ORDER BY name
+    `)).toEqual([
+      { name: "request_route_decisions" },
+      { name: "runtime_profile_states" },
+      { name: "runtime_profile_transitions" },
+    ]);
+    const routeColumns = database.all<{ name: string }>("PRAGMA table_info(request_route_decisions)").map((row) => row.name);
+    expect(routeColumns).toEqual(expect.arrayContaining([
+      "project_id", "session_id", "prompt_fingerprint", "classification", "tree_relation",
+      "confidence", "probabilities_json", "reason_codes_json", "disposition", "provider",
+      "model_requested", "model_resolved", "fallback_reason", "policy_version", "created_at",
+    ]));
+    expect(routeColumns).not.toEqual(expect.arrayContaining(["api_key", "raw_response", "prompt"]));
+
+    database.run("INSERT INTO projects (id, canonical_path, created_at, updated_at) VALUES ('p1', '/work/a', 'now', 'now')");
+    database.run(`
+      INSERT INTO request_route_decisions (
+        id, project_id, session_id, prompt_fingerprint, classification, tree_relation,
+        confidence, probabilities_json, reason_codes_json, disposition, provider,
+        model_requested, model_resolved, fallback_reason, policy_version, created_at
+      ) VALUES ('route-1', 'p1', 'session-1', 'hash', 'task_tree_workflow', 'create_new_tree',
+        0.95, '{}', '["complex"]', 'accepted', 'typesafe_jev', 'jev-1.13.0', 'jev-1.13.0', NULL, 'request-routing-v1', 'now')
+    `);
+    database.run(`
+      INSERT INTO runtime_profile_states (
+        project_id, session_id, profile, source_route_decision_id, reason_code, updated_at
+      ) VALUES ('p1', 'session-1', 'structured_coding', 'route-1', 'route:task_tree_workflow', 'now')
+    `);
+    database.run(`
+      INSERT INTO runtime_profile_transitions (
+        id, project_id, session_id, prior_profile, next_profile,
+        source_route_decision_id, reason_code, created_at
+      ) VALUES ('transition-1', 'p1', 'session-1', NULL, 'structured_coding',
+        'route-1', 'route:task_tree_workflow', 'now')
+    `);
+    expect(() => database.run("UPDATE request_route_decisions SET confidence = 0 WHERE id = 'route-1'")).toThrow();
+    expect(() => database.run("DELETE FROM request_route_decisions WHERE id = 'route-1'")).toThrow();
+    expect(() => database.run("UPDATE runtime_profile_transitions SET next_profile = 'conversation' WHERE id = 'transition-1'")).toThrow();
+    expect(() => database.run("DELETE FROM runtime_profile_transitions WHERE id = 'transition-1'")).toThrow();
+    expect(() => database.run(`
+      INSERT INTO runtime_profile_states (project_id, session_id, profile, reason_code, updated_at)
+      VALUES ('missing', 'session-1', 'conversation', 'test', 'now')
+    `)).toThrow();
+    database.close();
+  });
+
+  it("adds revision-scoped immutable Task Tree authoring commands", async () => {
+    const database = new RuntimeDatabase(await databasePath());
+    const columns = database.all<{ name: string }>("PRAGMA table_info(task_tree_authoring_commands)")
+      .map((row) => row.name);
+    expect(columns).toEqual([
+      "id", "project_id", "tree_id", "affiliation_decision_id", "command_kind",
+      "idempotency_key", "input_hash", "base_revision_id", "result_revision_id",
+      "source_session_id", "source_trace_event_id", "created_at",
+    ]);
+    expect(database.all<{ name: string }>(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'trigger' AND tbl_name = 'task_tree_authoring_commands'
+      ORDER BY name
+    `)).toEqual([
+      { name: "task_tree_authoring_commands_no_delete" },
+      { name: "task_tree_authoring_commands_no_update" },
+    ]);
+    database.close();
+  });
+
+  it("adds constrained native Plan approval and append-only binding facts", async () => {
+    const database = new RuntimeDatabase(await databasePath());
+    expect(database.all<{ name: string }>(`
+      SELECT name FROM sqlite_master WHERE type = 'table'
+        AND name IN (
+          'task_tree_approval_references', 'native_plan_snapshots',
+          'native_plan_task_tree_links', 'native_plan_approval_events'
+        ) ORDER BY name
+    `)).toEqual([
+      { name: "native_plan_approval_events" },
+      { name: "native_plan_snapshots" },
+      { name: "native_plan_task_tree_links" },
+      { name: "task_tree_approval_references" },
+    ]);
+    const approvalColumns = database.all<{ name: string }>("PRAGMA table_info(task_tree_approval_references)")
+      .map((row) => row.name);
+    expect(approvalColumns).toEqual(expect.arrayContaining([
+      "approval_ref", "project_id", "session_id", "tree_id", "tree_revision_id",
+      "readiness_result_id", "workflow_id", "workflow_revision", "confirmation_prompt_id",
+      "canonical_block_hash", "status", "expires_at", "created_at", "resolved_at",
+    ]));
+    expect(approvalColumns).not.toEqual(expect.arrayContaining(["prompt", "api_key", "raw_response"]));
+    expect(database.all<{ name: string }>(`
+      SELECT name FROM sqlite_master WHERE type = 'trigger'
+        AND name LIKE 'native_plan_%_no_%' ORDER BY name
+    `)).toHaveLength(6);
     database.close();
   });
 });

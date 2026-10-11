@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { TaskTreeService } from "../../src/application/task-tree-service.js";
 import { RuntimeQueryService } from "../../src/application/runtime-query-service.js";
+import { TaskTreeApprovalService } from "../../src/application/task-tree-approval-service.js";
 import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
 import { RuntimeDatabase } from "../../src/storage/database.js";
 
@@ -55,6 +56,58 @@ const planningDocument: TaskTreeDocument = {
     { id: "skeleton-a", branchNodeId: "branch-a", expectedArtifacts: ["a.ts"], requiredContracts: ["a-contract"], verificationCommands: ["npm test -- a"], readinessConditions: ["A compiles"] },
     { id: "skeleton-b", branchNodeId: "branch-b", expectedArtifacts: ["b.ts"], requiredContracts: ["b-contract"], verificationCommands: ["npm test -- b"], readinessConditions: ["B compiles"] },
   ],
+};
+
+const executablePlanningDocument: TaskTreeDocument = {
+  planningVersion: 1,
+  planningContext: {
+    goal: "Build the runtime", scopeBoundaries: ["Runtime module"], exclusions: ["No UI"],
+    unresolvedQuestions: [], unresolvedDecisions: [], plannedEffects: [],
+  },
+  nodes: [
+    {
+      id: "runtime-root", parentId: null, title: "Runtime", children: ["runtime-branch"],
+      executionPhase: "verification", requiredEvidence: [{ key: "root-test", description: "full test" }],
+    },
+    {
+      id: "runtime-branch", parentId: "runtime-root", title: "Runtime branch",
+      children: ["runtime-skeleton", "runtime-implementation"], executionPhase: "verification",
+      requiredEvidence: [{ key: "branch-test", description: "branch test" }],
+    },
+    {
+      id: "runtime-skeleton", parentId: "runtime-branch", title: "Runtime skeleton", children: [],
+      objectives: ["Define runtime contract"], expectedOutputs: ["src/runtime.ts"],
+      acceptanceCriteria: ["runtime builds"], unresolvedQuestions: [], unresolvedDecisions: [], dependencies: [],
+      requiredEvidence: [{ key: "contract-test", description: "contract test" }], executionPhase: "skeleton",
+      stopDecompositionReason: "one skeleton boundary",
+    },
+    {
+      id: "runtime-implementation", parentId: "runtime-branch", title: "Runtime implementation", children: [],
+      objectives: ["Implement runtime behavior"], expectedOutputs: ["src/runtime-impl.ts"],
+      acceptanceCriteria: ["runtime tests pass"], unresolvedQuestions: [], unresolvedDecisions: [],
+      dependencies: ["runtime-skeleton"], requiredEvidence: [{ key: "impl-test", description: "implementation test" }],
+      executionPhase: "implementation", stopDecompositionReason: "one implementation output",
+    },
+  ],
+  relations: [{ fromNodeId: "runtime-implementation", toNodeId: "runtime-skeleton", kind: "depends_on" }],
+  artifacts: [
+    { id: "runtime-file", kind: "file", locator: "src/runtime.ts" },
+    { id: "runtime-contract-artifact", kind: "contract", locator: "contract:runtime" },
+  ],
+  artifactLinks: [
+    { taskNodeId: "runtime-skeleton", artifactId: "runtime-file", relationType: "creates" },
+    { taskNodeId: "runtime-skeleton", artifactId: "runtime-contract-artifact", relationType: "implements" },
+    { taskNodeId: "runtime-implementation", artifactId: "runtime-contract-artifact", relationType: "consumes" },
+  ],
+  artifactContracts: [{
+    id: "runtime-contract", artifactId: "runtime-contract-artifact", name: "Runtime contract", version: "1",
+    compatibilityPolicy: "exact", schemaOrSignature: "run(): void", providerNodeIds: ["runtime-skeleton"],
+    consumerNodeIds: ["runtime-implementation"], validationRefs: ["contract-test"],
+  }],
+  skeletonCriteria: [{
+    id: "runtime-ready", branchNodeId: "runtime-branch", expectedArtifacts: ["src/runtime.ts"],
+    requiredContracts: ["runtime-contract"], verificationCommands: ["npm test"], readinessConditions: ["runtime imports"],
+  }],
 };
 async function fixture() {
   const directory = await mkdtemp(path.join(tmpdir(), "harness-tree-"));
@@ -116,6 +169,111 @@ describe("TaskTreeService", () => {
       stage: "branch_confirmation",
       revision: 3,
     });
+    database.close();
+  });
+
+  it("rewinds an execution workflow when a new Task Tree revision requires reconfirmation", async () => {
+    const { database, service } = await fixture();
+    const root = await service.createTaskRoot({ projectId: "p1", title: "Runtime" });
+    const approved = service.saveDraftRevision({
+      projectId: "p1", treeId: root.treeId, baseRevisionId: root.revisionId, document: executablePlanningDocument,
+    });
+    database.run(
+      "UPDATE task_node_confirmation_states SET state = 'confirmed' WHERE tree_revision_id = ?",
+      approved.revisionId,
+    );
+    database.run("UPDATE workflow_states SET stage = 'skeleton_pass', revision = 4 WHERE tree_id = ?", root.treeId);
+    database.run(`
+      INSERT INTO skeleton_gate_results (
+        id, project_id, tree_id, tree_revision_id, workflow_revision, policy_version, status,
+        branch_results_json, blockers_json, attempt_ids_json, evidence_trace_ids_json, created_at
+      ) VALUES ('old-gate', 'p1', ?, ?, 4, 'v1', 'failed', '[]', '[{"code":"old"}]', '[]', '[]', 'now')
+    `, root.treeId, approved.revisionId);
+
+    const amendedDocument: TaskTreeDocument = {
+      ...executablePlanningDocument,
+      nodes: executablePlanningDocument.nodes.map((node) => node.id === "runtime-skeleton"
+        ? { ...node, acceptanceCriteria: ["runtime builds and exports its public contract"] }
+        : node),
+    };
+    const amended = service.saveDraftRevision({
+      projectId: "p1", treeId: root.treeId, baseRevisionId: approved.revisionId, document: amendedDocument,
+    });
+
+    // The implementation depends on the amended Skeleton acceptance contract,
+    // so both scopes (and their ancestors) require confirmation in this revision.
+    expect(amended.status).toBe("draft");
+    expect(database.get<{ stage: string; active_branch_node_id: string | null }>(
+      "SELECT stage, active_branch_node_id FROM workflow_states WHERE tree_id = ?", root.treeId,
+    )).toEqual({ stage: "task_tree_refinement", active_branch_node_id: null });
+    expect(database.get<{ status: string }>("SELECT status FROM task_trees WHERE id = ?", root.treeId))
+      .toEqual({ status: "draft" });
+    expect(database.get<{ state: string }>(`
+      SELECT state FROM task_node_confirmation_states
+      WHERE tree_revision_id = ? AND task_node_id = 'runtime-skeleton'
+    `, amended.revisionId)).toEqual({ state: "pending_user_confirmation" });
+    expect(new RuntimeQueryService(database).getRuntimeSnapshot("p1")).toMatchObject({
+      workflow: { stage: "task_tree_refinement" },
+      latestSkeletonGate: null,
+      blockerCount: 0,
+      availableActions: expect.arrayContaining(["scan_readiness"]),
+    });
+    database.close();
+  });
+
+  it("repairs a legacy amended revision that is stranded in an execution stage", async () => {
+    const { database, service } = await fixture();
+    const root = await service.createTaskRoot({ projectId: "p1", title: "Runtime" });
+    const draft = service.saveDraftRevision({
+      projectId: "p1", treeId: root.treeId, baseRevisionId: root.revisionId, document: executablePlanningDocument,
+    });
+    database.run(
+      "UPDATE task_node_confirmation_states SET state = 'pending_user_confirmation' WHERE tree_revision_id = ?",
+      draft.revisionId,
+    );
+    database.run("UPDATE workflow_states SET stage = 'skeleton_pass', revision = 4 WHERE tree_id = ?", root.treeId);
+
+    const readiness = service.scanPlanReadiness({ projectId: "p1", treeId: root.treeId });
+
+    expect(readiness.ready).toBe(true);
+    expect(database.get<{ stage: string }>(
+      "SELECT stage FROM workflow_states WHERE tree_id = ?", root.treeId,
+    )).toEqual({ stage: "branch_confirmation" });
+    expect(database.get<{ status: string }>("SELECT status FROM task_trees WHERE id = ?", root.treeId))
+      .toEqual({ status: "draft" });
+    database.close();
+  });
+
+  it("supersedes a prepared approval when its Task Tree revision is amended", async () => {
+    const { database, service } = await fixture();
+    const root = await service.createTaskRoot({ projectId: "p1", title: "Runtime" });
+    const draft = service.saveDraftRevision({
+      projectId: "p1", treeId: root.treeId, baseRevisionId: root.revisionId, document: executablePlanningDocument,
+    });
+    const readiness = service.scanPlanReadiness({ projectId: "p1", treeId: root.treeId });
+    const approval = new TaskTreeApprovalService(database).prepare({
+      projectId: "p1", sessionId: "session-1", treeId: root.treeId,
+      treeRevisionId: draft.revisionId, readinessResultId: readiness.resultId,
+    });
+
+    service.saveDraftRevision({
+      projectId: "p1", treeId: root.treeId, baseRevisionId: draft.revisionId,
+      document: {
+        ...executablePlanningDocument,
+        nodes: executablePlanningDocument.nodes.map((node) => node.id === "runtime-skeleton"
+          ? { ...node, title: "Revised runtime skeleton" }
+          : node),
+      },
+    });
+
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM task_tree_approval_references WHERE approval_ref = ?", approval.approvalRef,
+    )).toEqual({ status: "superseded" });
+    expect(database.get<{ status: string; answer: string }>(`
+      SELECT status, answer FROM runtime_confirmation_prompts WHERE id = (
+        SELECT confirmation_prompt_id FROM task_tree_approval_references WHERE approval_ref = ?
+      )
+    `, approval.approvalRef)).toEqual({ status: "cancelled", answer: "superseded" });
     database.close();
   });
 
@@ -347,10 +505,10 @@ describe("TaskTreeService", () => {
     const branch = service.scanPlanReadiness({ projectId: "p1", treeId: root.treeId, scopeRootNodeId: "branch-a" });
     expect(branch).toMatchObject({ revisionId: draft.revisionId, ready: false, scopeKind: "branch" });
     expect(branch.blockingIssues).toEqual(expect.arrayContaining([expect.objectContaining({ code: "leaf_contract_incomplete" })]));
-    expect(branch.recommendedNextIssue).toMatchObject({ code: "leaf_contract_incomplete" });
+    expect(branch.recommendedNextIssue).toMatchObject({ code: "branch_verification_missing" });
     expect(database.get<{ issues_json: string; recommended_issue_json: string }>(
       "SELECT issues_json, recommended_issue_json FROM plan_readiness_results WHERE id = ?", branch.resultId,
-    )).toMatchObject({ issues_json: expect.stringContaining("leaf_contract_incomplete"), recommended_issue_json: expect.stringContaining("leaf_contract_incomplete") });
+    )).toMatchObject({ issues_json: expect.stringContaining("leaf_contract_incomplete"), recommended_issue_json: expect.stringContaining("branch_verification_missing") });
     database.close();
   });
 

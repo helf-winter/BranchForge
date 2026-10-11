@@ -6,8 +6,16 @@ import { HookIngestionService } from "../../src/application/hook-ingestion-servi
 import { ProjectIdentityService } from "../../src/application/project-identity-service.js";
 import { TaskAffiliationService } from "../../src/application/task-affiliation-service.js";
 import { TaskTreeService } from "../../src/application/task-tree-service.js";
+import { RequestRoutingService } from "../../src/application/request-routing-service.js";
+import { RuntimeProfileService } from "../../src/application/runtime-profile-service.js";
 import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
+import { resolveJevRequestRoutingConfiguration } from "../../src/domain/request-routing.js";
 import { RuntimeDatabase } from "../../src/storage/database.js";
+import { NativePlanBindingService } from "../../src/application/native-plan-binding-service.js";
+import { TaskTreeApprovalService } from "../../src/application/task-tree-approval-service.js";
+import { TaskTreeValidationService } from "../../src/application/task-tree-validation-service.js";
+import { WorkflowService } from "../../src/application/workflow-service.js";
+import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
 
 const dirs: string[] = [];
 const databases: RuntimeDatabase[] = [];
@@ -35,6 +43,77 @@ async function activeTree(directory: string, database: RuntimeDatabase) {
     `attempt-${nodeId}`, project.projectId, tree.treeId, nodeId, nodeRevisionId,
   );
   return { project, tree, nodeId, nodeRevisionId };
+}
+
+function setProfile(
+  database: RuntimeDatabase,
+  projectId: string,
+  sessionId: string,
+  profile: "conversation" | "direct_coding" | "structured_coding",
+) {
+  database.run(`
+    INSERT INTO runtime_profile_states (
+      project_id, session_id, profile, reason_code, updated_at
+    ) VALUES (?, ?, ?, 'test', 'now')
+    ON CONFLICT(project_id, session_id) DO UPDATE SET profile = excluded.profile, updated_at = excluded.updated_at
+  `, projectId, sessionId, profile);
+}
+
+async function nativePlanTree(directory: string, database: RuntimeDatabase) {
+  const identity = new ProjectIdentityService(database);
+  const project = await identity.resolve(directory, "persist");
+  const trees = new TaskTreeService(database);
+  const root = await trees.createTaskRoot({ projectId: project.projectId, title: "Editor" });
+  const document: TaskTreeDocument = {
+    planningVersion: 1,
+    planningContext: {
+      goal: "Build editor", scopeBoundaries: ["browser"], exclusions: ["server"],
+      unresolvedQuestions: [], unresolvedDecisions: [], plannedEffects: [],
+    },
+    nodes: [
+      {
+        id: "root", parentId: null, title: "Editor", children: ["canvas"],
+        executionPhase: "verification", requiredEvidence: [{ key: "root-test", description: "Full editor test" }],
+      },
+      {
+        id: "canvas", parentId: "root", title: "Canvas", children: ["canvas-skeleton", "canvas-implementation"],
+        executionPhase: "verification", requiredEvidence: [{ key: "branch-test", description: "Canvas integration test" }],
+      },
+      {
+        id: "canvas-skeleton", parentId: "canvas", title: "Canvas skeleton", children: [],
+        objectives: ["Create canvas contract"], expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["module imports"],
+        unresolvedQuestions: [], unresolvedDecisions: [], dependencies: [],
+        requiredEvidence: [{ key: "skeleton-test", description: "Canvas contract check" }],
+        executionPhase: "skeleton", stopDecompositionReason: "One verifiable skeleton",
+      },
+      {
+        id: "canvas-implementation", parentId: "canvas", title: "Canvas implementation", children: [],
+        objectives: ["Render beads"], expectedOutputs: ["canvas.ts"], acceptanceCriteria: ["test passes"],
+        unresolvedQuestions: [], unresolvedDecisions: [], dependencies: ["canvas-skeleton"],
+        requiredEvidence: [{ key: "test", description: "Canvas test" }],
+        executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
+      },
+    ],
+    relations: [], artifacts: [],
+    skeletonCriteria: [{
+      id: "canvas-skeleton", branchNodeId: "canvas", expectedArtifacts: ["canvas.ts"],
+      requiredContracts: ["canvas-api"], verificationCommands: ["npm test"], readinessConditions: ["module imports"],
+    }],
+  };
+  const revision = trees.saveDraftRevision({
+    projectId: project.projectId, treeId: root.treeId, baseRevisionId: root.revisionId, document,
+  });
+  const readiness = new TaskTreeValidationService(database, trees).validate({
+    projectId: project.projectId, treeId: revision.treeId, treeRevisionId: revision.revisionId,
+  });
+  const approval = new TaskTreeApprovalService(database, trees).prepare({
+    projectId: project.projectId, sessionId: "s1", treeId: revision.treeId,
+    treeRevisionId: revision.revisionId, readinessResultId: readiness.resultId,
+  });
+  const workflows = new WorkflowService(database);
+  const binding = new NativePlanBindingService(database, workflows);
+  const service = new HookIngestionService(database, identity, undefined, undefined, undefined, binding);
+  return { project, trees, revision, document, approval, service };
 }
 
 function linkPlannedFile(database: RuntimeDatabase, input: {
@@ -102,6 +181,132 @@ describe("Claude hook ingestion", () => {
     database.close();
   });
 
+  it("does not inject generic lifecycle context at session start", async () => {
+    const { directory, database, service } = await fixture();
+    const result = await service.ingest(mapClaudeHook({
+      hook_event_name: "SessionStart", session_id: "s1", cwd: directory, source: "startup",
+    }));
+
+    expect(result).toEqual({ recorded: false, reason: "inactive" });
+    expect(database.all("SELECT id FROM projects")).toEqual([]);
+    await expect(readFile(path.join(directory, ".agent-harness-project.json"))).rejects.toThrow();
+    database.close();
+  });
+
+  it("records an existing Project prompt before routing and returns only structured Profile context", async () => {
+    const { directory, database } = await fixture();
+    const projects = new ProjectIdentityService(database);
+    await projects.resolve(directory, "persist");
+    const config = resolveJevRequestRoutingConfiguration({
+      HARNESS_JEV_ROUTING_ENABLED: "true",
+      TYPESAFE_API_KEY: "secret",
+    });
+    let observedPromptTrace = false;
+    const provider = {
+      async route() {
+        observedPromptTrace = Boolean(database.get(`
+          SELECT id FROM trace_events
+          WHERE session_id = 'profile-session' AND event_name = 'UserPromptSubmit'
+        `));
+        return {
+          classification: "task_tree_workflow" as const,
+          treeRelation: "create_new_tree" as const,
+          confidence: 0.95,
+          probabilities: { task_tree_workflow: 0.95 },
+          reasonCodes: ["route:task_tree_workflow"],
+          model: "jev-1.13.0",
+          usage: { inputTokens: 10, outputTokens: 2 },
+          latencyMs: 1,
+        };
+      },
+    };
+    const profiles = new RuntimeProfileService(
+      database,
+      projects,
+      new RequestRoutingService(database, config, provider),
+      config,
+    );
+    const service = new HookIngestionService(database, projects, undefined, undefined, profiles);
+    const event = mapClaudeHook({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "profile-session",
+      cwd: directory,
+      prompt: "实现一个完整的拼豆网页",
+      timestamp: "2030-01-01T00:00:00.000Z",
+    });
+    const first = await service.ingest(event);
+    expect(observedPromptTrace).toBe(true);
+    expect(first).toMatchObject({
+      recorded: true,
+      blocked: false,
+      directive: {
+        kind: "context",
+        context: expect.stringMatching(/task-tree-planning[\s\S]*harness_propose_task_affiliation/),
+      },
+    });
+    expect(await service.ingest(event)).toMatchObject({
+      recorded: false,
+      reason: "duplicate",
+      directive: { kind: "context" },
+    });
+    expect(database.all("SELECT id FROM trace_events WHERE session_id = 'profile-session'")).toHaveLength(1);
+    expect(database.all("SELECT id FROM runtime_profile_transitions WHERE session_id = 'profile-session'")).toHaveLength(1);
+    database.close();
+  });
+
+  it("rewakes one ignored structured-planning turn before it stops without Task affiliation", async () => {
+    const { directory, database } = await fixture();
+    const projects = new ProjectIdentityService(database);
+    const config = resolveJevRequestRoutingConfiguration({});
+    const provider = { route: async () => { throw new Error("external routing must not run"); } };
+    const profiles = new RuntimeProfileService(
+      database,
+      projects,
+      new RequestRoutingService(database, config, provider),
+      config,
+    );
+    const service = new HookIngestionService(database, projects, undefined, undefined, profiles);
+
+    await service.ingest(mapClaudeHook({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "structured-session",
+      cwd: directory,
+      prompt: "请先和我讨论并完善需求，确认规划之后再开始实现。",
+      timestamp: "2030-01-01T00:00:00.000Z",
+    }));
+    const firstStop = await service.ingest(mapClaudeHook({
+      hook_event_name: "Stop",
+      session_id: "structured-session",
+      cwd: directory,
+      timestamp: "2030-01-01T00:01:00.000Z",
+    }));
+    expect(firstStop).toMatchObject({
+      recorded: true,
+      blocked: false,
+      directive: {
+        kind: "stop",
+        reason: expect.stringMatching(/task-tree-planning[\s\S]*harness_propose_task_affiliation/),
+      },
+    });
+    expect(database.all(`
+      SELECT id FROM trace_events
+      WHERE session_id = 'structured-session' AND event_name = 'workflow_activation_required'
+    `)).toHaveLength(1);
+
+    const repeatedStop = await service.ingest(mapClaudeHook({
+      hook_event_name: "Stop",
+      session_id: "structured-session",
+      cwd: directory,
+      timestamp: "2030-01-01T00:02:00.000Z",
+    }));
+    expect(repeatedStop).toEqual({ recorded: false, reason: "inactive" });
+    expect(database.all(`
+      SELECT id FROM trace_events
+      WHERE session_id = 'structured-session' AND event_name = 'workflow_activation_required'
+    `)).toHaveLength(1);
+    database.close();
+  });
+
   it("records a user answer while Task affiliation confirmation is pending without an active tree", async () => {
     const { directory, database, service } = await fixture();
     const project = await new ProjectIdentityService(database).resolve(directory, "persist");
@@ -128,6 +333,38 @@ describe("Claude hook ingestion", () => {
     )?.status).toBe("pending");
     expect(database.all("SELECT id FROM task_trees")).toEqual([]);
     database.close();
+  });
+
+  it("records native question clicks without a tree and resolves them without another typed prompt", async () => {
+    const { directory, database, service } = await fixture();
+    const project = await new ProjectIdentityService(database).resolve(directory, "persist");
+    const affiliations = new TaskAffiliationService(database);
+    const proposal = affiliations.propose({ projectId: project.projectId, requestTitle: "Pause work", recommendation: "pause" });
+    const result = await service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "native-choice", cwd: directory,
+      tool_name: "AskUserQuestion", tool_use_id: "question-choice",
+      tool_input: { questions: [{ question: "Continue?", options: [{ label: "Pause" }] }] },
+      tool_response: { answers: { "Continue?": "Pause" } },
+    }));
+    expect(result).toMatchObject({ recorded: true, violation: false, blocked: false });
+    if (!result.recorded) throw new Error("native answer not recorded");
+    expect(await affiliations.resolve({ projectId: project.projectId, decisionId: proposal.decisionId, choice: "pause", answerTraceEventId: result.eventId }))
+      .toMatchObject({ status: "paused" });
+    expect(database.all("SELECT id FROM task_trees")).toHaveLength(0);
+  });
+
+  it("does not reopen structured planning on Stop or block verification after archiving the selected tree", async () => {
+    const { directory, database, service } = await fixture();
+    const { project, revision: tree } = await nativePlanTree(directory, database);
+    setProfile(database, project.projectId, "archive-session", "structured_coding");
+    new TaskTreeService(database).archiveTaskTree({ projectId: project.projectId, treeId: tree.treeId });
+    const stop = await service.ingest(mapClaudeHook({ hook_event_name: "Stop", session_id: "archive-session", cwd: directory }));
+    expect(stop).not.toHaveProperty("directive");
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "archive-session", cwd: directory,
+      tool_name: "Bash", tool_use_id: "verify-archived", tool_input: { command: "npm run build" },
+    }))).toMatchObject({ recorded: true, blocked: false, violation: false });
+    expect(database.all("SELECT id FROM task_affiliation_decisions")).toHaveLength(0);
   });
 
   it("persists an immutable Execution Context snapshot and carries model state across one Project run", async () => {
@@ -267,19 +504,347 @@ describe("Claude hook ingestion", () => {
     database.close();
   });
 
-  it("records an early mutation violation but never blocks the tool", async () => {
+  it("records and allows direct project mutation when no Task Tree workflow is active", async () => {
     const { directory, database, service } = await fixture();
     const event = mapClaudeHook({ hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "u1", tool_input: { file_path: path.join(directory, "a.ts"), apiKey: "secret" } });
-    expect(await service.ingest(event)).toMatchObject({ recorded: true, violation: true, blocked: false });
+    expect(await service.ingest(event)).toMatchObject({
+      recorded: true,
+      violation: false,
+      blocked: false,
+    });
+    expect(await service.ingest(event)).toEqual({ recorded: false, reason: "duplicate" });
     const trace = database.get<{ event_name: string; payload_json: string }>("SELECT event_name, payload_json FROM trace_events");
-    expect(trace?.event_name).toBe("workflow_violation");
+    expect(trace?.event_name).toBe("PreToolUse");
     expect(trace?.payload_json).not.toContain("secret");
     expect(trace?.payload_json).toContain("[REDACTED]");
     const bashMutation = mapClaudeHook({
       hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Bash", tool_use_id: "u2",
       tool_input: { command: "printf 'x' > src/a.ts" },
     });
-    expect(await service.ingest(bashMutation)).toMatchObject({ recorded: true, violation: true, blocked: false });
+    expect(await service.ingest(bashMutation)).toMatchObject({ recorded: true, violation: false, blocked: false });
+    database.close();
+  });
+
+  it("records the outcome and Artifact of direct work without a Task Tree", async () => {
+    const { directory, database, service } = await fixture();
+    const result = await service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "direct-write",
+      tool_input: { file_path: path.join(directory, "direct.txt") }, tool_response: { ok: true },
+    }));
+
+    expect(result).toMatchObject({ recorded: true, violation: false, blocked: false });
+    if (!result.recorded) throw new Error("direct work outcome was not recorded");
+    expect(database.get<{ tree_id: string | null; event_name: string }>(
+      "SELECT tree_id, event_name FROM trace_events WHERE id = ?", result.eventId,
+    )).toEqual({ tree_id: null, event_name: "PostToolUse" });
+    expect(database.get<{ tree_id: string | null; status: string; source_trace_event_id: string }>(
+      "SELECT tree_id, status, source_trace_event_id FROM artifacts WHERE locator = 'direct.txt'",
+    )).toEqual({ tree_id: null, status: "created", source_trace_event_id: result.eventId });
+    database.close();
+  });
+
+  it("blocks only structured project mutation before native Plan approval", async () => {
+    const { directory, database, service } = await fixture();
+    const { project } = await activeTree(directory, database);
+    setProfile(database, project.projectId, "s1", "structured_coding");
+    const event = mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "u1",
+      tool_input: { file_path: path.join(directory, "a.ts") },
+    });
+
+    expect(await service.ingest(event)).toMatchObject({
+      recorded: true,
+      violation: true,
+      blocked: true,
+      directive: { kind: "deny", reason: expect.stringContaining("harness_prepare_task_tree_approval") },
+    });
+    expect(await service.ingest(event)).toMatchObject({ recorded: false, reason: "duplicate", directive: { kind: "deny" } });
+    database.close();
+  });
+
+  it.each([
+    "git apply /tmp/change.patch",
+    "python generate.py",
+    "node scripts/generate.mjs",
+    "npm run format",
+    "rsync -a /tmp/generated/ ./src/",
+  ])("conservatively blocks potentially mutating Bash before approval: %s", async (command) => {
+    const { directory, database, service } = await fixture();
+    const { project } = await activeTree(directory, database);
+    setProfile(database, project.projectId, "s1", "structured_coding");
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Bash",
+      tool_use_id: `bash-${command}`, tool_input: { command },
+    }))).toMatchObject({ recorded: true, violation: true, blocked: true, directive: { kind: "deny" } });
+    database.close();
+  });
+
+  it("does not treat a simple mutation of an external absolute path as a project mutation", async () => {
+    const { directory, database, service } = await fixture();
+    const { project } = await activeTree(directory, database);
+    setProfile(database, project.projectId, "s1", "structured_coding");
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Bash",
+      tool_use_id: "external-rm", tool_input: { command: "rm -f /tmp/harness-external-only" },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    database.close();
+  });
+
+  it.each(["conversation", "direct_coding"] as const)(
+    "allows %s project mutation even when a Task Tree exists",
+    async (profile) => {
+      const { directory, database, service } = await fixture();
+      const { project } = await activeTree(directory, database);
+      setProfile(database, project.projectId, "s1", profile);
+      expect(await service.ingest(mapClaudeHook({
+        hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+        tool_name: "Write", tool_use_id: `write-${profile}`,
+        tool_input: { file_path: path.join(directory, "a.ts") },
+      }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+      database.close();
+    },
+  );
+
+  it("keeps planning, questions, runtime tools, and reads available before approval", async () => {
+    const { directory, database, service } = await fixture();
+    const { project } = await activeTree(directory, database);
+    setProfile(database, project.projectId, "s1", "structured_coding");
+    for (const [toolName, toolInput] of [
+      ["AskUserQuestion", { questions: [] }],
+      ["EnterPlanMode", {}],
+      ["Read", { file_path: path.join(directory, "README.md") }],
+      ["mcp__agent-harness__harness_get_runtime_state", { cwd: directory }],
+    ] as const) {
+      expect(await service.ingest(mapClaudeHook({
+        hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+        tool_name: toolName, tool_use_id: `safe-${toolName}`, tool_input: toolInput,
+      }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    }
+    database.close();
+  });
+
+  it("keeps Claude native Plan Mode available while Task Tree planning is active", async () => {
+    const { directory, database, service } = await fixture();
+    await activeTree(directory, database);
+    const result = await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "EnterPlanMode", tool_use_id: "plan-mode", tool_input: {},
+    }));
+
+    expect(result).toMatchObject({ recorded: true, violation: false, blocked: false });
+    expect(database.get<{ event_name: string }>(
+      "SELECT event_name FROM trace_events WHERE id = ?", result.recorded ? result.eventId : "",
+    )).toEqual({ event_name: "PreToolUse" });
+    database.close();
+  });
+
+  it("leaves native Plan Mode available when no Task Tree workflow is active", async () => {
+    const { directory, database, service } = await fixture();
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "EnterPlanMode", tool_use_id: "plan-mode", tool_input: {},
+    }))).toEqual({ recorded: false, reason: "inactive" });
+    expect(database.all("SELECT id FROM projects")).toEqual([]);
+    database.close();
+  });
+
+  it("binds successful ExitPlanMode hooks to the exact prepared Task Tree revision once", async () => {
+    const { directory, database } = await fixture();
+    const native = await nativePlanTree(directory, database);
+    const pre = mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-approved", tool_input: { plan: native.approval.canonicalBlock },
+    });
+    expect(await native.service.ingest(pre)).toMatchObject({ recorded: true, violation: false, blocked: false });
+    expect(await native.service.ingest(pre)).toMatchObject({ recorded: false, reason: "duplicate" });
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-approved", tool_input: {}, tool_response: { approved: true },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    expect(database.get<{ stage: string }>("SELECT stage FROM workflow_states WHERE tree_id = ?", native.revision.treeId))
+      .toEqual({ stage: "skeleton_pass" });
+    expect(database.all("SELECT id FROM native_plan_approval_events")).toHaveLength(1);
+    database.close();
+  });
+
+  it("requires a scheduled active Attempt after approval and binds allowed mutation to that node", async () => {
+    const { directory, database } = await fixture();
+    const native = await nativePlanTree(directory, database);
+    setProfile(database, native.project.projectId, "s1", "structured_coding");
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-for-attempt", tool_input: { plan: native.approval.canonicalBlock },
+    }));
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-for-attempt", tool_input: {}, tool_response: { approved: true },
+    }));
+
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "Write", tool_use_id: "write-without-attempt",
+      tool_input: { file_path: path.join(directory, "canvas.ts") },
+    }))).toMatchObject({
+      recorded: true, violation: true, blocked: true,
+      directive: { kind: "deny", reason: expect.stringContaining("harness_get_next_executable_node") },
+    });
+
+    const nodeRevisionId = database.get<{ id: string }>(`
+      SELECT id FROM task_node_revisions WHERE tree_revision_id = ? AND node_id = 'canvas-skeleton'
+    `, native.revision.revisionId)!.id;
+    database.run(`
+      INSERT INTO execution_attempts (
+        id, project_id, tree_id, task_node_id, task_node_revision_id,
+        attempt_number, status, started_at, session_id, agent_runtime,
+        tree_revision_id, workflow_revision
+      ) VALUES ('canvas-attempt', ?, ?, 'canvas-skeleton', ?, 1, 'running', 'now', 's1', 'claude-code', ?, 4)
+    `, native.project.projectId, native.revision.treeId, nodeRevisionId, native.revision.revisionId);
+    const allowed = await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "Write", tool_use_id: "write-with-attempt",
+      tool_input: { file_path: path.join(directory, "canvas.ts") },
+    }));
+    expect(allowed).toMatchObject({ recorded: true, violation: false, blocked: false });
+    if (!allowed.recorded) throw new Error("allowed mutation was not recorded");
+    expect(database.get<{ node_id: string }>(
+      "SELECT node_id FROM trace_events WHERE id = ?", allowed.eventId,
+    )).toEqual({ node_id: "canvas-skeleton" });
+
+    setProfile(database, native.project.projectId, "s1", "direct_coding");
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "Write", tool_use_id: "explicit-direct",
+      tool_input: { file_path: path.join(directory, "direct.ts") },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    expect(database.get<{ node_id: string | null }>(
+      "SELECT node_id FROM trace_events WHERE payload_json LIKE '%explicit-direct%'",
+    )).toEqual({ node_id: null });
+    database.close();
+  });
+
+  it("continues project-approved work in a new Session without borrowing another Session's Attempt", async () => {
+    const { directory, database } = await fixture();
+    const native = await nativePlanTree(directory, database);
+    setProfile(database, native.project.projectId, "s1", "structured_coding");
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "approve-project", tool_input: { plan: native.approval.canonicalBlock },
+    }));
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "approve-project", tool_input: {}, tool_response: { approved: true },
+    }));
+    const nodeRevisionId = database.get<{ id: string }>(
+      "SELECT id FROM task_node_revisions WHERE tree_revision_id = ? AND node_id = 'canvas-skeleton'",
+      native.revision.revisionId,
+    )!.id;
+    database.run(`
+      INSERT INTO execution_attempts (
+        id, project_id, tree_id, task_node_id, task_node_revision_id, attempt_number, status,
+        started_at, session_id, agent_runtime, tree_revision_id, workflow_revision
+      ) VALUES ('session-one-attempt', ?, ?, 'canvas-skeleton', ?, 1, 'running', 'now', 's1', 'claude-code', ?, 4)
+    `, native.project.projectId, native.revision.treeId, nodeRevisionId, native.revision.revisionId);
+    setProfile(database, native.project.projectId, "s2", "structured_coding");
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s2", cwd: directory, tool_name: "Write", tool_use_id: "s2-no-attempt",
+      tool_input: { file_path: path.join(directory, "canvas.ts") },
+    }))).toMatchObject({
+      recorded: true, violation: true, blocked: true,
+      directive: { kind: "deny", reason: expect.stringContaining("harness_start_node_attempt") },
+    });
+    database.run("UPDATE execution_attempts SET status = 'aborted', completed_at = 'later' WHERE id = 'session-one-attempt'");
+    database.run(`
+      INSERT INTO execution_attempts (
+        id, project_id, tree_id, task_node_id, task_node_revision_id, attempt_number, status,
+        started_at, session_id, agent_runtime, tree_revision_id, workflow_revision
+      ) VALUES ('session-two-attempt', ?, ?, 'canvas-skeleton', ?, 2, 'running', 'now', 's2', 'claude-code', ?, 4)
+    `, native.project.projectId, native.revision.treeId, nodeRevisionId, native.revision.revisionId);
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s2", cwd: directory, tool_name: "Write", tool_use_id: "s2-own-attempt",
+      tool_input: { file_path: path.join(directory, "canvas.ts") },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    database.close();
+  });
+
+  it("records failed ExitPlanMode as rejection without activating execution", async () => {
+    const { directory, database } = await fixture();
+    const native = await nativePlanTree(directory, database);
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-rejected", tool_input: { plan: native.approval.canonicalBlock },
+    }));
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUseFailure", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-rejected", tool_input: {}, tool_response: { rejected: true },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    expect(database.get<{ status: string }>(
+      "SELECT status FROM task_tree_approval_references WHERE approval_ref = ?", native.approval.approvalRef,
+    )).toEqual({ status: "rejected" });
+    expect(database.get<{ stage: string }>("SELECT stage FROM workflow_states WHERE tree_id = ?", native.revision.treeId))
+      .toEqual({ stage: "branch_confirmation" });
+    database.close();
+  });
+
+  it("denies malformed or stale canonical blocks with a recoverable native Plan action", async () => {
+    const malformedFixture = await fixture();
+    const malformed = await nativePlanTree(malformedFixture.directory, malformedFixture.database);
+    const malformedEvent = mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: malformedFixture.directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-malformed",
+      tool_input: { plan: malformed.approval.canonicalBlock.replace("Canvas", "Changed Canvas") },
+    });
+    expect(await malformed.service.ingest(malformedEvent)).toMatchObject({
+      recorded: true, violation: true, blocked: true,
+      directive: { kind: "deny", reason: expect.stringContaining("prepare a new approval block") },
+    });
+    expect(await malformed.service.ingest(malformedEvent)).toMatchObject({
+      recorded: false, reason: "duplicate",
+      directive: { kind: "deny", reason: expect.stringContaining("prepare a new approval block") },
+    });
+    malformedFixture.database.close();
+
+    const staleFixture = await fixture();
+    const stale = await nativePlanTree(staleFixture.directory, staleFixture.database);
+    stale.trees.saveDraftRevision({
+      projectId: stale.project.projectId, treeId: stale.revision.treeId,
+      baseRevisionId: stale.revision.revisionId, document: stale.document,
+    });
+    expect(await stale.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: staleFixture.directory,
+      tool_name: "ExitPlanMode", tool_use_id: "exit-stale", tool_input: { plan: stale.approval.canonicalBlock },
+    }))).toMatchObject({ recorded: true, violation: true, blocked: true });
+    staleFixture.database.close();
+  });
+
+  it("does not treat project-external planning files or read-only tools as project mutations", async () => {
+    const { directory, database, service } = await fixture();
+    const externalPlan = path.join(tmpdir(), "claude-plan.md");
+
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "plan",
+      tool_input: { file_path: externalPlan },
+    }))).toEqual({ recorded: false, reason: "inactive" });
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Read", tool_use_id: "read",
+      tool_input: { file_path: path.join(directory, "README.md") },
+    }))).toEqual({ recorded: false, reason: "inactive" });
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Bash", tool_use_id: "tmp-log",
+      tool_input: { command: "git status" },
+    }))).toEqual({ recorded: false, reason: "inactive" });
+    expect(database.all("SELECT id FROM projects")).toEqual([]);
+    database.close();
+  });
+
+  it("allows project mutation after the Workflow reaches an executable stage", async () => {
+    const { directory, database, service } = await fixture();
+    const { project } = await activeTree(directory, database);
+    database.run("UPDATE workflow_states SET stage = 'skeleton_pass' WHERE project_id = ? AND active = 1", project.projectId);
+
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory, tool_name: "Write", tool_use_id: "allowed-write",
+      tool_input: { file_path: path.join(directory, "src", "planned.ts") },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
     database.close();
   });
 
@@ -336,6 +901,24 @@ describe("Claude hook ingestion", () => {
     expect(database.get<{ status: string; confidence: string; source_trace_event_id: string }>(
       "SELECT status, confidence, source_trace_event_id FROM artifacts WHERE kind = 'command'",
     )).toEqual({ status: "verified", confidence: "verified", source_trace_event_id: result.eventId });
+    database.close();
+  });
+
+  it("stores a hashed command signature instead of raw Bash secrets", async () => {
+    const { directory, database, service } = await fixture();
+    const identity = new ProjectIdentityService(database);
+    const project = await identity.resolve(directory, "persist");
+    await new TaskTreeService(database).createTaskRoot({ projectId: project.projectId, title: "Runtime" });
+    await service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUseFailure", session_id: "s1", cwd: directory, tool_name: "Bash", tool_use_id: "secret-command",
+      tool_input: { command: "curl -H 'Authorization: Bearer super-secret-token' https://example.invalid" },
+      tool_response: { exitCode: 1 },
+    }));
+    const artifact = database.get<{ locator: string; path_or_name: string }>(
+      "SELECT locator, path_or_name FROM artifacts WHERE kind = 'command'",
+    )!;
+    expect(artifact.locator).toMatch(/^command:curl:[a-f0-9]{64}$/);
+    expect(JSON.stringify(artifact)).not.toContain("super-secret-token");
     database.close();
   });
 

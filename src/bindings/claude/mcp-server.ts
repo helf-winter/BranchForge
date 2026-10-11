@@ -3,9 +3,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { openRuntime } from "../../application/runtime.js";
 import { HarnessError } from "../../domain/errors.js";
+import { findUserDecisionEvidence } from "../../application/user-decision-evidence.js";
 import type { TaskNodeInput, TaskTreeDocument } from "../../domain/task-tree.js";
 import type { FailureReproductionContract, ReproductionValidationObservation } from "../../domain/failure-case.js";
 import type { PluginRevisionManifest } from "../../domain/plugin-composition.js";
+import type { TaskTreePatchOperation } from "../../domain/task-tree-authoring.js";
 
 function result(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
@@ -102,6 +104,11 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
     return project;
   };
   const guarded = <T>(handler: () => Promise<T> | T) => Promise.resolve().then(handler).then(result, failure);
+  const requireUserMessage = (projectId: string, traceEventId: string) => {
+    const trace = findUserDecisionEvidence(runtime.database, projectId, traceEventId);
+    if (!trace) throw new HarnessError("evidence_scope_mismatch", "a same-Project user prompt or completed native question answer Trace Event is required");
+    return trace;
+  };
 
   server.registerTool("harness_get_project_identity", {
     description: "Inspect the current directory's deterministic Project identity resolution without exposing its identity token.",
@@ -223,10 +230,10 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   })));
 
   server.registerTool("harness_propose_task_affiliation", {
-    description: "Persist a coding request's deterministic Task Tree candidates and ask the user to choose new tree, merge, or pause before planning.",
+    description: "For work that merits Task Tree planning, persist deterministic candidates and ask the user to choose direct execution, new tree, merge, or pause.",
     inputSchema: {
       cwd: cwdSchema, requestTitle: z.string().min(1), candidateQuery: z.string().min(1).optional(),
-      recommendation: z.enum(["new_tree", "merge"]), recommendedTreeId: z.string().min(1).optional(),
+      recommendation: z.enum(["new_tree", "merge", "direct_execution", "pause"]), recommendedTreeId: z.string().min(1).optional(),
       runId: z.string().min(1).optional(),
     },
   }, ({ cwd, requestTitle, candidateQuery, recommendation, recommendedTreeId, runId }) => guarded(async () => runtime.affiliations.propose({
@@ -236,9 +243,9 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   })));
 
   server.registerTool("harness_resolve_task_affiliation", {
-    description: "Apply an evidence-backed user choice to create a new Task Tree, merge into a current Project tree, or pause.",
+    description: "Apply an evidence-backed user choice to execute directly without a Task Tree, create a new tree, merge, or pause. Use direct_execution when the user's latest instruction says not to build a Task Tree.",
     inputSchema: {
-      cwd: cwdSchema, decisionId: z.string().min(1), choice: z.enum(["new_tree", "merge", "pause"]),
+      cwd: cwdSchema, decisionId: z.string().min(1), choice: z.enum(["direct_execution", "new_tree", "merge", "pause"]),
       answerTraceEventId: z.string().min(1), chosenTreeId: z.string().min(1).optional(),
     },
   }, ({ cwd, decisionId, choice, answerTraceEventId, chosenTreeId }) => guarded(async () => runtime.affiliations.resolve({
@@ -252,6 +259,104 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   }, ({ cwd, decisionId }) => guarded(async () => {
     const projectId = (await existingProject(cwd)).projectId;
     return decisionId ? runtime.affiliations.get(projectId, decisionId) : runtime.affiliations.list(projectId);
+  }));
+
+  server.registerTool("harness_create_task_tree_draft", {
+    description: "Create the first full goal-level Task Tree draft after explicit affiliation, deriving Session provenance from the recorded answer.",
+    inputSchema: {
+      cwd: cwdSchema,
+      affiliationDecisionId: z.string().min(1),
+      expectedTreeRevisionId: z.string().min(1).optional(),
+      document: z.unknown(),
+      idempotencyKey: z.string().min(1),
+    },
+  }, ({ cwd, affiliationDecisionId, expectedTreeRevisionId, document, idempotencyKey }) => guarded(async () => {
+    const project = await existingProject(cwd);
+    const affiliation = runtime.affiliations.get(project.projectId, affiliationDecisionId);
+    if (!affiliation.answerTraceEventId || !["new_tree", "merged"].includes(affiliation.status)) {
+      throw new HarnessError("confirmation_required", "Task Tree draft creation requires an explicitly resolved new-tree or merge affiliation");
+    }
+    const trace = requireUserMessage(project.projectId, affiliation.answerTraceEventId);
+    return runtime.taskTreeDrafts.createDraft({
+      projectId: project.projectId,
+      sessionId: trace.session_id,
+      affiliationDecisionId,
+      ...(expectedTreeRevisionId ? { expectedTreeRevisionId } : {}),
+      document: document as TaskTreeDocument,
+      idempotencyKey,
+    });
+  }));
+
+  server.registerTool("harness_patch_task_tree", {
+    description: "Apply one evidence-linked local Task Tree patch against an exact immutable base revision.",
+    inputSchema: {
+      cwd: cwdSchema,
+      treeId: z.string().min(1),
+      expectedTreeRevisionId: z.string().min(1),
+      operations: z.array(z.object({
+        op: z.literal("replace_document"),
+        document: z.unknown(),
+        sourceUserMessageTraceEventId: z.string().min(1),
+        previewId: z.string().min(1).optional(),
+        decision: refinementDecisionSchema,
+      })).length(1),
+      idempotencyKey: z.string().min(1),
+    },
+  }, ({ cwd, treeId, expectedTreeRevisionId, operations, idempotencyKey }) => guarded(async () => {
+    const project = await existingProject(cwd);
+    const trace = requireUserMessage(project.projectId, operations[0]!.sourceUserMessageTraceEventId);
+    return runtime.taskTreeDrafts.patch({
+      projectId: project.projectId,
+      sessionId: trace.session_id,
+      treeId,
+      expectedTreeRevisionId,
+      operations: operations as TaskTreePatchOperation[],
+      idempotencyKey,
+    });
+  }));
+
+  server.registerTool("harness_validate_task_tree", {
+    description: "Validate deterministic whole-tree planning readiness for one exact current Task Tree revision.",
+    inputSchema: {
+      cwd: cwdSchema,
+      treeId: z.string().min(1),
+      treeRevisionId: z.string().min(1),
+    },
+  }, ({ cwd, treeId, treeRevisionId }) => guarded(async () => {
+    const project = await existingProject(cwd);
+    return runtime.taskTreeValidation.validate({ projectId: project.projectId, treeId, treeRevisionId });
+  }));
+
+  server.registerTool("harness_prepare_task_tree_approval", {
+    description: "Prepare an opaque one-use native Plan approval reference and canonical Task Tree block for an exact ready revision.",
+    inputSchema: {
+      cwd: cwdSchema,
+      treeId: z.string().min(1),
+      treeRevisionId: z.string().min(1),
+      readinessResultId: z.string().min(1),
+      sourceUserMessageTraceEventId: z.string().min(1),
+    },
+  }, ({ cwd, treeId, treeRevisionId, readinessResultId, sourceUserMessageTraceEventId }) => guarded(async () => {
+    const project = await existingProject(cwd);
+    const trace = requireUserMessage(project.projectId, sourceUserMessageTraceEventId);
+    const affiliation = runtime.database.get<{ id: string }>(`
+      SELECT d.id FROM task_affiliation_decisions d
+      JOIN trace_events answer ON answer.id = d.answer_trace_event_id
+      WHERE d.project_id = ? AND d.resolved_tree_id = ? AND d.status IN ('new_tree', 'merged')
+        AND d.resolved_at IS NOT NULL AND (d.answer_trace_event_id = ? OR d.resolved_at <= ?) AND answer.session_id = ?
+      ORDER BY d.resolved_at DESC, d.id DESC LIMIT 1
+    `, project.projectId, treeId, sourceUserMessageTraceEventId, trace.occurred_at, trace.session_id);
+    if (!affiliation) {
+      throw new HarnessError("evidence_scope_mismatch", "approval evidence must follow the Task Tree's resolved affiliation");
+    }
+    return runtime.taskTreeApprovals.prepare({
+      projectId: project.projectId,
+      sessionId: trace.session_id,
+      treeId,
+      treeRevisionId,
+      readinessResultId,
+      sourceTraceEventId: sourceUserMessageTraceEventId,
+    });
   }));
 
   server.registerTool("harness_select_task_tree", {
@@ -281,7 +386,7 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   }, ({ cwd, title }) => guarded(async () => runtime.taskTrees.createTaskRoot({ projectId: (await persistedProject(cwd)).projectId, title })));
 
   server.registerTool("harness_save_draft_revision", {
-    description: "Save a structurally valid Task Tree draft as a new immutable revision; planning drafts may remain incomplete until readiness succeeds.",
+    description: "Save a structurally valid Task Tree draft as a new immutable revision; planning drafts may remain incomplete until readiness succeeds. baseRevisionId must be the exact revisionId returned by task-root creation or harness_get_task_tree_summary, never the numeric revision counter.",
     inputSchema: { cwd: cwdSchema, treeId: z.string(), baseRevisionId: z.string(), document: z.unknown() },
   }, ({ cwd, treeId, baseRevisionId, document }) => guarded(async () => runtime.taskTrees.saveDraftRevision({ projectId: (await existingProject(cwd)).projectId, treeId, baseRevisionId, document: document as TaskTreeDocument })));
 
@@ -348,7 +453,7 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   )));
 
   server.registerTool("harness_get_task_tree_summary", {
-    description: "Get the current Task Tree revision, one-hop relations, Artifacts, and Trace count.",
+    description: "Get the current Task Tree revisionId (use it as baseRevisionId for draft writes), numeric revision counter, one-hop relations, Artifacts, and Trace count.",
     inputSchema: { cwd: cwdSchema, treeId: z.string() },
   }, ({ cwd, treeId }) => guarded(async () => runtime.queries.getTaskTreeSummary((await existingProject(cwd)).projectId, treeId)));
 
@@ -818,11 +923,21 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
     (await existingProject(cwd)).projectId, replacementId,
   )));
 
+  server.registerTool("harness_get_next_executable_node", {
+    description: "Project the one deterministic Task Node eligible to execute next; this does not start an Attempt or change lifecycle state.",
+    inputSchema: { cwd: cwdSchema, treeId: z.string().min(1) },
+  }, ({ cwd, treeId }) => guarded(async () => runtime.scheduler.next({
+    projectId: (await existingProject(cwd)).projectId, treeId,
+  })));
+
   server.registerTool("harness_start_node_attempt", {
-    description: "Start an evidence-backed Execution Attempt for the current Task Node revision.",
-    inputSchema: { cwd: cwdSchema, nodeId: z.string().min(1), expectedTreeRevisionId: z.string().min(1) },
-  }, ({ cwd, nodeId, expectedTreeRevisionId }) => guarded(async () => runtime.executions.startAttempt({
-    projectId: (await existingProject(cwd)).projectId, nodeId, expectedTreeRevisionId,
+    description: "Start the exact scheduler-selected Execution Attempt with same-Project Trace provenance for the current Session.",
+    inputSchema: {
+      cwd: cwdSchema, nodeId: z.string().min(1), expectedTreeRevisionId: z.string().min(1),
+      sourceTraceEventId: z.string().min(1),
+    },
+  }, ({ cwd, nodeId, expectedTreeRevisionId, sourceTraceEventId }) => guarded(async () => runtime.executions.startAttempt({
+    projectId: (await existingProject(cwd)).projectId, nodeId, expectedTreeRevisionId, sourceTraceEventId,
   })));
 
   server.registerTool("harness_begin_node_verification", {

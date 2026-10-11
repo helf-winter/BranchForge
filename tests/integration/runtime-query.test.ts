@@ -153,7 +153,7 @@ describe("RuntimeQueryService", () => {
       driftCounts: { warning: 1, blocking: 1 },
     });
     expect(service.getTaskTreeSummary("p1", tree.treeId)).toMatchObject({
-      treeId: tree.treeId, title: "Runtime", traceCount: 4, attemptCount: 1, evaluationCount: 1,
+      treeId: tree.treeId, revisionId: tree.revisionId, title: "Runtime", traceCount: 4, attemptCount: 1, evaluationCount: 1,
       artifactCounts: { total: 2 }, driftCounts: { warning: 1, blocking: 1 },
       confirmationCounts: { draft: 1, pendingUserConfirmation: 0, confirmed: 0, partialConfirmed: 0 },
       nodes: [expect.objectContaining({ confirmationState: "draft" })],

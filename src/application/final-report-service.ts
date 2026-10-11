@@ -1,7 +1,10 @@
 import { HarnessError } from "../domain/errors.js";
+import { loadNodeCompletion } from "./node-completion.js";
 import { newId, nowIso } from "../domain/ids.js";
 import { canonicalJson } from "../domain/trace.js";
 import type { RuntimeDatabase } from "../storage/database.js";
+import type { TaskTreeDocument } from "../domain/task-tree.js";
+import { taskNodeEvidenceContext } from "../domain/task-node-evidence-context.js";
 
 interface FinalReportRow {
   id: string;
@@ -105,11 +108,16 @@ export class FinalReportService {
       ORDER BY created_at DESC, id DESC LIMIT 1
     `, input.projectId, input.treeId, tree.current_revision_id, workflow.revision - 1);
 
-    const taskNodes = this.statusCounts(`
-      SELECT n.status, count(*) AS count FROM task_nodes n
+    const complete = loadNodeCompletion(this.database, input.treeId);
+    const taskNodes = new Map<string, number>();
+    for (const node of this.database.all<{ id: string; status: string }>(`
+      SELECT n.id, n.status FROM task_nodes n
       JOIN task_node_revisions nr ON nr.node_id = n.id
-      WHERE n.tree_id = ? AND nr.tree_revision_id = ? GROUP BY n.status
-    `, input.treeId, tree.current_revision_id);
+      WHERE n.tree_id = ? AND nr.tree_revision_id = ?
+    `, input.treeId, tree.current_revision_id)) {
+      const status = complete(node.id) ? "succeeded" : node.status === "succeeded" ? "needs_revalidation" : node.status;
+      taskNodes.set(status, (taskNodes.get(status) ?? 0) + 1);
+    }
     const branches = this.statusCounts(`
       SELECT status, count(*) AS count FROM workflow_branch_states
       WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ? GROUP BY status
@@ -155,11 +163,20 @@ export class FinalReportService {
     const artifacts = this.statusCounts(`
       SELECT status, count(*) AS count FROM artifacts WHERE project_id = ? AND tree_id = ? GROUP BY status
     `, input.projectId, input.treeId);
-    const evaluations = this.statusCounts(`
-      SELECT e.verdict AS status, count(*) AS count FROM evaluations e
+    const document = JSON.parse(this.database.get<{ document_json: string }>(
+      "SELECT document_json FROM task_tree_revisions WHERE id = ?", tree.current_revision_id,
+    )!.document_json) as TaskTreeDocument;
+    const matchesCurrentContext = (nodeId: string, priorDocument: string) =>
+      taskNodeEvidenceContext(document, nodeId) === taskNodeEvidenceContext(JSON.parse(priorDocument) as TaskTreeDocument, nodeId);
+    const evaluationRows = this.database.all<{ id: string; status: string; task_node_id: string; execution_attempt_id: string; document_json: string }>(`
+      SELECT e.id, e.verdict AS status, e.task_node_id, e.execution_attempt_id, prior.document_json FROM evaluations e
       JOIN task_node_revisions nr ON nr.id = e.task_node_revision_id
-      WHERE e.project_id = ? AND e.tree_id = ? AND nr.tree_revision_id = ? GROUP BY e.verdict
-    `, input.projectId, input.treeId, tree.current_revision_id);
+      JOIN task_tree_revisions prior ON prior.id = nr.tree_revision_id
+      JOIN task_node_revisions current ON current.node_id = e.task_node_id AND current.tree_revision_id = ?
+      WHERE e.project_id = ? AND e.tree_id = ? AND nr.body_json = current.body_json ORDER BY e.created_at, e.id
+    `, tree.current_revision_id, input.projectId, input.treeId).filter((row) => matchesCurrentContext(row.task_node_id, row.document_json));
+    const evaluations = new Map<string, number>();
+    for (const row of evaluationRows) evaluations.set(row.status, (evaluations.get(row.status) ?? 0) + 1);
     const traceCount = this.count(
       "SELECT count(*) AS count FROM trace_events WHERE project_id = ? AND tree_id = ?",
       input.projectId, input.treeId,
@@ -171,25 +188,25 @@ export class FinalReportService {
       WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ?
       ORDER BY created_at, id
     `, input.projectId, input.treeId, tree.current_revision_id);
-    const invalidatedEvaluationIds = new Set(invalidations.flatMap((row) => JSON.parse(row.invalidated_evaluation_ids_json) as string[]));
+    const invalidatedEvaluationIds = new Set(this.database.all<{ invalidated_evaluation_ids_json: string }>(
+      "SELECT invalidated_evaluation_ids_json FROM verification_invalidations WHERE project_id = ? AND tree_id = ?",
+      input.projectId, input.treeId,
+    ).flatMap((row) => JSON.parse(row.invalidated_evaluation_ids_json) as string[]));
     const invalidatedGateResultIds = new Set(invalidations.flatMap((row) => JSON.parse(row.invalidated_gate_result_ids_json) as string[]));
     const phaseGateResultIds = this.ids(`
       SELECT id FROM workflow_phase_gate_results
       WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ? AND status = 'passed'
       ORDER BY created_at, id
     `, input.projectId, input.treeId, tree.current_revision_id).filter((id) => !invalidatedGateResultIds.has(id));
-    const evaluationIds = this.ids(`
-      SELECT e.id FROM evaluations e JOIN task_node_revisions nr ON nr.id = e.task_node_revision_id
-      WHERE e.project_id = ? AND e.tree_id = ? AND nr.tree_revision_id = ? AND e.verdict = 'succeeded'
-      ORDER BY e.created_at, e.id
-    `, input.projectId, input.treeId, tree.current_revision_id).filter((id) => !invalidatedEvaluationIds.has(id));
-    const traceEventIds = this.ids(`
-      SELECT DISTINCT ae.trace_event_id AS id FROM execution_attempt_evidence ae
+    const validEvaluations = evaluationRows.filter((row) => row.status === "succeeded" && !invalidatedEvaluationIds.has(row.id));
+    const evaluationIds = validEvaluations.map((row) => row.id);
+    const validAttemptIds = new Set(validEvaluations.map((row) => row.execution_attempt_id));
+    const traceEventIds = [...new Set(this.database.all<{ id: string; attempt_id: string }>(`
+      SELECT DISTINCT ae.trace_event_id AS id, ae.attempt_id FROM execution_attempt_evidence ae
       JOIN execution_attempts a ON a.id = ae.attempt_id
-      JOIN task_node_revisions nr ON nr.id = a.task_node_revision_id
-      WHERE a.project_id = ? AND a.tree_id = ? AND nr.tree_revision_id = ?
+      WHERE a.project_id = ? AND a.tree_id = ?
       ORDER BY id
-    `, input.projectId, input.treeId, tree.current_revision_id);
+    `, input.projectId, input.treeId).filter((row) => validAttemptIds.has(row.attempt_id)).map((row) => row.id))];
     const artifactIds = this.ids(`
       SELECT id FROM artifacts WHERE project_id = ? AND tree_id = ?
         AND status IN ('created', 'modified', 'verified', 'observed') ORDER BY id

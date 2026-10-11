@@ -1,6 +1,7 @@
 export interface Migration {
   version: number;
   sql: string;
+  rebuildReferencedTable?: boolean;
 }
 
 export const migrations: Migration[] = [{
@@ -1193,5 +1194,284 @@ export const migrations: Migration[] = [{
     CREATE TRIGGER verification_invalidations_no_delete
       BEFORE DELETE ON verification_invalidations
       BEGIN SELECT RAISE(ABORT, 'verification invalidations are immutable'); END;
+  `,
+}, {
+  version: 20,
+  sql: `
+    ALTER TABLE task_affiliation_decisions RENAME TO task_affiliation_decisions_v14;
+    CREATE TABLE task_affiliation_decisions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      request_trace_event_id TEXT NOT NULL UNIQUE REFERENCES trace_events(id) ON DELETE RESTRICT,
+      request_title TEXT NOT NULL,
+      candidate_query TEXT NOT NULL,
+      candidate_snapshot_json TEXT NOT NULL,
+      recommendation TEXT NOT NULL CHECK(recommendation IN ('new_tree', 'merge')),
+      recommended_tree_id TEXT REFERENCES task_trees(id) ON DELETE SET NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'direct_execution', 'new_tree', 'merged', 'paused')),
+      confirmation_prompt_id TEXT NOT NULL UNIQUE REFERENCES runtime_confirmation_prompts(id) ON DELETE RESTRICT,
+      runtime_action_id TEXT NOT NULL UNIQUE REFERENCES runtime_actions(id) ON DELETE RESTRICT,
+      answer_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT,
+      resolved_tree_id TEXT REFERENCES task_trees(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+    INSERT INTO task_affiliation_decisions (
+      id, project_id, request_trace_event_id, request_title, candidate_query,
+      candidate_snapshot_json, recommendation, recommended_tree_id, status,
+      confirmation_prompt_id, runtime_action_id, answer_trace_event_id,
+      resolved_tree_id, created_at, resolved_at
+    ) SELECT
+      id, project_id, request_trace_event_id, request_title, candidate_query,
+      candidate_snapshot_json, recommendation, recommended_tree_id, status,
+      confirmation_prompt_id, runtime_action_id, answer_trace_event_id,
+      resolved_tree_id, created_at, resolved_at
+    FROM task_affiliation_decisions_v14;
+    DROP TABLE task_affiliation_decisions_v14;
+    CREATE UNIQUE INDEX one_pending_task_affiliation_per_project
+      ON task_affiliation_decisions(project_id) WHERE status = 'pending';
+    CREATE INDEX task_affiliation_history_idx
+      ON task_affiliation_decisions(project_id, created_at DESC, id DESC);
+  `,
+}, {
+  version: 21,
+  sql: `
+    CREATE TABLE request_route_decisions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      prompt_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE SET NULL,
+      prompt_fingerprint TEXT NOT NULL,
+      classification TEXT NOT NULL CHECK(classification IN ('direct_response', 'direct_execution', 'task_tree_workflow')),
+      tree_relation TEXT CHECK(tree_relation IN ('continue_existing_tree', 'change_existing_tree', 'create_new_tree', 'unclear')),
+      confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+      probabilities_json TEXT NOT NULL,
+      reason_codes_json TEXT NOT NULL,
+      disposition TEXT NOT NULL CHECK(disposition IN ('accepted', 'advisory', 'native_fallback', 'explicit_override')),
+      provider TEXT NOT NULL,
+      model_requested TEXT NOT NULL,
+      model_resolved TEXT,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      latency_ms INTEGER,
+      fallback_reason TEXT,
+      policy_version TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, session_id, prompt_fingerprint, policy_version)
+    );
+    CREATE INDEX request_route_history_idx
+      ON request_route_decisions(project_id, session_id, created_at DESC, id DESC);
+    CREATE TRIGGER request_route_decisions_no_update
+      BEFORE UPDATE ON request_route_decisions
+      BEGIN SELECT RAISE(ABORT, 'request route decisions are immutable'); END;
+    CREATE TRIGGER request_route_decisions_no_delete
+      BEFORE DELETE ON request_route_decisions
+      BEGIN SELECT RAISE(ABORT, 'request route decisions are immutable'); END;
+
+    CREATE TABLE runtime_profile_states (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      profile TEXT NOT NULL CHECK(profile IN ('conversation', 'direct_coding', 'structured_coding')),
+      source_route_decision_id TEXT REFERENCES request_route_decisions(id) ON DELETE SET NULL,
+      source_affiliation_decision_id TEXT REFERENCES task_affiliation_decisions(id) ON DELETE SET NULL,
+      reason_code TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(project_id, session_id)
+    );
+    CREATE INDEX runtime_profile_state_profile_idx
+      ON runtime_profile_states(project_id, profile, updated_at DESC);
+
+    CREATE TABLE runtime_profile_transitions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      prior_profile TEXT CHECK(prior_profile IN ('conversation', 'direct_coding', 'structured_coding')),
+      next_profile TEXT NOT NULL CHECK(next_profile IN ('conversation', 'direct_coding', 'structured_coding')),
+      source_route_decision_id TEXT REFERENCES request_route_decisions(id) ON DELETE SET NULL,
+      source_affiliation_decision_id TEXT REFERENCES task_affiliation_decisions(id) ON DELETE SET NULL,
+      reason_code TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX runtime_profile_transition_history_idx
+      ON runtime_profile_transitions(project_id, session_id, created_at DESC, id DESC);
+    CREATE TRIGGER runtime_profile_transitions_no_update
+      BEFORE UPDATE ON runtime_profile_transitions
+      BEGIN SELECT RAISE(ABORT, 'runtime profile transitions are immutable'); END;
+    CREATE TRIGGER runtime_profile_transitions_no_delete
+      BEFORE DELETE ON runtime_profile_transitions
+      BEGIN SELECT RAISE(ABORT, 'runtime profile transitions are immutable'); END;
+  `,
+}, {
+  version: 22,
+  sql: `
+    CREATE TABLE task_tree_authoring_commands (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      tree_id TEXT NOT NULL REFERENCES task_trees(id) ON DELETE CASCADE,
+      affiliation_decision_id TEXT REFERENCES task_affiliation_decisions(id) ON DELETE SET NULL,
+      command_kind TEXT NOT NULL CHECK(command_kind IN ('create_draft', 'patch')),
+      idempotency_key TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      base_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      result_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      source_session_id TEXT NOT NULL,
+      source_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, idempotency_key)
+    );
+    CREATE INDEX task_tree_authoring_history_idx
+      ON task_tree_authoring_commands(project_id, tree_id, created_at DESC, id DESC);
+    CREATE TRIGGER task_tree_authoring_commands_no_update
+      BEFORE UPDATE ON task_tree_authoring_commands
+      BEGIN SELECT RAISE(ABORT, 'task tree authoring commands are immutable'); END;
+    CREATE TRIGGER task_tree_authoring_commands_no_delete
+      BEFORE DELETE ON task_tree_authoring_commands
+      BEGIN SELECT RAISE(ABORT, 'task tree authoring commands are immutable'); END;
+  `,
+}, {
+  version: 23,
+  sql: `
+    CREATE TABLE task_tree_approval_references (
+      approval_ref TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      tree_id TEXT NOT NULL REFERENCES task_trees(id) ON DELETE CASCADE,
+      tree_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      readiness_result_id TEXT NOT NULL REFERENCES plan_readiness_results(id) ON DELETE RESTRICT,
+      workflow_id TEXT NOT NULL REFERENCES workflow_states(id) ON DELETE RESTRICT,
+      workflow_revision INTEGER NOT NULL CHECK(workflow_revision > 0),
+      confirmation_prompt_id TEXT NOT NULL UNIQUE REFERENCES runtime_confirmation_prompts(id) ON DELETE RESTRICT,
+      canonical_block_hash TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('prepared', 'consumed', 'rejected', 'expired', 'superseded')),
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+    CREATE INDEX task_tree_approval_pending_idx
+      ON task_tree_approval_references(project_id, session_id, tree_id, status, created_at DESC);
+    CREATE TRIGGER task_tree_approval_references_guard_update
+      BEFORE UPDATE ON task_tree_approval_references
+      WHEN OLD.status <> 'prepared'
+        OR NEW.status NOT IN ('consumed', 'rejected', 'expired', 'superseded')
+        OR NEW.approval_ref <> OLD.approval_ref OR NEW.project_id <> OLD.project_id
+        OR NEW.session_id <> OLD.session_id OR NEW.tree_id <> OLD.tree_id
+        OR NEW.tree_revision_id <> OLD.tree_revision_id OR NEW.readiness_result_id <> OLD.readiness_result_id
+        OR NEW.workflow_id <> OLD.workflow_id OR NEW.workflow_revision <> OLD.workflow_revision
+        OR NEW.confirmation_prompt_id <> OLD.confirmation_prompt_id
+        OR NEW.canonical_block_hash <> OLD.canonical_block_hash OR NEW.expires_at <> OLD.expires_at
+        OR NEW.created_at <> OLD.created_at OR NEW.resolved_at IS NULL
+      BEGIN SELECT RAISE(ABORT, 'invalid Task Tree approval reference transition'); END;
+    CREATE TRIGGER task_tree_approval_references_no_delete
+      BEFORE DELETE ON task_tree_approval_references
+      BEGIN SELECT RAISE(ABORT, 'Task Tree approval references are immutable facts'); END;
+
+    CREATE TABLE native_plan_snapshots (
+      id TEXT PRIMARY KEY,
+      approval_ref TEXT NOT NULL REFERENCES task_tree_approval_references(approval_ref) ON DELETE RESTRICT,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      tool_use_id TEXT NOT NULL,
+      plan_hash TEXT NOT NULL,
+      canonical_block_hash TEXT NOT NULL,
+      plan_file_path TEXT,
+      trace_event_id TEXT NOT NULL REFERENCES trace_events(id) ON DELETE RESTRICT,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, session_id, tool_use_id)
+    );
+    CREATE TABLE native_plan_task_tree_links (
+      id TEXT PRIMARY KEY,
+      snapshot_id TEXT NOT NULL UNIQUE REFERENCES native_plan_snapshots(id) ON DELETE RESTRICT,
+      approval_ref TEXT NOT NULL UNIQUE REFERENCES task_tree_approval_references(approval_ref) ON DELETE RESTRICT,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      tree_id TEXT NOT NULL REFERENCES task_trees(id) ON DELETE CASCADE,
+      tree_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      confirmation_prompt_id TEXT NOT NULL REFERENCES runtime_confirmation_prompts(id) ON DELETE RESTRICT,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE native_plan_approval_events (
+      id TEXT PRIMARY KEY,
+      approval_ref TEXT NOT NULL REFERENCES task_tree_approval_references(approval_ref) ON DELETE RESTRICT,
+      snapshot_id TEXT NOT NULL REFERENCES native_plan_snapshots(id) ON DELETE RESTRICT,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      tool_use_id TEXT NOT NULL,
+      trace_event_id TEXT NOT NULL REFERENCES trace_events(id) ON DELETE RESTRICT,
+      outcome TEXT NOT NULL CHECK(outcome IN ('approved', 'rejected')),
+      plan_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, session_id, tool_use_id, outcome)
+    );
+    CREATE TRIGGER native_plan_snapshots_no_update BEFORE UPDATE ON native_plan_snapshots
+      BEGIN SELECT RAISE(ABORT, 'native Plan snapshots are append-only'); END;
+    CREATE TRIGGER native_plan_snapshots_no_delete BEFORE DELETE ON native_plan_snapshots
+      BEGIN SELECT RAISE(ABORT, 'native Plan snapshots are append-only'); END;
+    CREATE TRIGGER native_plan_task_tree_links_no_update BEFORE UPDATE ON native_plan_task_tree_links
+      BEGIN SELECT RAISE(ABORT, 'native Plan Task Tree links are append-only'); END;
+    CREATE TRIGGER native_plan_task_tree_links_no_delete BEFORE DELETE ON native_plan_task_tree_links
+      BEGIN SELECT RAISE(ABORT, 'native Plan Task Tree links are append-only'); END;
+    CREATE TRIGGER native_plan_approval_events_no_update BEFORE UPDATE ON native_plan_approval_events
+      BEGIN SELECT RAISE(ABORT, 'native Plan approval events are append-only'); END;
+    CREATE TRIGGER native_plan_approval_events_no_delete BEFORE DELETE ON native_plan_approval_events
+      BEGIN SELECT RAISE(ABORT, 'native Plan approval events are append-only'); END;
+  `,
+}, {
+  version: 24,
+  sql: `
+    ALTER TABLE execution_attempts ADD COLUMN session_id TEXT;
+    ALTER TABLE execution_attempts ADD COLUMN agent_runtime TEXT;
+    ALTER TABLE execution_attempts ADD COLUMN tree_revision_id TEXT REFERENCES task_tree_revisions(id) ON DELETE RESTRICT;
+    ALTER TABLE execution_attempts ADD COLUMN workflow_revision INTEGER;
+    ALTER TABLE execution_attempts ADD COLUMN source_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT;
+    CREATE INDEX execution_attempts_session_active_idx
+      ON execution_attempts(project_id, session_id, tree_id, status, started_at DESC);
+
+    ALTER TABLE task_tree_approval_references ADD COLUMN source_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT;
+    CREATE UNIQUE INDEX task_tree_approval_source_unique
+      ON task_tree_approval_references(project_id, tree_id, tree_revision_id, readiness_result_id, source_trace_event_id)
+      WHERE source_trace_event_id IS NOT NULL;
+    DROP TRIGGER task_tree_approval_references_guard_update;
+    CREATE TRIGGER task_tree_approval_references_guard_update
+      BEFORE UPDATE ON task_tree_approval_references
+      WHEN OLD.status <> 'prepared'
+        OR NEW.status NOT IN ('consumed', 'rejected', 'expired', 'superseded')
+        OR NEW.approval_ref <> OLD.approval_ref OR NEW.project_id <> OLD.project_id
+        OR NEW.session_id <> OLD.session_id OR NEW.tree_id <> OLD.tree_id
+        OR NEW.tree_revision_id <> OLD.tree_revision_id OR NEW.readiness_result_id <> OLD.readiness_result_id
+        OR NEW.workflow_id <> OLD.workflow_id OR NEW.workflow_revision <> OLD.workflow_revision
+        OR NEW.confirmation_prompt_id <> OLD.confirmation_prompt_id
+        OR NEW.canonical_block_hash <> OLD.canonical_block_hash OR NEW.expires_at <> OLD.expires_at
+        OR NEW.created_at <> OLD.created_at
+        OR COALESCE(NEW.source_trace_event_id, '') <> COALESCE(OLD.source_trace_event_id, '')
+        OR NEW.resolved_at IS NULL
+      BEGIN SELECT RAISE(ABORT, 'invalid Task Tree approval reference transition'); END;
+  `,
+}, {
+  version: 25,
+  rebuildReferencedTable: true,
+  sql: `
+    CREATE TABLE task_affiliation_decisions_next (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      request_trace_event_id TEXT NOT NULL UNIQUE REFERENCES trace_events(id) ON DELETE RESTRICT,
+      request_title TEXT NOT NULL,
+      candidate_query TEXT NOT NULL,
+      candidate_snapshot_json TEXT NOT NULL,
+      recommendation TEXT NOT NULL CHECK(recommendation IN ('new_tree', 'merge', 'direct_execution', 'pause')),
+      recommended_tree_id TEXT REFERENCES task_trees(id) ON DELETE SET NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'direct_execution', 'new_tree', 'merged', 'paused')),
+      confirmation_prompt_id TEXT NOT NULL UNIQUE REFERENCES runtime_confirmation_prompts(id) ON DELETE RESTRICT,
+      runtime_action_id TEXT NOT NULL UNIQUE REFERENCES runtime_actions(id) ON DELETE RESTRICT,
+      answer_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT,
+      resolved_tree_id TEXT REFERENCES task_trees(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+    INSERT INTO task_affiliation_decisions_next SELECT * FROM task_affiliation_decisions;
+    DROP TABLE task_affiliation_decisions;
+    ALTER TABLE task_affiliation_decisions_next RENAME TO task_affiliation_decisions;
+    CREATE UNIQUE INDEX one_pending_task_affiliation_per_project
+      ON task_affiliation_decisions(project_id) WHERE status = 'pending';
+    CREATE INDEX task_affiliation_history_idx
+      ON task_affiliation_decisions(project_id, created_at DESC, id DESC);
   `,
 }];

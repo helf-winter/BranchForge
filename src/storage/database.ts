@@ -19,10 +19,20 @@ export class RuntimeDatabase {
     const applied = new Set(this.all<{ version: number }>("SELECT version FROM schema_migrations").map((row) => row.version));
     for (const migration of migrations) {
       if (applied.has(migration.version)) continue;
-      this.transaction(() => {
-        this.database.exec(migration.sql);
-        this.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", migration.version, new Date().toISOString());
-      });
+      // Disable foreign keys outside the transaction for SQLite's table-rebuild
+      // procedure, verify every reference before commit, and always restore them.
+      if (migration.rebuildReferencedTable) this.database.exec("PRAGMA foreign_keys = OFF");
+      try {
+        this.transaction(() => {
+          this.database.exec(migration.sql);
+          if (migration.rebuildReferencedTable && this.all("PRAGMA foreign_key_check").length) {
+            throw new HarnessError("storage_failure", "migration would break existing foreign-key references");
+          }
+          this.run("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", migration.version, new Date().toISOString());
+        });
+      } finally {
+        if (migration.rebuildReferencedTable) this.database.exec("PRAGMA foreign_keys = ON");
+      }
     }
   }
 

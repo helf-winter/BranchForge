@@ -17,3 +17,10 @@ export interface ArtifactInput {
   currentHashOrVersion?: string | null;
   metadata?: Record<string, unknown>;
 }
+import { createHash } from "node:crypto";
+
+
+export function commandArtifactLocator(command: string): string {
+  const executable = command.trim().match(/^[^\s;&|]+/)?.[0]?.replace(/[^A-Za-z0-9_.-]/g, "") || "shell";
+  return `command:${executable}:${createHash("sha256").update(command).digest("hex")}`;
+}

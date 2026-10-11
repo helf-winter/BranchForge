@@ -82,9 +82,10 @@ describe("Failure Case maturity vertical slice", () => {
 
     const failedAttempt = first.executions.startAttempt({
       projectId: project.projectId, nodeId: "endpoint-test", expectedTreeRevisionId: revision.revisionId,
+      sourceTraceEventId: answer.eventId,
     });
     const failureTrace = await first.hooks.ingest(mapClaudeHook({
-      hook_event_name: "PostToolUse", session_id: "failed-test", cwd: projectDir,
+      hook_event_name: "PostToolUse", session_id: "confirm", cwd: projectDir,
       tool_name: "Bash", tool_use_id: "endpoint-red", tool_input: { command: "npm test -- endpoint.test.ts" },
       tool_response: { exitCode: 1, stderr: "AssertionError: endpoint" },
     }));
@@ -143,9 +144,10 @@ describe("Failure Case maturity vertical slice", () => {
 
     const successfulAttempt = first.executions.startAttempt({
       projectId: project.projectId, nodeId: "endpoint-test", expectedTreeRevisionId: revision.revisionId,
+      sourceTraceEventId: answer.eventId,
     });
     const greenEvidence = await first.hooks.ingest(mapClaudeHook({
-      hook_event_name: "PostToolUse", session_id: "post-fix-green", cwd: projectDir,
+      hook_event_name: "PostToolUse", session_id: "confirm", cwd: projectDir,
       tool_name: "Bash", tool_use_id: "stable-green", tool_input: { command: "npm test -- endpoint.test.ts" },
       tool_response: { exitCode: 0, repetitions: 3 },
     }));

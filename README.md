@@ -1,6 +1,6 @@
 # Self-Evolving Agent Harness
 
-Agent Harness 是 Claude Code 内部的一层长期工程运行时：Skills 约束任务规划和执行方式，Hooks 记录生命周期事实，MCP 工具提供可验证的 Task Tree 与 Runtime State 操作。它不是独立管理 Claude 的后台系统。
+Agent Harness 是 Claude Code 内部的一层长期工程运行时：Skills 约束任务规划和执行方式，Hooks 记录生命周期事实并在确定性边界执行有限门禁，MCP 工具提供可验证的 Task Tree 与 Runtime State 操作。它不是独立管理 Claude 的后台系统。
 
 当前版本实现 Runtime Foundation、Branch Confirmation、Node Execution & Evaluation、Artifact Graph & Plan Drift、Runtime Action & User Change、Failure Case Maturity、Experience & Skill Evolution、Task Node Replacement & Effect Disposal、Project Identity & Clone、Plugin Composition Contract、Task Tree Refinement Loop、Trace Execution Context、Task Tree Collection Lifecycle、Parent–Child Task Communication、Tree-centered Runtime View、Task Affiliation Confirmation、Jev Evidence Semantic Evaluation、Skeleton Gate Evaluation、Branch Phase Orchestration、Final Report & Task Tree Completion，以及 Verification Freshness & Invalidation 二十一个纵向切片：
 
@@ -15,6 +15,8 @@ Agent Harness 是 Claude Code 内部的一层长期工程运行时：Skills 约�
 - 分支确认记录不可变；节点确认状态与执行状态分离，支持 `draft`、`pending_user_confirmation`、`confirmed`、`partial_confirmed`；
 - 修改一个已确认分支时，仅该分支重新确认，未变化兄弟分支保留确认；跨分支依赖未确认时节点处于 `blocked_by_unconfirmed_dependency`；
 - Claude 生命周期 Hook 的幂等、脱敏 Trace 与 Artifact 投影；
+- 可选 Jev 请求路由只给出 `conversation`、`direct_coding`、`structured_coding` 三类建议；失败、低置信度或未配置时回退给 Claude 原生判断，不会让 Claude Code 不可用；
+- `task-tree-planning` 只引导复杂、多阶段、跨模块或用户显式要求规划的请求；Claude 原生讨论、`AskUserQuestion` 和 Plan Mode 保持可用。结构化执行只在“当前 revision 未经原生 Plan 批准”或“批准后尚未启动调度节点 Attempt”两个写入边界返回可恢复门禁；
 - Trace Event 保存隐私受限的 Execution Context 快照；同一 Project/run 内继承启动模型与方式，模型切换后更新后续事件，且不保存 transcript、任意环境变量或底层模型完整请求响应；
 - 修订绑定的 Artifact Graph：Task Link、Artifact Relation、Contract、规划基线和 Trace 来源；
 - 确定性 Hook 自动识别未规划 Artifact，语义 Drift 可由 Agent 显式记录；阻断 Drift 会暂停节点等待用户确认；
@@ -43,7 +45,7 @@ Agent Harness 是 Claude Code 内部的一层长期工程运行时：Skills 约�
 - 父节点按当前 Task Tree revision 获得一跳 Child Task Reports；报告派生自 Attempt、Evaluation、Evidence、Artifact、Trace 与 Drift 事实，不维护第二份可漂移状态；
 - 可执行的非叶子 verification 节点只有在当前直接子节点全部成功后才能创建 Attempt，且父节点仍必须完成自己的独立 Evaluation；
 - Tree-centered View 以当前 Task Tree 为骨架提供 Snapshot、Summary、Detail 三档查询；默认只突出需关注关系，只有显式请求才返回可过滤的全局 Relation Overlay；
-- Bash CLI、Claude 插件 Skills 和 76 个 MCP Runtime Tools。
+- Bash CLI、Claude 插件 Skills 和 77 个 MCP Runtime Tools。
 
 ## 环境要求
 
@@ -71,6 +73,8 @@ harness doctor
 ```
 
 `npm link` 只链接当前项目，不复制项目目录。若切换了 WSL 用户或 Node/NVM 版本，需要在对应环境重新执行一次。
+
+`harness doctor` 还会报告请求路由的 `enabled`、`readiness`、模型和 API Key 是否已配置，但绝不会输出 Key 本身。`disabled` 表示保留确定性显式意图和 Claude 原生判断；`misconfigured` 表示已要求启用 Jev、但当前 Bash/WSL 进程没有读到 `TYPESAFE_API_KEY`。
 
 ## CLI 快速体验
 
@@ -120,16 +124,32 @@ Task Tree 属于 Project，而不是聊天 Session。一个 Project 可以保留
 
 ### Task Affiliation Confirmation
 
-普通 coding 请求不能由 Agent 静默新建或归并 Task Tree。`task-tree-planning` Skill 使用一条可恢复的确认链路：
+小型、自包含的 coding 请求默认直接执行，由 Hooks 记录 Trace 与 Artifact，不强制建立 Task Tree。复杂、多阶段、跨模块、存在未决设计问题或用户明确要求结构化规划的请求，才由 `task-tree-planning` Skill 使用可恢复的确认链路：
+
+当确定性路由或 Jev 把当前请求归为 `structured_coding` 时，Hook 会在该次请求的动态上下文中明确要求先加载 `agent-harness:task-tree-planning`，并在普通需求细节提问前调用 `harness_propose_task_affiliation`。这只激活 Harness 的规划入口，不替代 Claude 原生讨论、`AskUserQuestion` 或 Plan Mode。若 Agent 忽略入口并准备结束本轮，`Stop` Hook 只会唤醒一次并给出同一恢复动作；已有待确认归属时不会打断用户问题，同一 Session 也不会重复唤醒形成循环。
 
 1. `harness_propose_task_affiliation` 在当前 Project 内执行确定性候选检索，保存候选快照、Agent 的 `new_tree` / `merge` 建议、Runtime Action 和确认提示，但不创建或选择树；
-2. Agent 向用户展示候选、匹配依据与建议，用户选择 `new_tree`、`merge` 或 `pause`；
+2. Agent 向用户展示候选、匹配依据与建议，用户选择 `direct_execution`、`new_tree`、`merge` 或 `pause`；用户也可以在自由文本回答中随时要求“不建树，直接执行”；
 3. 等待确认期间，即使尚无 active Workflow，Hook 仍会把回答记录为 `UserPromptSubmit` Trace；普通解释性聊天仍不会创建 Project 或 Runtime 状态；
 4. `harness_resolve_task_affiliation` 只接受同一 Project 中、提示之后的回答 Trace；`merge` 还会重新校验目标树未归档且属于当前 Project；
-5. `new_tree` 在确认后才创建并选择根任务，`merge` 只选择现有树，`pause` 不改变树；同一决定重复提交相同选择保持幂等；
+5. `direct_execution` 关闭待定归属且不创建、选择或修改 Task Tree，Agent 随即按用户最新指令直接工作；`new_tree` 在确认后才创建并选择根任务，`merge` 只选择现有树，`pause` 停止当前请求；同一决定重复提交相同选择保持幂等；
 6. `harness_get_task_affiliations` 和 Runtime Snapshot 可在重启后恢复待确认或已解决结果。每个 Project 同时最多一个待确认归属。
 
+没有活动 Task Tree Workflow 时，Harness 不把“没有任务树”解释为禁止修改：Agent 可以直接执行，Hooks 只记录事实。原生 Plan Mode、提问、读取和 Runtime 工具在结构化模式中也始终可用。只有 `structured_coding` 的项目 mutation 才检查两个精确边界：当前 revision 必须已通过一次原生 Plan 批准，并且执行阶段必须已有由调度器选中并启动的活跃 Attempt。门禁会返回 `harness_prepare_task_tree_approval` 或 `harness_get_next_executable_node` → `harness_start_node_attempt` 的单一恢复路径；用户明确选择 `direct_execution` 后立即绕过结构化门禁。高风险确认与是否建立 Task Tree 相互独立。
+
 显式 `/taskroot [任务名称]` 是用户直接要求新建根任务的命令，不经过普通 coding 请求的归属选择。
+
+### Structured Coding 与原生 Plan
+
+结构化工作流复用 Claude Code 原生规划能力，而不是另建一套对话或计划编辑器：
+
+1. Claude 通过原生对话和 `AskUserQuestion` 精炼需求，并通过 typed Runtime Tools 创建完整 Task Tree draft、提交用户可见决定对应的局部 patch；
+2. `harness_validate_task_tree` 对精确 revision 做确定性就绪检查；`harness_prepare_task_tree_approval` 返回可读、确定、不可篡改的 canonical block 和一次性 approval reference；
+3. Claude 将 canonical block 原样放进原生 Plan。成功的 `ExitPlanMode` 是这一 revision 唯一一次用户批准，不再弹出第二个 Harness 确认，也不从 Markdown 解析或重建 JSON manifest；
+4. 批准后调用 `harness_get_next_executable_node`。调度器先按深度与文档顺序执行全部 Skeleton，再在一个 active branch 内深度执行 implementation 和 verification，最后执行 root verification；
+5. Claude 用 `harness_start_node_attempt` 启动返回节点后，继续使用原生文件、命令和测试工具。Hooks 将 Trace 与 Artifact 事实绑定到该 Attempt；证据和 Evaluation 完成后再次查询下一节点。
+
+Task Tree revision 是规划事实源；原生 Plan 是展示与批准界面；Skill 是行为规范入口；Hook 是事实记录和有限边界门禁；MCP Tool Provider 提供结构化状态操作。四者不是相互替代的系统。
 
 ### Parent–Child Task Communication
 
@@ -323,6 +343,15 @@ Skeleton Gate 通过时，Runtime 按 Task Tree 中的顶层分支顺序建立�
 
 ## Jev Evidence 语义评估
 
+Jev 还可独立用于请求级三分类路由。该路由只接收当前用户 prompt 和是否存在活动树、树标题、当前节点标题、是否存在活动 Workflow 四项有界事实；不发送源码、工具输出、完整对话、环境变量、密钥或隐藏推理。启用方式：
+
+```bash
+export TYPESAFE_API_KEY='你的密钥'
+export HARNESS_JEV_ROUTING_ENABLED=true
+```
+
+路由默认模型为 `jev-1.13.0`，默认超时 `2000ms`。可选参数为 `HARNESS_JEV_ROUTING_TIMEOUT_MS`、`HARNESS_JEV_ROUTING_ACCEPTED_CONFIDENCE`（默认 `0.80`）和 `HARNESS_JEV_ROUTING_ADVISORY_CONFIDENCE`（默认 `0.50`）。用户明确要求“先讨论并完善需求，确认规划后再实现”时，确定性路由直接进入 `structured_coding`；明确要求“不建立或修改任务树，直接执行”时，直接进入 `direct_coding`。这两类用户明示优先于 Jev。其他含义不明确的请求才交给 Jev 建议或 Claude 原生判断。高置信度建议映射为 `conversation`、`direct_coding` 或 `structured_coding`；中等置信度仅作建议；低置信度、401、429、529、超时、网络错误和畸形响应全部 fail-open，保留 Claude 原生判断能力。
+
 项目已将 [TypeSafe Jev](https://docs.typesafe.ai/introduction) 接为可选的 Evidence 语义评估 Provider，用于补足确定性规则无法回答的问题：一条 Trace Evidence 的有限事实是否真正支持对应的 Required Evidence 与 Acceptance Criteria。
 
 Jev 不替代测试、构建、Trace、Evaluation 或 Lifecycle Transition Policy，也不能直接把 Task Node 标记为 `succeeded`。预期链路为：
@@ -360,20 +389,46 @@ export TYPESAFE_API_KEY='你的密钥'
 export HARNESS_JEV_ENABLED=true
 ```
 
-可选阈值为 `HARNESS_JEV_MIN_PROBABILITY`（默认 `0.7`）、`HARNESS_JEV_MIN_CONFIDENCE`（默认 `0.5`）和 `HARNESS_JEV_TIMEOUT_MS`（默认 `10000`）。API Key 本身不会自动启用外部调用。Jev 不参与 Task Tree 规划、代码生成或状态迁移；最终状态仍由确定性 Lifecycle Transition Policy 决定。
+可选阈值为 `HARNESS_JEV_MIN_PROBABILITY`（默认 `0.7`）、`HARNESS_JEV_MIN_CONFIDENCE`（默认 `0.5`）和 `HARNESS_JEV_TIMEOUT_MS`（默认 `10000`）。API Key 本身不会自动启用外部调用。Jev 不生成 Task Tree、不写代码，也不直接迁移状态；请求路由和 Evidence 评估均只提供有界判断，最终状态仍由用户选择与确定性 Lifecycle Policy 决定。
 
 ## 在 Claude Code 中加载
 
-先构建，再从仓库目录启动：
+推荐执行一次用户级安装。安装完成后，无论当前位于哪个项目目录，都可以直接运行 `claude`：
 
 ```bash
+cd '/mnt/d/code/创业/Agent-Harness'
 npm run build
-claude --plugin-dir ./plugin
+claude plugin marketplace add . --scope user
+claude plugin install agent-harness@agent-harness-local --scope user
 ```
 
-可使用 `/agent-harness:taskroot 任务名称` 显式新建根任务。普通 coding 请求会由 `task-tree-planning` Skill 引导：先判断新建还是归并、精炼完整树、运行就绪扫描、请求确认，再先做 Skeleton、后按分支深入执行。普通问答不会自动创建 Task Tree。
+仓库代码更新后，已安装插件不会自动读取工作区文件；Claude Code 使用的是用户级缓存副本。构建后应显式刷新 marketplace 和插件：
 
-MCP 和 Hooks 使用 `${CLAUDE_PLUGIN_ROOT}/runtime` 内的自包含构建产物，不依赖启动目录中的相对脚本。
+```bash
+cd '/mnt/d/code/创业/Agent-Harness'
+npm run build
+claude plugin marketplace update agent-harness-local
+claude plugin update agent-harness@agent-harness-local --scope user
+claude plugin list --json
+```
+
+确认列表中的 `version` 为仓库当前版本（本版为 `0.1.4`）后，再关闭并重新打开 Claude Code。`/clear` 只清理对话上下文，不能替代插件/MCP 进程重启。
+
+重新启动 Claude Code，然后在任意项目目录运行：
+
+```bash
+claude
+```
+
+开发插件本身时，也可以不安装，临时加载当前工作区版本：
+
+```bash
+claude --plugin-dir '/mnt/d/code/创业/Agent-Harness/plugin'
+```
+
+可使用 `/agent-harness:taskroot 任务名称` 显式新建根任务。复杂 coding 请求会由 `task-tree-planning` Skill 引导：先判断直接执行、新建、归并或暂停；进入 Task Tree 后再精炼完整树、运行就绪扫描、请求确认，并按 Skeleton 后分支的顺序执行。小型、自包含修改默认直接执行，用户也可在执行前用自然语言要求“不建树，直接执行”。普通问答不会创建 Task Tree。插件不注入每轮状态或 Conversation Frame；Claude Binding 只在 `SessionStart` 注入一次最小提醒。`PreToolUse` 不会因为项目没有 Task Tree 而阻止工作；只有活动 Task Tree 尚未到达 confirmed executable stage 时才返回 `deny`，防止越阶段修改。
+
+MCP 和 Hooks 使用 `${CLAUDE_PLUGIN_ROOT}/runtime` 内的自包含构建产物，不依赖启动目录中的相对脚本。用户级安装会把插件复制进 Claude Code 缓存；仓库更新并重新构建后，必须执行上述 `marketplace update` 与 `plugin update`，新会话才会读取更新内容。
 
 ### Trace Execution Context
 
@@ -393,3 +448,5 @@ claude plugin validate ./plugin
 ```
 
 完整人工验收见 [docs/acceptance.md](docs/acceptance.md)。当前切片尚不包含完整 AST/符号调用图、Codex Binding 和图形界面。
+
+`0.1.4` 修复原生选项回答证据、纯容器分支的根验证、正常实现对骨架的错误回退、依赖失效后的 Attempt 释放，以及归档/暂停后的残留门禁。回归范围与人工复测步骤见 [工作流死锁回归](docs/harness-deadlock-regressions.md)。
