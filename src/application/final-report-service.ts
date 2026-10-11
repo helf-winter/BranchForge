@@ -31,6 +31,12 @@ interface VerificationInvalidationRow {
   invalidated_gate_result_ids_json: string;
 }
 
+interface CompletionSessionProfileRow {
+  session_id: string;
+  source_route_decision_id: string | null;
+  source_affiliation_decision_id: string | null;
+}
+
 export class FinalReportService {
   constructor(private readonly database: RuntimeDatabase) {}
 
@@ -255,12 +261,82 @@ export class FinalReportService {
       "UPDATE workflow_states SET active = 0, updated_at = ? WHERE id = ?",
       createdAt, workflow.id,
     );
+    this.completeSessionProfiles(input.projectId, input.treeId, createdAt);
     return {
       reportId, projectId: input.projectId, treeId: input.treeId,
       treeRevisionId: tree.current_revision_id, workflowRevision: workflow.revision,
       rootPhaseGateResultId: rootGate!.id, status: "completed" as const,
       summary, evidenceRefs, idempotencyKey: input.idempotencyKey, createdAt, created: true,
     };
+  }
+
+  private completeSessionProfiles(projectId: string, treeId: string, timestamp: string): void {
+    // Completion ends the policy of this work, not the Task Tree's history.
+    // A later, independent request must not be cleared by an earlier tree.
+    const profiles = this.database.all<CompletionSessionProfileRow>(`
+      SELECT p.session_id, p.source_route_decision_id, p.source_affiliation_decision_id
+      FROM runtime_profile_states p
+      WHERE p.project_id = ? AND p.profile = 'structured_coding' AND (
+        EXISTS (
+          SELECT 1 FROM task_affiliation_decisions d
+          WHERE d.id = p.source_affiliation_decision_id AND d.project_id = p.project_id
+            AND d.resolved_tree_id = ? AND d.status IN ('new_tree', 'merged')
+        ) OR (p.source_affiliation_decision_id IS NULL AND (
+          EXISTS (
+            SELECT 1 FROM task_tree_approval_references a
+            WHERE a.project_id = p.project_id AND a.tree_id = ? AND a.session_id = p.session_id
+              AND a.status = 'consumed' AND a.resolved_at >= p.updated_at
+          ) OR EXISTS (
+            SELECT 1 FROM execution_attempts a
+            WHERE a.project_id = p.project_id AND a.tree_id = ? AND a.session_id = p.session_id
+              AND a.started_at >= p.updated_at
+          )
+        ))
+      )
+    `, projectId, treeId, treeId, treeId);
+    // A cached route points to its first Trace, possibly in an older tree.
+    // Bind continuation to the latest received prompt, using routing's trim()
+    // normalization (including Unicode whitespace), not SQL's space-only trim.
+    const continuations = this.database.all<CompletionSessionProfileRow & {
+      source_prompt: unknown; latest_prompt: unknown;
+    }>(`
+      SELECT p.session_id, p.source_route_decision_id, p.source_affiliation_decision_id,
+        json_extract(source.payload_json, '$.prompt') AS source_prompt,
+        json_extract(latest.payload_json, '$.prompt') AS latest_prompt
+      FROM runtime_profile_states p
+      JOIN request_route_decisions r ON r.id = p.source_route_decision_id
+        AND r.project_id = p.project_id AND r.session_id = p.session_id
+      JOIN trace_events source ON source.id = r.prompt_trace_event_id
+        AND source.project_id = p.project_id AND source.session_id = p.session_id AND source.event_name = 'UserPromptSubmit'
+      JOIN trace_events latest ON latest.id = (
+        SELECT id FROM trace_events
+        WHERE project_id = p.project_id AND session_id = p.session_id AND event_name = 'UserPromptSubmit'
+        ORDER BY rowid DESC LIMIT 1
+      )
+      WHERE p.project_id = ? AND p.profile = 'structured_coding'
+        AND p.source_affiliation_decision_id IS NULL AND p.reason_code = 'active_approved_workflow'
+        AND latest.tree_id = ?
+        AND (r.tree_relation IN ('continue_existing_tree', 'change_existing_tree') OR r.fallback_reason IS NOT NULL)
+    `, projectId, treeId);
+    const sessions = new Map(profiles.map((profile) => [profile.session_id, profile]));
+    for (const profile of continuations) {
+      if (typeof profile.source_prompt === "string" && typeof profile.latest_prompt === "string"
+        && profile.latest_prompt.trim() === profile.source_prompt.trim()) sessions.set(profile.session_id, profile);
+    }
+    for (const profile of sessions.values()) {
+      this.database.run(`
+        INSERT INTO runtime_profile_transitions (
+          id, project_id, session_id, prior_profile, next_profile, source_route_decision_id,
+          source_affiliation_decision_id, reason_code, created_at
+        ) VALUES (?, ?, ?, 'structured_coding', 'conversation', ?, ?, 'task_tree:completed', ?)
+      `, newId(), projectId, profile.session_id, profile.source_route_decision_id,
+      profile.source_affiliation_decision_id, timestamp);
+      this.database.run(`
+        UPDATE runtime_profile_states
+        SET profile = 'conversation', reason_code = 'task_tree:completed', updated_at = ?
+        WHERE project_id = ? AND session_id = ?
+      `, timestamp, projectId, profile.session_id);
+    }
   }
 
   private count(sql: string, ...params: string[]): number {

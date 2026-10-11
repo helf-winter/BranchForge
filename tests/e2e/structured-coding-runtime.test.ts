@@ -79,7 +79,7 @@ function pinBeanDocument(branchTitle = "Canvas editor"): TaskTreeDocument {
 }
 
 describe("structured coding runtime vertical slice", () => {
-  it("routes, plans, approves, schedules Skeleton first, and supports an explicit direct escape", async () => {
+  it.each([false, true])("routes, plans, approves, schedules Skeleton first, and supports an explicit direct escape (separate execution session: %s)", async (separateExecutionSession) => {
     const directory = await mkdtemp(path.join(tmpdir(), "harness-pinbean-e2e-"));
     directories.push(directory);
     const projectDirectory = path.join(directory, "pinbean");
@@ -179,19 +179,27 @@ describe("structured coding runtime vertical slice", () => {
       "SELECT status FROM task_tree_approval_references WHERE approval_ref = ?", approval.approvalRef,
     )).toEqual({ status: "consumed" });
 
+    const executionSessionId = separateExecutionSession ? "pin-execution-session" : sessionId;
+    const executionSource = separateExecutionSession
+      ? await runtime.hooks.ingest(mapClaudeHook({
+        hook_event_name: "UserPromptSubmit", session_id: executionSessionId, cwd: projectDirectory,
+        prompt: "继续执行已批准的拼豆任务树",
+      }))
+      : refinementAnswer;
+    if (!executionSource.recorded) throw new Error("execution source was not recorded");
     const skeleton = runtime.scheduler.next({ projectId: project.projectId, treeId: patched.treeId });
     expect(skeleton).toMatchObject({ nodeId: "canvas-skeleton", phase: "skeleton", stage: "skeleton_pass" });
     const skeletonAttempt = runtime.executions.startAttempt({
       projectId: project.projectId, nodeId: skeleton!.nodeId, expectedTreeRevisionId: skeleton!.treeRevisionId,
-      sourceTraceEventId: refinementAnswer.eventId,
+      sourceTraceEventId: executionSource.eventId,
     });
     const write = await runtime.hooks.ingest(mapClaudeHook({
-      hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
+      hook_event_name: "PostToolUse", session_id: executionSessionId, cwd: projectDirectory,
       tool_name: "Write", tool_use_id: "write-canvas", tool_input: { file_path: "src/canvas.ts", content: "export const canvas = true" },
       tool_response: { ok: true },
     }));
     const build = await runtime.hooks.ingest(mapClaudeHook({
-      hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
+      hook_event_name: "PostToolUse", session_id: executionSessionId, cwd: projectDirectory,
       tool_name: "Bash", tool_use_id: "build-skeleton", tool_input: { command: "npm run build" }, tool_response: { exitCode: 0 },
     }));
     if (!write.recorded || !build.recorded) throw new Error("skeleton facts were not recorded");
@@ -216,10 +224,10 @@ describe("structured coding runtime vertical slice", () => {
     expect(implementation).toMatchObject({ nodeId: "canvas-implementation", activeBranchNodeId: "canvas" });
     const implementationAttempt = runtime.executions.startAttempt({
       projectId: project.projectId, nodeId: implementation!.nodeId, expectedTreeRevisionId: implementation!.treeRevisionId,
-      sourceTraceEventId: refinementAnswer.eventId,
+      sourceTraceEventId: executionSource.eventId,
     });
     await runtime.hooks.ingest(mapClaudeHook({
-      hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
+      hook_event_name: "PostToolUse", session_id: executionSessionId, cwd: projectDirectory,
       tool_name: "Edit", tool_use_id: "implement-canvas",
       tool_input: { file_path: "src/canvas.ts", old_string: "export const canvas = true", new_string: "export const canvas = () => 'beads'" },
       tool_response: { ok: true },
@@ -227,7 +235,7 @@ describe("structured coding runtime vertical slice", () => {
     expect(runtime.database.get("SELECT status FROM task_nodes WHERE id = 'canvas-skeleton'")).toEqual({ status: "succeeded" });
     expect(runtime.database.get("SELECT stage FROM workflow_states WHERE tree_id = ?", patched.treeId)).toEqual({ stage: "branch_implementation" });
     const implementationTrace = await runtime.hooks.ingest(mapClaudeHook({
-      hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
+      hook_event_name: "PostToolUse", session_id: executionSessionId, cwd: projectDirectory,
       tool_name: "Bash", tool_use_id: "canvas-tests", tool_input: { command: "npm test -- canvas" }, tool_response: { exitCode: 0 },
     }));
     if (!implementationTrace.recorded) throw new Error("implementation fact was not recorded");
@@ -252,9 +260,9 @@ describe("structured coding runtime vertical slice", () => {
       const next = runtime.scheduler.next({ projectId: project.projectId, treeId: patched.treeId });
       expect(next?.nodeId).toBe(nodeId);
       const attempt = runtime.executions.startAttempt({ projectId: project.projectId, nodeId,
-        expectedTreeRevisionId: next!.treeRevisionId, sourceTraceEventId: refinementAnswer.eventId });
+        expectedTreeRevisionId: next!.treeRevisionId, sourceTraceEventId: executionSource.eventId });
       const evidence = await runtime.hooks.ingest(mapClaudeHook({
-        hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
+        hook_event_name: "PostToolUse", session_id: executionSessionId, cwd: projectDirectory,
         tool_name: "Bash", tool_use_id: `${nodeId}-tests`, tool_input: { command: "npm test" }, tool_response: { exitCode: 0 },
       }));
       if (!evidence.recorded) throw new Error("verification evidence missing");
@@ -272,6 +280,18 @@ describe("structured coding runtime vertical slice", () => {
       status: "completed", summary: { taskNodes: { total: 5, succeeded: 5 }, branches: { total: 1, verified: 1 } },
     });
     expect(runtime.database.all("SELECT task_node_id FROM execution_attempts WHERE task_node_id = 'canvas'")).toHaveLength(0);
+
+    for (const completedSessionId of new Set([sessionId, executionSessionId])) {
+      expect(await runtime.hooks.ingest(mapClaudeHook({
+        hook_event_name: "Stop", session_id: completedSessionId, cwd: projectDirectory,
+      }))).toMatchObject({ recorded: false, reason: "inactive" });
+      expect(runtime.runtimeProfiles.current(project.projectId, completedSessionId))
+        .toMatchObject({ profile: "conversation", reasonCode: "task_tree:completed" });
+    }
+    expect(runtime.queries.getRuntimeSnapshot(project.projectId))
+      .toMatchObject({ selectedTreeId: patched.treeId, workflow: null });
+    expect(runtime.database.get("SELECT status FROM task_trees WHERE id = ?", patched.treeId))
+      .toEqual({ status: "completed" });
 
     route = "direct_execution";
     const treeCount = runtime.database.get<{ count: number }>(

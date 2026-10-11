@@ -26,7 +26,7 @@ describe("Claude plugin contract", () => {
     const manifest = JSON.parse(await readFile(path.join(root, ".claude-plugin", "plugin.json"), "utf8")) as { name: string; version: string };
     const packageManifest = JSON.parse(await readFile(path.join(repositoryRoot, "package.json"), "utf8")) as { version: string };
     expect(manifest.name).toBe("agent-harness");
-    expect(manifest.version).toBe("0.1.4");
+    expect(manifest.version).toBe("0.1.5");
     expect(packageManifest.version).toBe(manifest.version);
     const mcp = JSON.parse(await readFile(path.join(root, ".mcp.json"), "utf8")) as { mcpServers: Record<string, { command: string; args: string[] }> };
     expect(mcp.mcpServers["agent-harness"]?.args.join(" ")).toContain("${CLAUDE_PLUGIN_ROOT}/runtime/mcp.mjs");

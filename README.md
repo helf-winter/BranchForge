@@ -412,7 +412,7 @@ claude plugin update agent-harness@agent-harness-local --scope user
 claude plugin list --json
 ```
 
-确认列表中的 `version` 为仓库当前版本（本版为 `0.1.4`）后，再关闭并重新打开 Claude Code。`/clear` 只清理对话上下文，不能替代插件/MCP 进程重启。
+确认列表中的 `version` 为仓库当前版本（本版为 `0.1.5`）后，再关闭并重新打开 Claude Code。`/clear` 只清理对话上下文，不能替代插件/MCP 进程重启。
 
 重新启动 Claude Code，然后在任意项目目录运行：
 
@@ -450,3 +450,5 @@ claude plugin validate ./plugin
 完整人工验收见 [docs/acceptance.md](docs/acceptance.md)。当前切片尚不包含完整 AST/符号调用图、Codex Binding 和图形界面。
 
 `0.1.4` 修复原生选项回答证据、纯容器分支的根验证、正常实现对骨架的错误回退、依赖失效后的 Attempt 释放，以及归档/暂停后的残留门禁。回归范围与人工复测步骤见 [工作流死锁回归](docs/harness-deadlock-regressions.md)。
+
+`0.1.5` 修复完成 Final Report 后的 Stop 误报：最终报告、树完成、工作流停用与相关会话的 Profile 收尾在同一事务提交。已完成树保持可查询，无需归档来解除门禁；新请求仍按原生讨论与 Task Tree 规划流程路由。
