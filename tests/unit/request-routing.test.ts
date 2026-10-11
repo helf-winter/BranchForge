@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  detectExplicitRequestRoute,
   resolveJevRequestRoutingConfiguration,
   resolveRuntimeProfile,
   type RequestRouteResult,
@@ -22,6 +23,31 @@ function route(
 }
 
 describe("request routing", () => {
+  it("detects an explicit discuss-confirm-implement contract without an external router", () => {
+    expect(detectExplicitRequestRoute(`
+      我想从零开发一个拼豆图案设计网页。
+      请先和我讨论并完善需求，确认规划之后再开始实现。
+    `)).toEqual({
+      classification: "task_tree_workflow",
+      treeRelation: "unclear",
+      reasonCode: "explicit_intent:discussion_before_implementation",
+    });
+  });
+
+  it("gives an explicit direct-execution escape priority over planning language", () => {
+    expect(detectExplicitRequestRoute("不用建立或修改任务树，直接执行这个小改动。"))
+      .toEqual({
+        classification: "direct_execution",
+        treeRelation: "unclear",
+        reasonCode: "explicit_intent:direct_execution",
+      });
+  });
+
+  it("leaves ambiguous requests to Jev or native Agent judgment", () => {
+    expect(detectExplicitRequestRoute("实现一个拼豆网页")).toBeNull();
+    expect(detectExplicitRequestRoute("解释一下 React Context")).toBeNull();
+  });
+
   it("defaults request routing to disabled without an explicit flag", () => {
     expect(resolveJevRequestRoutingConfiguration({})).toEqual({
       enabled: false,

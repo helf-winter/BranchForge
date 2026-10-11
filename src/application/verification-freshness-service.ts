@@ -1,5 +1,6 @@
 import { newId, nowIso } from "../domain/ids.js";
 import { canonicalJson } from "../domain/trace.js";
+import type { TaskNodeInput } from "../domain/task-tree.js";
 import type { RuntimeDatabase } from "../storage/database.js";
 
 interface WorkflowRow {
@@ -130,23 +131,50 @@ export class VerificationFreshnessService {
       WHERE n.tree_id = ? ORDER BY n.id
     `, workflow.current_revision_id, input.treeId);
     const byId = new Map(nodes.map((node) => [node.id, node]));
-    const impact = new Set(candidateNodeIds.filter((nodeId) => byId.has(nodeId)));
+    const rootId = nodes.find((node) => node.parent_id === null)?.id ?? null;
+    const branchFor = (nodeId: string): string | null => {
+      let current = byId.get(nodeId);
+      while (current?.parent_id && current.parent_id !== rootId) current = byId.get(current.parent_id);
+      return current?.parent_id === rootId ? current.id : null;
+    };
+    const mutationNode = input.fallbackNodeId ? byId.get(input.fallbackNodeId) : undefined;
+    const mutationBody = mutationNode ? JSON.parse(mutationNode.body_json) as TaskNodeInput : undefined;
+    const changedArtifact = input.artifactId
+      ? this.database.get<{ kind: string; locator: string }>("SELECT kind, locator FROM artifacts WHERE id = ?", input.artifactId)
+      : undefined;
+    const extendsPlannedSkeleton = mutationBody?.executionPhase === "implementation" && changedArtifact?.kind === "file"
+      && (mutationBody.expectedOutputs ?? []).some((output) => output.replaceAll("\\", "/") === changedArtifact.locator);
+    const skeletonCreators = extendsPlannedSkeleton ? new Set(this.database.all<{ task_node_id: string }>(`
+      SELECT task_node_id FROM task_node_artifact_links WHERE tree_revision_id = ? AND artifact_id = ? AND relation_type = 'creates'
+    `, workflow.current_revision_id, input.artifactId!).map((row) => row.task_node_id)) : new Set<string>();
+    // Filling a planned implementation into a created skeleton file is normal
+    // forward progress, not evidence that the shared skeleton was broken. A
+    // contract change or an out-of-scope mutation still invalidates its owners.
+    const impact = new Set(candidateNodeIds.filter((nodeId) => {
+      const node = byId.get(nodeId);
+      if (!node) return false;
+      const body = JSON.parse(node.body_json) as TaskNodeInput;
+      return !(skeletonCreators.has(nodeId) && body.executionPhase === "skeleton"
+        && branchFor(nodeId) === branchFor(mutationNode!.id));
+    }));
     const taskRelations = this.database.all<{ from_node_id: string; to_node_id: string; kind: string }>(`
       SELECT from_node_id, to_node_id, kind FROM task_relation_edges
       WHERE tree_revision_id = ?
     `, workflow.current_revision_id);
-    const symmetricRelations = new Set(["exchanges_data_with", "data_exchange", "shares_artifact_with", "shares_contract", "coordinates_with"]);
+    for (const node of nodes) {
+      const body = JSON.parse(node.body_json) as TaskNodeInput;
+      for (const dependency of body.dependencies ?? []) {
+        taskRelations.push({ from_node_id: node.id, to_node_id: dependency, kind: "depends_on" });
+      }
+    }
     let taskImpactExpanded = true;
     while (taskImpactExpanded) {
       taskImpactExpanded = false;
       for (const relation of taskRelations) {
-        if (impact.has(relation.to_node_id) && !impact.has(relation.from_node_id)) {
+        // Communication edges describe topology, not evidence dependencies. Shared
+        // assets/contracts propagate through their actual Artifact links instead.
+        if (relation.kind === "depends_on" && impact.has(relation.to_node_id) && !impact.has(relation.from_node_id)) {
           impact.add(relation.from_node_id);
-          taskImpactExpanded = true;
-        }
-        if (symmetricRelations.has(relation.kind)
-          && impact.has(relation.from_node_id) && !impact.has(relation.to_node_id)) {
-          impact.add(relation.to_node_id);
           taskImpactExpanded = true;
         }
       }
@@ -161,12 +189,6 @@ export class VerificationFreshnessService {
         parentId = parent.parent_id;
       }
     }
-    const rootId = nodes.find((node) => node.parent_id === null)?.id ?? null;
-    const branchFor = (nodeId: string): string | null => {
-      let current = byId.get(nodeId);
-      while (current?.parent_id && current.parent_id !== rootId) current = byId.get(current.parent_id);
-      return current?.parent_id === rootId ? current.id : null;
-    };
     const initiallyImpactedBranches = new Set([...impact].map(branchFor).filter((value): value is string => Boolean(value)));
     const initiallyImpactedPhases = new Set([...impact].map((nodeId) => {
       const body = JSON.parse(byId.get(nodeId)!.body_json) as { executionPhase?: string };
@@ -195,7 +217,12 @@ export class VerificationFreshnessService {
             AND a.task_node_id IN (${impactPlaceholders})
         `, input.projectId, input.treeId, ...impact).filter((attempt) => {
           const body = JSON.parse(attempt.body_json) as { executionPhase?: string };
-          return (executionPhaseRank.get(body.executionPhase ?? "") ?? -1) > earliestImpactedPhaseRank;
+          const staleDependency = taskRelations.some((relation) => relation.kind === "depends_on"
+            && relation.from_node_id === attempt.task_node_id
+            && relation.to_node_id !== attempt.task_node_id
+            && impact.has(relation.to_node_id)
+            && byId.get(relation.to_node_id)?.status === "succeeded");
+          return staleDependency || (executionPhaseRank.get(body.executionPhase ?? "") ?? -1) > earliestImpactedPhaseRank;
         })
       : [];
     const createdAt = nowIso();

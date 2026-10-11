@@ -30,8 +30,7 @@ function pinBeanDocument(branchTitle = "Canvas editor"): TaskTreeDocument {
       },
       {
         id: "canvas", parentId: "root", title: branchTitle,
-        children: ["canvas-skeleton", "canvas-implementation"], executionPhase: "verification",
-        requiredEvidence: [{ key: "branch-test", description: "canvas integration test" }],
+        children: ["canvas-skeleton", "canvas-implementation", "canvas-verify"],
       },
       {
         id: "canvas-skeleton", parentId: "canvas", title: "Wire canvas contract", children: [],
@@ -46,6 +45,13 @@ function pinBeanDocument(branchTitle = "Canvas editor"): TaskTreeDocument {
         acceptanceCriteria: ["canvas tests pass"], unresolvedQuestions: [], unresolvedDecisions: [],
         dependencies: ["canvas-skeleton"], requiredEvidence: [{ key: "canvas-test", description: "canvas tests pass" }],
         executionPhase: "implementation", stopDecompositionReason: "one independently testable feature",
+      },
+      {
+        id: "canvas-verify", parentId: "canvas", title: "Verify canvas", children: [],
+        objectives: ["Verify canvas integration"], expectedOutputs: ["test report"],
+        acceptanceCriteria: ["canvas tests pass"], unresolvedQuestions: [], unresolvedDecisions: [],
+        dependencies: ["canvas-implementation"], requiredEvidence: [{ key: "branch-test", description: "canvas integration test" }],
+        executionPhase: "verification", stopDecompositionReason: "one independently verifiable branch",
       },
     ],
     relations: [{ fromNodeId: "canvas-implementation", toNodeId: "canvas-skeleton", kind: "depends_on" }],
@@ -120,7 +126,9 @@ describe("structured coding runtime vertical slice", () => {
       projectId: project.projectId, requestTitle: "Build PinBean editor", recommendation: "new_tree",
     });
     const affiliationAnswer = await runtime.hooks.ingest(mapClaudeHook({
-      hook_event_name: "UserPromptSubmit", session_id: sessionId, cwd: projectDirectory, prompt: "创建新任务树",
+      hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
+      tool_name: "AskUserQuestion", tool_use_id: "affiliation-click",
+      tool_input: { questions: [{ question: "How to proceed?" }] }, tool_response: { answers: { "How to proceed?": "创建新任务树" } },
     }));
     if (!affiliationAnswer.recorded) throw new Error("affiliation answer was not recorded");
     const affiliation = await runtime.affiliations.resolve({
@@ -210,6 +218,14 @@ describe("structured coding runtime vertical slice", () => {
       projectId: project.projectId, nodeId: implementation!.nodeId, expectedTreeRevisionId: implementation!.treeRevisionId,
       sourceTraceEventId: refinementAnswer.eventId,
     });
+    await runtime.hooks.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
+      tool_name: "Edit", tool_use_id: "implement-canvas",
+      tool_input: { file_path: "src/canvas.ts", old_string: "export const canvas = true", new_string: "export const canvas = () => 'beads'" },
+      tool_response: { ok: true },
+    }));
+    expect(runtime.database.get("SELECT status FROM task_nodes WHERE id = 'canvas-skeleton'")).toEqual({ status: "succeeded" });
+    expect(runtime.database.get("SELECT stage FROM workflow_states WHERE tree_id = ?", patched.treeId)).toEqual({ stage: "branch_implementation" });
     const implementationTrace = await runtime.hooks.ingest(mapClaudeHook({
       hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
       tool_name: "Bash", tool_use_id: "canvas-tests", tool_input: { command: "npm test -- canvas" }, tool_response: { exitCode: 0 },
@@ -230,7 +246,32 @@ describe("structured coding runtime vertical slice", () => {
       projectId: project.projectId, treeId: patched.treeId, workflowRevision: branchWorkflow.revision,
     });
     expect(runtime.scheduler.next({ projectId: project.projectId, treeId: patched.treeId }))
-      .toMatchObject({ nodeId: "canvas", phase: "verification", activeBranchNodeId: "canvas" });
+      .toMatchObject({ nodeId: "canvas-verify", phase: "verification", activeBranchNodeId: "canvas" });
+
+    for (const [nodeId, key] of [["canvas-verify", "branch-test"], ["root", "root-test"]] as const) {
+      const next = runtime.scheduler.next({ projectId: project.projectId, treeId: patched.treeId });
+      expect(next?.nodeId).toBe(nodeId);
+      const attempt = runtime.executions.startAttempt({ projectId: project.projectId, nodeId,
+        expectedTreeRevisionId: next!.treeRevisionId, sourceTraceEventId: refinementAnswer.eventId });
+      const evidence = await runtime.hooks.ingest(mapClaudeHook({
+        hook_event_name: "PostToolUse", session_id: sessionId, cwd: projectDirectory,
+        tool_name: "Bash", tool_use_id: `${nodeId}-tests`, tool_input: { command: "npm test" }, tool_response: { exitCode: 0 },
+      }));
+      if (!evidence.recorded) throw new Error("verification evidence missing");
+      runtime.executions.attachEvidence({ projectId: project.projectId, attemptId: attempt.attemptId, requiredEvidenceKey: key, traceEventId: evidence.eventId });
+      runtime.executions.beginVerification({ projectId: project.projectId, attemptId: attempt.attemptId, expectedStatus: "running" });
+      expect(runtime.evaluations.evaluateAttempt({ projectId: project.projectId, attemptId: attempt.attemptId, proposedVerdict: "succeeded", riskSummary: null }))
+        .toMatchObject({ transition: { applied: true } });
+      const current = runtime.queries.getRuntimeSnapshot(project.projectId).workflow!;
+      expect(runtime.workflowPhases.evaluate({ projectId: project.projectId, treeId: patched.treeId, workflowRevision: current.revision }))
+        .toMatchObject({ status: "passed", nextStage: nodeId === "root" ? "final_report" : "root_verification" });
+    }
+    const finalWorkflow = runtime.queries.getRuntimeSnapshot(project.projectId).workflow!;
+    expect(runtime.finalReports.finalize({ projectId: project.projectId, treeId: patched.treeId,
+      workflowRevision: finalWorkflow.revision, idempotencyKey: "finish-pinbean" })).toMatchObject({
+      status: "completed", summary: { taskNodes: { total: 5, succeeded: 5 }, branches: { total: 1, verified: 1 } },
+    });
+    expect(runtime.database.all("SELECT task_node_id FROM execution_attempts WHERE task_node_id = 'canvas'")).toHaveLength(0);
 
     route = "direct_execution";
     const treeCount = runtime.database.get<{ count: number }>(

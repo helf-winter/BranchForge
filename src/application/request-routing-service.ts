@@ -7,6 +7,7 @@ import type { HarnessErrorCode } from "../domain/errors.js";
 import { HarnessError } from "../domain/errors.js";
 import { newId, nowIso } from "../domain/ids.js";
 import {
+  detectExplicitRequestRoute,
   resolveRuntimeProfile,
   type JevRequestRoutingConfiguration,
   type RequestRouteClassification,
@@ -20,6 +21,10 @@ export interface RequestRouter {
   route(snapshot: RequestRouteSnapshot): Promise<JevRequestRouteResponse>;
 }
 
+type RouteResponse = Omit<JevRequestRouteResponse, "usage"> & {
+  usage: JevRequestRouteResponse["usage"] | null;
+};
+
 export interface RequestRouteDecisionView {
   id: string | null;
   projectId: string | null;
@@ -31,7 +36,7 @@ export interface RequestRouteDecisionView {
   probabilities: Partial<Record<RequestRouteClassification, number>>;
   reasonCodes: string[];
   disposition: RouteDisposition;
-  provider: "typesafe_jev";
+  provider: "typesafe_jev" | "deterministic_rules";
   modelRequested: string;
   modelResolved: string | null;
   usage: { inputTokens: number; outputTokens: number } | null;
@@ -53,7 +58,7 @@ interface RouteRow {
   probabilities_json: string;
   reason_codes_json: string;
   disposition: RouteDisposition;
-  provider: "typesafe_jev";
+  provider: "typesafe_jev" | "deterministic_rules";
   model_requested: string;
   model_resolved: string | null;
   input_tokens: number | null;
@@ -112,7 +117,7 @@ export class RequestRoutingService {
     private readonly database: RuntimeDatabase,
     private readonly config: JevRequestRoutingConfiguration,
     private readonly router: RequestRouter,
-    private readonly policyVersion = "request-routing-v1",
+    private readonly policyVersion = "request-routing-v2",
   ) {}
 
   async route(input: {
@@ -144,9 +149,23 @@ export class RequestRoutingService {
       if (existing) return viewFromRow(existing);
     }
 
-    let response: JevRequestRouteResponse | null = null;
+    const explicitRoute = detectExplicitRequestRoute(prompt);
+    let response: RouteResponse | null = explicitRoute
+      ? {
+          classification: explicitRoute.classification,
+          treeRelation: explicitRoute.treeRelation,
+          confidence: 1,
+          probabilities: { [explicitRoute.classification]: 1 },
+          reasonCodes: [explicitRoute.reasonCode],
+          model: "deterministic-explicit-intent-v1",
+          usage: null,
+          latencyMs: 0,
+        }
+      : null;
     let fallbackReason: string | null = null;
-    if (!this.config.enabled) {
+    if (explicitRoute) {
+      // Explicit user direction is authoritative and does not require an external classifier.
+    } else if (!this.config.enabled) {
       fallbackReason = "routing_disabled";
     } else if (this.config.readiness !== "ready") {
       fallbackReason = "routing_misconfigured";
@@ -171,7 +190,7 @@ export class RequestRoutingService {
           confidence,
           probabilities: response?.probabilities ?? {},
           reasonCodes: response?.reasonCodes ?? [],
-          provider: "typesafe_jev",
+          provider: explicitRoute ? "deterministic_rules" : "typesafe_jev",
           model: response?.model ?? this.config.model,
           fallbackReason: null,
         },
@@ -189,8 +208,8 @@ export class RequestRoutingService {
       probabilities: response?.probabilities ?? {},
       reasonCodes: response?.reasonCodes ?? [fallbackReason ?? "routing_unavailable"],
       disposition: resolution.disposition,
-      provider: "typesafe_jev",
-      modelRequested: this.config.model,
+      provider: explicitRoute ? "deterministic_rules" : "typesafe_jev",
+      modelRequested: explicitRoute ? "deterministic-explicit-intent-v1" : this.config.model,
       modelResolved: response?.model ?? null,
       usage: response?.usage ?? null,
       latencyMs: response?.latencyMs ?? null,

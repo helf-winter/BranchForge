@@ -1,8 +1,8 @@
 import { HarnessError } from "./errors.js";
 
-export type TaskAffiliationRecommendation = "new_tree" | "merge";
-export type TaskAffiliationChoice = "new_tree" | "merge" | "pause";
-export type TaskAffiliationStatus = "pending" | "new_tree" | "merged" | "paused";
+export type TaskAffiliationRecommendation = "new_tree" | "merge" | "direct_execution" | "pause";
+export type TaskAffiliationChoice = "direct_execution" | "new_tree" | "merge" | "pause";
+export type TaskAffiliationStatus = "pending" | "direct_execution" | "new_tree" | "merged" | "paused";
 
 export function validateAffiliationRecommendation(input: {
   recommendation: TaskAffiliationRecommendation;
@@ -11,8 +11,8 @@ export function validateAffiliationRecommendation(input: {
   if (input.recommendation === "merge" && !input.recommendedTreeId?.trim()) {
     throw new HarnessError("invalid_input", "a merge recommendation requires a recommended Task Tree");
   }
-  if (input.recommendation === "new_tree" && input.recommendedTreeId) {
-    throw new HarnessError("invalid_input", "a new-tree recommendation cannot target an existing Task Tree");
+  if (input.recommendation !== "merge" && input.recommendedTreeId) {
+    throw new HarnessError("invalid_input", "only a merge recommendation can target an existing Task Tree");
   }
 }
 

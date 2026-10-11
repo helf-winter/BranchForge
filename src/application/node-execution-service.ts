@@ -1,4 +1,5 @@
 import { HarnessError } from "../domain/errors.js";
+import { loadNodeCompletion } from "./node-completion.js";
 import type { ExecutionAttemptStatus } from "../domain/execution.js";
 import { newId, nowIso } from "../domain/ids.js";
 import type { RequiredEvidence, TaskNodeInput } from "../domain/task-tree.js";
@@ -252,6 +253,7 @@ export class NodeExecutionService {
   }
 
   private requireSucceededDependencies(treeId: string, dependencyIds: string[]): void {
+    const complete = loadNodeCompletion(this.database, treeId);
     for (const dependencyId of dependencyIds) {
       const dependency = this.database.get<{ status: string }>(`
         SELECT n.status
@@ -260,21 +262,22 @@ export class NodeExecutionService {
         JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
         WHERE n.id = ? AND n.tree_id = ?
       `, dependencyId, treeId);
-      if (dependency?.status !== "succeeded") {
+      if (!dependency || !complete(dependencyId)) {
         throw new HarnessError("attempt_not_executable", `dependency ${dependencyId} has not succeeded`);
       }
     }
   }
 
   private requireSucceededCurrentChildren(treeId: string, parentNodeId: string): void {
-    const incompleteChild = this.database.get<{ id: string; status: string }>(`
+    const complete = loadNodeCompletion(this.database, treeId);
+    const incompleteChild = this.database.all<{ id: string; status: string }>(`
       SELECT n.id, n.status
       FROM task_nodes n
       JOIN task_trees t ON t.id = n.tree_id
       JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
-      WHERE n.tree_id = ? AND n.parent_id = ? AND n.status <> 'succeeded'
-      ORDER BY n.id LIMIT 1
-    `, treeId, parentNodeId);
+      WHERE n.tree_id = ? AND n.parent_id = ?
+      ORDER BY n.id
+    `, treeId, parentNodeId).find((child) => !complete(child.id));
     if (incompleteChild) {
       throw new HarnessError(
         "attempt_not_executable",

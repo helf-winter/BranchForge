@@ -1,6 +1,7 @@
 export interface Migration {
   version: number;
   sql: string;
+  rebuildReferencedTable?: boolean;
 }
 
 export const migrations: Migration[] = [{
@@ -1443,5 +1444,34 @@ export const migrations: Migration[] = [{
         OR COALESCE(NEW.source_trace_event_id, '') <> COALESCE(OLD.source_trace_event_id, '')
         OR NEW.resolved_at IS NULL
       BEGIN SELECT RAISE(ABORT, 'invalid Task Tree approval reference transition'); END;
+  `,
+}, {
+  version: 25,
+  rebuildReferencedTable: true,
+  sql: `
+    CREATE TABLE task_affiliation_decisions_next (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      request_trace_event_id TEXT NOT NULL UNIQUE REFERENCES trace_events(id) ON DELETE RESTRICT,
+      request_title TEXT NOT NULL,
+      candidate_query TEXT NOT NULL,
+      candidate_snapshot_json TEXT NOT NULL,
+      recommendation TEXT NOT NULL CHECK(recommendation IN ('new_tree', 'merge', 'direct_execution', 'pause')),
+      recommended_tree_id TEXT REFERENCES task_trees(id) ON DELETE SET NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'direct_execution', 'new_tree', 'merged', 'paused')),
+      confirmation_prompt_id TEXT NOT NULL UNIQUE REFERENCES runtime_confirmation_prompts(id) ON DELETE RESTRICT,
+      runtime_action_id TEXT NOT NULL UNIQUE REFERENCES runtime_actions(id) ON DELETE RESTRICT,
+      answer_trace_event_id TEXT REFERENCES trace_events(id) ON DELETE RESTRICT,
+      resolved_tree_id TEXT REFERENCES task_trees(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+    INSERT INTO task_affiliation_decisions_next SELECT * FROM task_affiliation_decisions;
+    DROP TABLE task_affiliation_decisions;
+    ALTER TABLE task_affiliation_decisions_next RENAME TO task_affiliation_decisions;
+    CREATE UNIQUE INDEX one_pending_task_affiliation_per_project
+      ON task_affiliation_decisions(project_id) WHERE status = 'pending';
+    CREATE INDEX task_affiliation_history_idx
+      ON task_affiliation_decisions(project_id, created_at DESC, id DESC);
   `,
 }];

@@ -40,6 +40,41 @@ const input = {
 };
 
 describe("RequestRoutingService", () => {
+  it("accepts explicit structured intent deterministically when Jev routing is disabled", async () => {
+    const { database, config } = await fixture();
+    const provider = { route: vi.fn() };
+    const service = new RequestRoutingService(database, config, provider);
+    await expect(service.route({
+      ...input,
+      prompt: "请先和我讨论并完善需求，确认规划之后再开始实现。",
+    })).resolves.toMatchObject({
+      classification: "task_tree_workflow",
+      disposition: "accepted",
+      provider: "deterministic_rules",
+      confidence: 1,
+      fallbackReason: null,
+      reasonCodes: ["explicit_intent:discussion_before_implementation"],
+    });
+    expect(provider.route).not.toHaveBeenCalled();
+    database.close();
+  });
+
+  it("lets explicit direct execution override an available Jev provider", async () => {
+    const { database, config } = await fixture({ HARNESS_JEV_ROUTING_ENABLED: "true", TYPESAFE_API_KEY: "secret" });
+    const provider = { route: vi.fn(async () => providerResult("task_tree_workflow", 0.99)) };
+    const service = new RequestRoutingService(database, config, provider);
+    await expect(service.route({
+      ...input,
+      prompt: "不用建立或修改任务树，直接执行这个小改动。",
+    })).resolves.toMatchObject({
+      classification: "direct_execution",
+      disposition: "accepted",
+      provider: "deterministic_rules",
+    });
+    expect(provider.route).not.toHaveBeenCalled();
+    database.close();
+  });
+
   it.each([
     [{}, "disabled"],
     [{ HARNESS_JEV_ROUTING_ENABLED: "true" }, "misconfigured"],

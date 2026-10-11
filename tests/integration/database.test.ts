@@ -15,16 +15,57 @@ async function databasePath(): Promise<string> {
 afterEach(async () => Promise.all(dirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));
 
 describe("RuntimeDatabase", () => {
+  it("upgrades populated v24 affiliation records without nulling profile or authoring references", async () => {
+    const filename = await databasePath();
+    const legacy = new DatabaseSync(filename);
+    legacy.exec("PRAGMA foreign_keys = ON; CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    for (const migration of migrations.filter(({ version }) => version <= 24)) {
+      legacy.exec(migration.sql);
+      legacy.prepare("INSERT INTO schema_migrations VALUES (?, 'now')").run(migration.version);
+    }
+    legacy.exec(`
+      INSERT INTO projects (id, canonical_path, created_at, updated_at) VALUES ('p', '/project', 'now', 'now');
+      INSERT INTO task_trees (id, project_id, title, status, created_at, updated_at) VALUES ('t', 'p', 'Tree', 'draft', 'now', 'now');
+      INSERT INTO task_tree_revisions (id, tree_id, revision, document_json, created_at) VALUES ('r', 't', 1, '{}', 'now');
+      UPDATE task_trees SET current_revision_id = 'r' WHERE id = 't';
+      INSERT INTO trace_events (id, project_id, session_id, event_name, payload_json, occurred_at, idempotency_key)
+        VALUES ('trace', 'p', 'session', 'UserPromptSubmit', '{}', 'now', 'trace');
+      INSERT INTO runtime_actions (id, project_id, kind, input_json, result_json, created_at) VALUES ('action', 'p', 'affiliation', '{}', '{}', 'now');
+      INSERT INTO runtime_confirmation_prompts (id, project_id, scope_id, prompt, status, created_at) VALUES ('prompt', 'p', 'p', 'Choice?', 'pending', 'now');
+      INSERT INTO task_affiliation_decisions (id, project_id, request_trace_event_id, request_title, candidate_query, candidate_snapshot_json,
+        recommendation, status, confirmation_prompt_id, runtime_action_id, created_at)
+        VALUES ('decision', 'p', 'trace', 'Task', '', '[]', 'new_tree', 'pending', 'prompt', 'action', 'now');
+      INSERT INTO runtime_profile_states (project_id, session_id, profile, source_affiliation_decision_id, reason_code, updated_at)
+        VALUES ('p', 'session', 'structured_coding', 'decision', 'test', 'now');
+      INSERT INTO runtime_profile_transitions (id, project_id, session_id, next_profile, source_affiliation_decision_id, reason_code, created_at)
+        VALUES ('transition', 'p', 'session', 'structured_coding', 'decision', 'test', 'now');
+      INSERT INTO task_tree_authoring_commands (id, project_id, tree_id, affiliation_decision_id, command_kind, idempotency_key, input_hash,
+        base_revision_id, result_revision_id, source_session_id, source_trace_event_id, created_at)
+        VALUES ('authoring', 'p', 't', 'decision', 'create_draft', 'command', 'hash', 'r', 'r', 'session', 'trace', 'now');
+    `);
+    legacy.close();
+    const upgraded = new RuntimeDatabase(filename);
+    expect(upgraded.all("PRAGMA foreign_key_check")).toEqual([]);
+    expect(upgraded.get("PRAGMA foreign_keys")).toEqual({ foreign_keys: 1 });
+    for (const table of ["runtime_profile_states", "runtime_profile_transitions"]) {
+      expect(upgraded.get(`SELECT source_affiliation_decision_id FROM ${table}`)).toEqual({ source_affiliation_decision_id: "decision" });
+    }
+    expect(upgraded.get("SELECT affiliation_decision_id FROM task_tree_authoring_commands")).toEqual({ affiliation_decision_id: "decision" });
+    expect(upgraded.get("SELECT recommendation, status FROM task_affiliation_decisions")).toEqual({ recommendation: "new_tree", status: "pending" });
+    upgraded.run("UPDATE task_affiliation_decisions SET recommendation = 'pause' WHERE id = 'decision'");
+    expect(() => upgraded.run("UPDATE task_affiliation_decisions SET project_id = 'missing' WHERE id = 'decision'")).toThrow();
+    upgraded.close();
+  });
   it("applies migrations once and persists data across reopen", async () => {
     const filename = await databasePath();
     const first = new RuntimeDatabase(filename);
-    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }]);
+    expect(first.all<{ version: number }>("SELECT version FROM schema_migrations")).toEqual(migrations.map(({ version }) => ({ version })));
     first.run("INSERT INTO projects (id, canonical_path, created_at, updated_at) VALUES (?, ?, ?, ?)", "p1", "/work/a", "2026-01-01", "2026-01-01");
     first.close();
 
     const reopened = new RuntimeDatabase(filename);
     expect(reopened.get<{ canonical_path: string }>("SELECT canonical_path FROM projects WHERE id = ?", "p1")).toEqual({ canonical_path: "/work/a" });
-    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(24);
+    expect(reopened.all("SELECT version FROM schema_migrations")).toHaveLength(migrations.length);
     reopened.close();
   });
 

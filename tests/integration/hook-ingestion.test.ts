@@ -241,10 +241,7 @@ describe("Claude hook ingestion", () => {
       blocked: false,
       directive: {
         kind: "context",
-        context: [
-          "Harness runtime profile: structured_coding.",
-          "Establish and obtain native approval for a first-class Task Tree revision before project mutation.",
-        ].join("\n"),
+        context: expect.stringMatching(/task-tree-planning[\s\S]*harness_propose_task_affiliation/),
       },
     });
     expect(await service.ingest(event)).toMatchObject({
@@ -254,6 +251,59 @@ describe("Claude hook ingestion", () => {
     });
     expect(database.all("SELECT id FROM trace_events WHERE session_id = 'profile-session'")).toHaveLength(1);
     expect(database.all("SELECT id FROM runtime_profile_transitions WHERE session_id = 'profile-session'")).toHaveLength(1);
+    database.close();
+  });
+
+  it("rewakes one ignored structured-planning turn before it stops without Task affiliation", async () => {
+    const { directory, database } = await fixture();
+    const projects = new ProjectIdentityService(database);
+    const config = resolveJevRequestRoutingConfiguration({});
+    const provider = { route: async () => { throw new Error("external routing must not run"); } };
+    const profiles = new RuntimeProfileService(
+      database,
+      projects,
+      new RequestRoutingService(database, config, provider),
+      config,
+    );
+    const service = new HookIngestionService(database, projects, undefined, undefined, profiles);
+
+    await service.ingest(mapClaudeHook({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "structured-session",
+      cwd: directory,
+      prompt: "请先和我讨论并完善需求，确认规划之后再开始实现。",
+      timestamp: "2030-01-01T00:00:00.000Z",
+    }));
+    const firstStop = await service.ingest(mapClaudeHook({
+      hook_event_name: "Stop",
+      session_id: "structured-session",
+      cwd: directory,
+      timestamp: "2030-01-01T00:01:00.000Z",
+    }));
+    expect(firstStop).toMatchObject({
+      recorded: true,
+      blocked: false,
+      directive: {
+        kind: "stop",
+        reason: expect.stringMatching(/task-tree-planning[\s\S]*harness_propose_task_affiliation/),
+      },
+    });
+    expect(database.all(`
+      SELECT id FROM trace_events
+      WHERE session_id = 'structured-session' AND event_name = 'workflow_activation_required'
+    `)).toHaveLength(1);
+
+    const repeatedStop = await service.ingest(mapClaudeHook({
+      hook_event_name: "Stop",
+      session_id: "structured-session",
+      cwd: directory,
+      timestamp: "2030-01-01T00:02:00.000Z",
+    }));
+    expect(repeatedStop).toEqual({ recorded: false, reason: "inactive" });
+    expect(database.all(`
+      SELECT id FROM trace_events
+      WHERE session_id = 'structured-session' AND event_name = 'workflow_activation_required'
+    `)).toHaveLength(1);
     database.close();
   });
 
@@ -283,6 +333,38 @@ describe("Claude hook ingestion", () => {
     )?.status).toBe("pending");
     expect(database.all("SELECT id FROM task_trees")).toEqual([]);
     database.close();
+  });
+
+  it("records native question clicks without a tree and resolves them without another typed prompt", async () => {
+    const { directory, database, service } = await fixture();
+    const project = await new ProjectIdentityService(database).resolve(directory, "persist");
+    const affiliations = new TaskAffiliationService(database);
+    const proposal = affiliations.propose({ projectId: project.projectId, requestTitle: "Pause work", recommendation: "pause" });
+    const result = await service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "native-choice", cwd: directory,
+      tool_name: "AskUserQuestion", tool_use_id: "question-choice",
+      tool_input: { questions: [{ question: "Continue?", options: [{ label: "Pause" }] }] },
+      tool_response: { answers: { "Continue?": "Pause" } },
+    }));
+    expect(result).toMatchObject({ recorded: true, violation: false, blocked: false });
+    if (!result.recorded) throw new Error("native answer not recorded");
+    expect(await affiliations.resolve({ projectId: project.projectId, decisionId: proposal.decisionId, choice: "pause", answerTraceEventId: result.eventId }))
+      .toMatchObject({ status: "paused" });
+    expect(database.all("SELECT id FROM task_trees")).toHaveLength(0);
+  });
+
+  it("does not reopen structured planning on Stop or block verification after archiving the selected tree", async () => {
+    const { directory, database, service } = await fixture();
+    const { project, revision: tree } = await nativePlanTree(directory, database);
+    setProfile(database, project.projectId, "archive-session", "structured_coding");
+    new TaskTreeService(database).archiveTaskTree({ projectId: project.projectId, treeId: tree.treeId });
+    const stop = await service.ingest(mapClaudeHook({ hook_event_name: "Stop", session_id: "archive-session", cwd: directory }));
+    expect(stop).not.toHaveProperty("directive");
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "archive-session", cwd: directory,
+      tool_name: "Bash", tool_use_id: "verify-archived", tool_input: { command: "npm run build" },
+    }))).toMatchObject({ recorded: true, blocked: false, violation: false });
+    expect(database.all("SELECT id FROM task_affiliation_decisions")).toHaveLength(0);
   });
 
   it("persists an immutable Execution Context snapshot and carries model state across one Project run", async () => {

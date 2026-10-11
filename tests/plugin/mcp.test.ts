@@ -89,7 +89,7 @@ describe("Harness MCP binding", () => {
     });
     expect(tools.find((tool) => tool.name === "harness_propose_task_affiliation")?.inputSchema).toMatchObject({
       required: expect.arrayContaining(["requestTitle", "recommendation"]),
-      properties: { recommendation: { enum: ["new_tree", "merge"] }, recommendedTreeId: { type: "string" } },
+      properties: { recommendation: { enum: ["new_tree", "merge", "direct_execution", "pause"] }, recommendedTreeId: { type: "string" } },
     });
     expect(tools.find((tool) => tool.name === "harness_resolve_task_affiliation")?.inputSchema).toMatchObject({
       required: expect.arrayContaining(["decisionId", "choice", "answerTraceEventId"]),
@@ -290,8 +290,8 @@ describe("Harness MCP binding", () => {
       INSERT INTO trace_events (
         id, project_id, tree_id, session_id, event_name, payload_json,
         execution_context_json, occurred_at, idempotency_key
-      ) VALUES (?, ?, ?, 'session-private', 'UserPromptSubmit', '{}', '{}', '9999-01-01', ?)
-    `, id, identity.projectId, treeId, id);
+      ) VALUES (?, ?, ?, 'session-private', 'UserPromptSubmit', '{}', '{}', ?, ?)
+    `, id, identity.projectId, treeId, id === "affiliation-answer" ? proposal.createdAt as string : "9999-01-01", id);
     addAnswer("affiliation-answer");
     const affiliation = parse(await client.callTool({
       name: "harness_resolve_task_affiliation",
@@ -362,7 +362,7 @@ describe("Harness MCP binding", () => {
       name: "harness_prepare_task_tree_approval",
       arguments: {
         cwd: project, treeId: patched.treeId, treeRevisionId: patched.revisionId,
-        readinessResultId: readiness.resultId, sourceUserMessageTraceEventId: "approval-answer",
+        readinessResultId: readiness.resultId, sourceUserMessageTraceEventId: "affiliation-answer",
       },
     }));
     expect(approval).toMatchObject({

@@ -1,4 +1,5 @@
 import { HarnessError } from "../domain/errors.js";
+import { findUserDecisionEvidence } from "./user-decision-evidence.js";
 import { newId, nowIso } from "../domain/ids.js";
 import {
   hashTaskTreeAuthoringPayload,
@@ -54,10 +55,7 @@ export class TaskTreeDraftService {
       throw new HarnessError("confirmation_required", "Task Tree authoring requires a resolved new-tree or merge affiliation");
     }
     const trace = affiliation.answer_trace_event_id
-      ? this.database.get<{ session_id: string }>(
-        "SELECT session_id FROM trace_events WHERE id = ? AND project_id = ? AND event_name = 'UserPromptSubmit'",
-        affiliation.answer_trace_event_id, input.projectId,
-      )
+      ? findUserDecisionEvidence(this.database, input.projectId, affiliation.answer_trace_event_id)
       : undefined;
     if (!trace || trace.session_id !== input.sessionId) {
       throw new HarnessError("evidence_scope_mismatch", "authoring Session must match the confirmed affiliation answer");
@@ -124,11 +122,8 @@ export class TaskTreeDraftService {
     });
     const existing = this.idempotent(input.projectId, input.idempotencyKey, inputHash);
     if (existing) return existing;
-    const trace = this.database.get<{ session_id: string }>(`
-      SELECT session_id FROM trace_events
-      WHERE id = ? AND project_id = ? AND tree_id = ? AND event_name = 'UserPromptSubmit'
-    `, operation.sourceUserMessageTraceEventId, input.projectId, input.treeId);
-    if (!trace || trace.session_id !== input.sessionId) {
+    const trace = findUserDecisionEvidence(this.database, input.projectId, operation.sourceUserMessageTraceEventId);
+    if (!trace || trace.tree_id !== input.treeId || trace.session_id !== input.sessionId) {
       throw new HarnessError("evidence_scope_mismatch", "patch source Trace must belong to the authoring Session and Task Tree");
     }
 

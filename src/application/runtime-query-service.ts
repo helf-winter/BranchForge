@@ -103,14 +103,21 @@ export class RuntimeQueryService {
     const state = this.database.get<{ selected_tree_id: string | null; selected_node_id: string | null }>(
       "SELECT selected_tree_id, selected_node_id FROM runtime_states WHERE project_id = ?", projectId,
     );
-    const workflow = this.database.get<{ tree_id: string; stage: string; revision: number; active_branch_node_id: string | null }>(
-      "SELECT tree_id, stage, revision, active_branch_node_id FROM workflow_states WHERE project_id = ? AND active = 1", projectId,
-    );
+    const workflow = this.database.get<{
+      tree_id: string; stage: string; revision: number; active_branch_node_id: string | null; current_revision_id: string;
+    }>(`
+      SELECT w.tree_id, w.stage, w.revision, w.active_branch_node_id, t.current_revision_id
+      FROM workflow_states w JOIN task_trees t ON t.id = w.tree_id
+      WHERE w.project_id = ? AND w.active = 1
+    `, projectId);
     const confirmation = this.database.get<{ id: string; scope_id: string; prompt: string }>(
       "SELECT id, scope_id, prompt FROM runtime_confirmation_prompts WHERE project_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1", projectId,
     );
     const readiness = workflow
-      ? this.database.get<{ blockers_json: string }>("SELECT blockers_json FROM plan_readiness_results WHERE tree_id = ? ORDER BY created_at DESC LIMIT 1", workflow.tree_id)
+      ? this.database.get<{ blockers_json: string }>(`
+          SELECT blockers_json FROM plan_readiness_results
+          WHERE tree_id = ? AND revision_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
+        `, workflow.tree_id, workflow.current_revision_id)
       : undefined;
     const activeAttemptCount = this.database.get<{ count: number }>(
       "SELECT count(*) AS count FROM execution_attempts WHERE project_id = ? AND status IN ('running', 'verifying')",
@@ -129,15 +136,16 @@ export class RuntimeQueryService {
     const latestSkeletonGate = workflow
       ? this.database.get<{ id: string; status: string; tree_revision_id: string; blockers_json: string; created_at: string }>(`
           SELECT id, status, tree_revision_id, blockers_json, created_at
-          FROM skeleton_gate_results WHERE project_id = ? AND tree_id = ?
+          FROM skeleton_gate_results WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ?
           ORDER BY created_at DESC, id DESC LIMIT 1
-        `, projectId, workflow.tree_id)
+        `, projectId, workflow.tree_id, workflow.current_revision_id)
       : undefined;
     const latestWorkflowPhaseGate = workflow
       ? this.database.get<{ id: string; stage: string; status: string; blocker_codes_json: string; created_at: string }>(`
           SELECT id, stage, status, blocker_codes_json, created_at FROM workflow_phase_gate_results
-          WHERE project_id = ? AND tree_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
-        `, projectId, workflow.tree_id)
+          WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ?
+          ORDER BY created_at DESC, id DESC LIMIT 1
+        `, projectId, workflow.tree_id, workflow.current_revision_id)
       : undefined;
     const workflowBranches = workflow
       ? this.database.all<{ branch_node_id: string; branch_order: number; status: string }>(`
@@ -201,7 +209,7 @@ export class RuntimeQueryService {
     const confirmationByNode = new Map(confirmationRows.map((row) => [row.task_node_id, row.state]));
     const artifactCounts = { total: artifacts.length };
     return {
-      treeId: tree.id, title: tree.title, status: tree.status, revision: revision.revision,
+      treeId: tree.id, revisionId: tree.current_revision_id, title: tree.title, status: tree.status, revision: revision.revision,
       nodes: document.nodes.map((node) => ({
         id: node.id, parentId: node.parentId, title: node.title, children: node.children,
         confirmationState: confirmationByNode.get(node.id) ?? "draft",

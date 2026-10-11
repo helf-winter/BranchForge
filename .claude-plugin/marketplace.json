@@ -1,0 +1,14 @@
+{
+  "name": "agent-harness-local",
+  "description": "Local marketplace for the Self-Evolving Agent Harness Claude Code plugin",
+  "owner": {
+    "name": "Agent Harness"
+  },
+  "plugins": [
+    {
+      "name": "agent-harness",
+      "source": "./plugin",
+      "description": "Task Tree workflow, runtime state, Trace facts, and Artifact memory for coding agents"
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { hasNativeQuestionAnswer } from "./user-decision-evidence.js";
 import { commandArtifactLocator } from "../domain/artifact.js";
 import { buildExecutionContext, type ExecutionContext } from "../domain/execution-context.js";
 import { newId } from "../domain/ids.js";
@@ -46,9 +47,16 @@ const missingActiveAttemptReason = [
   "Call harness_get_next_executable_node, then harness_start_node_attempt for that exact revision before changing project files.",
   "If the user explicitly wants this change outside the workflow, record a direct-execution affiliation instead.",
 ].join(" ");
+const missingWorkflowActivationReason = [
+  "This turn entered Harness structured_coding but is about to stop without starting its planning workflow.",
+  "Continue the same native conversation and load agent-harness:task-tree-planning now.",
+  "Call harness_propose_task_affiliation before ordinary requirement-detail questions, then use AskUserQuestion for the user's affiliation choice.",
+  "Do not create a Task Tree until that choice is resolved.",
+].join(" ");
 export type HookDirective =
   | { kind: "deny"; reason: string }
-  | { kind: "context"; context: string };
+  | { kind: "context"; context: string }
+  | { kind: "stop"; reason: string };
 
 export type HookIngestionResult =
   | { recorded: false; reason: "inactive" | "duplicate"; directive?: HookDirective }
@@ -102,12 +110,15 @@ export class HookIngestionService {
         `, project.projectId)
       : undefined;
     const mutation = mutationLifecycleEvents.has(event.eventName) && this.isMutation(event);
-    const pendingAffiliationAnswer = project.status === "same_project" && event.eventName === "UserPromptSubmit" && Boolean(
+    const pendingAffiliation = project.status === "same_project" && Boolean(
       this.database.get(`
         SELECT id FROM task_affiliation_decisions
         WHERE project_id = ? AND status = 'pending' LIMIT 1
       `, project.projectId),
     );
+    const nativeQuestionAnswer = event.eventName === "PostToolUse"
+      && hasNativeQuestionAnswer({ toolName: event.toolName, toolResponse: event.toolResponse });
+    const pendingAffiliationAnswer = pendingAffiliation && (event.eventName === "UserPromptSubmit" || nativeQuestionAnswer);
     let profileDecision: RuntimeProfileDecisionView | undefined;
     const routablePrompt = event.eventName === "UserPromptSubmit"
       && Boolean(event.prompt?.trim())
@@ -131,7 +142,24 @@ export class HookIngestionService {
           `, project.projectId)
         : undefined;
     }
-    if (!workflow && !mutation && !pendingAffiliationAnswer && !routablePrompt) {
+    const sessionProfile = project.status === "same_project"
+      ? this.database.get<{ profile: string }>(`
+          SELECT profile FROM runtime_profile_states WHERE project_id = ? AND session_id = ?
+        `, project.projectId, event.sessionId)?.profile
+      : undefined;
+    const workflowActivationReminderSent = project.status === "same_project" && Boolean(
+      this.database.get(`
+        SELECT id FROM trace_events
+        WHERE project_id = ? AND session_id = ? AND event_name = 'workflow_activation_required'
+        LIMIT 1
+      `, project.projectId, event.sessionId),
+    );
+    const workflowActivationRequired = event.eventName === "Stop"
+      && sessionProfile === "structured_coding"
+      && !workflow
+      && !pendingAffiliation
+      && !workflowActivationReminderSent;
+    if (!workflow && !mutation && !pendingAffiliationAnswer && !routablePrompt && !workflowActivationRequired) {
       return { recorded: false, reason: "inactive" };
     }
     if (project.status !== "same_project") project = await this.projects.resolve(event.cwd, "persist");
@@ -144,7 +172,7 @@ export class HookIngestionService {
       WHERE w.project_id = ? AND w.active = 1
     `, project.projectId);
 
-    const sessionProfile = this.database.get<{ profile: string }>(`
+    const persistedSessionProfile = sessionProfile ?? this.database.get<{ profile: string }>(`
       SELECT profile FROM runtime_profile_states WHERE project_id = ? AND session_id = ?
     `, project.projectId, event.sessionId)?.profile;
     const activeAttempt = workflow
@@ -158,14 +186,16 @@ export class HookIngestionService {
       ? this.structuredMutationViolation(project.projectId, event.sessionId, workflow, activeAttempt)
       : undefined;
     const violation = Boolean(violationReason);
-    const structuredSession = sessionProfile === "structured_coding" || (!sessionProfile && Boolean(workflow));
+    const structuredSession = persistedSessionProfile === "structured_coding" || (!persistedSessionProfile && Boolean(workflow));
     const traceNodeId = structuredSession
       ? executableStages.has(workflow?.stage ?? "")
         ? activeAttempt?.task_node_id ?? null
         : activeAttempt?.task_node_id ?? workflow?.selected_node_id ?? null
       : null;
     const eventId = newId();
-    const eventName = violation ? "workflow_violation" : event.eventName;
+    const eventName = workflowActivationRequired
+      ? "workflow_activation_required"
+      : violation ? "workflow_violation" : event.eventName;
     const payload = redactSecrets({
       sourceEvent: event.eventName,
       ...(event.toolName ? { toolName: event.toolName } : {}),
@@ -174,6 +204,7 @@ export class HookIngestionService {
       ...(event.toolResponse !== undefined ? { toolResponse: event.toolResponse } : {}),
       ...(event.prompt ? { prompt: event.prompt } : {}),
       ...(violationReason ? { reason: violationReason } : {}),
+      ...(workflowActivationRequired ? { reason: "structured_workflow_not_started" } : {}),
     });
     const previousContext = this.latestExecutionContext(project.projectId, event.sessionId);
     const executionContext = redactSecrets(buildExecutionContext({
@@ -277,6 +308,15 @@ export class HookIngestionService {
             ? missingActiveAttemptReason
             : missingNativeApprovalReason,
         },
+      };
+    }
+    if (workflowActivationRequired) {
+      return {
+        recorded: true,
+        eventId,
+        violation: false,
+        blocked: false,
+        directive: { kind: "stop", reason: missingWorkflowActivationReason },
       };
     }
     return {

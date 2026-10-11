@@ -4,6 +4,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ExecutionSchedulerService } from "../../src/application/execution-scheduler-service.js";
 import { NodeExecutionService } from "../../src/application/node-execution-service.js";
+import { EvaluationService } from "../../src/application/evaluation-service.js";
+import { WorkflowPhaseService } from "../../src/application/workflow-phase-service.js";
+import { FinalReportService } from "../../src/application/final-report-service.js";
 import { TaskTreeService } from "../../src/application/task-tree-service.js";
 import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
 import { RuntimeDatabase } from "../../src/storage/database.js";
@@ -65,6 +68,41 @@ async function fixture() {
 }
 
 describe("ExecutionSchedulerService", () => {
+  it("closes verified container branches without fabricated branch Attempts", async () => {
+    const f = await fixture();
+    f.database.run("UPDATE task_nodes SET status = 'succeeded' WHERE id IN ('a-skeleton', 'b-skeleton', 'a-impl', 'a-verify', 'b-impl', 'b-verify')");
+    f.database.run("UPDATE workflow_states SET stage = 'root_verification', active_branch_node_id = NULL WHERE tree_id = ?", f.revision.treeId);
+    for (const [id, order] of [["branch-a", 0], ["branch-b", 1]] as const) {
+      f.database.run("INSERT INTO workflow_branch_states (project_id, tree_id, tree_revision_id, branch_node_id, branch_order, status, updated_at) VALUES ('p1', ?, ?, ?, ?, 'verified', 'now')", f.revision.treeId, f.revision.revisionId, id, order);
+    }
+    expect(f.scheduler.next({ projectId: "p1", treeId: f.revision.treeId })).toMatchObject({ nodeId: "root" });
+    const attempt = new NodeExecutionService(f.database).startAttempt({ projectId: "p1", nodeId: "root", expectedTreeRevisionId: f.revision.revisionId });
+    expect(attempt.status).toBe("running");
+    expect(f.database.all("SELECT id FROM execution_attempts")).toHaveLength(1);
+    const executions = new NodeExecutionService(f.database);
+    f.database.run(`INSERT INTO trace_events (id, project_id, tree_id, node_id, session_id, event_name,
+      payload_json, execution_context_json, occurred_at, idempotency_key)
+      VALUES ('root-evidence', 'p1', ?, 'root', 'run', 'PostToolUse', '{}', '{}', '9999-01-01', 'root-evidence')`, f.revision.treeId);
+    executions.attachEvidence({ projectId: "p1", attemptId: attempt.attemptId, requiredEvidenceKey: "root-test", traceEventId: "root-evidence" });
+    executions.beginVerification({ projectId: "p1", attemptId: attempt.attemptId, expectedStatus: "running" });
+    expect(new EvaluationService(f.database).evaluateAttempt({ projectId: "p1", attemptId: attempt.attemptId, proposedVerdict: "succeeded", riskSummary: null }))
+      .toMatchObject({ transition: { applied: true, targetStatus: "succeeded" } });
+    const gate = new WorkflowPhaseService(f.database).evaluate({ projectId: "p1", treeId: f.revision.treeId, workflowRevision: 4 });
+    expect(gate).toMatchObject({ status: "passed", nextStage: "final_report" });
+    expect(new FinalReportService(f.database).finalize({ projectId: "p1", treeId: f.revision.treeId, workflowRevision: gate.workflow.revision, idempotencyKey: "finish" }))
+      .toMatchObject({ status: "completed", summary: { taskNodes: { total: 10, succeeded: 10 } } });
+    expect(f.database.all("SELECT id FROM execution_attempts")).toHaveLength(1);
+    f.database.close();
+  });
+
+  it("does not treat a verified container as complete after a descendant loses validation", async () => {
+    const f = await fixture();
+    f.database.run("UPDATE task_nodes SET status = 'succeeded' WHERE tree_id = ? AND id <> 'root'", f.revision.treeId);
+    f.database.run("UPDATE task_nodes SET status = 'needs_revalidation' WHERE id = 'a-impl'");
+    f.database.run("UPDATE workflow_states SET stage = 'root_verification' WHERE tree_id = ?", f.revision.treeId);
+    expect(f.scheduler.next({ projectId: "p1", treeId: f.revision.treeId })).toBeNull();
+    f.database.close();
+  });
   it("selects Skeleton nodes breadth-first by depth and stable document order", async () => {
     const f = await fixture();
     expect(f.scheduler.next({ projectId: "p1", treeId: f.revision.treeId })).toMatchObject({
@@ -106,10 +144,11 @@ describe("ExecutionSchedulerService", () => {
     f.database.run("UPDATE workflow_states SET stage = 'branch_verification', active_branch_node_id = 'branch-a', revision = 6 WHERE tree_id = ?", f.revision.treeId);
     f.database.run("INSERT INTO workflow_branch_states (project_id, tree_id, tree_revision_id, branch_node_id, branch_order, status, updated_at) VALUES ('p1', ?, ?, 'branch-a', 0, 'implemented', 'now')", f.revision.treeId, f.revision.revisionId);
     expect(f.scheduler.next({ projectId: "p1", treeId: f.revision.treeId })).toMatchObject({ nodeId: "a-verify", phase: "verification" });
-    f.database.run("UPDATE task_nodes SET status = 'succeeded' WHERE id IN ('branch-a', 'branch-b')");
+    f.database.run("UPDATE task_nodes SET status = 'succeeded' WHERE id <> 'root'");
+    f.database.run("UPDATE workflow_branch_states SET status = 'verified'");
     f.database.run("UPDATE workflow_states SET stage = 'root_verification', active_branch_node_id = NULL, revision = 9 WHERE tree_id = ?", f.revision.treeId);
     expect(f.scheduler.next({ projectId: "p1", treeId: f.revision.treeId })).toMatchObject({ nodeId: "root", phase: "verification" });
-    f.database.run("UPDATE task_nodes SET status = 'ready' WHERE id = 'branch-b'");
+    f.database.run("UPDATE task_nodes SET status = 'needs_revalidation' WHERE id = 'branch-b'");
     expect(f.scheduler.next({ projectId: "p1", treeId: f.revision.treeId })).toBeNull();
     f.database.close();
   });

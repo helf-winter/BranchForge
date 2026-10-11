@@ -1,6 +1,7 @@
 import type { RequiredEvidence, TaskNodeInput, TaskTreeDocument } from "../domain/task-tree.js";
 import type { WorkflowStage } from "../domain/workflow.js";
 import type { RuntimeDatabase } from "../storage/database.js";
+import { loadNodeCompletion } from "./node-completion.js";
 
 interface WorkflowRow {
   stage: WorkflowStage;
@@ -67,6 +68,7 @@ export class ExecutionSchedulerService {
       WHERE n.tree_id = ?
     `, workflow.current_revision_id, workflow.current_revision_id, input.treeId).map((row) => [row.id, row]));
     const byId = new Map(document.nodes.map((node) => [node.id, node]));
+    const complete = loadNodeCompletion(this.database, input.treeId);
     const order = new Map(document.nodes.map((node, index) => [node.id, index]));
     const depth = new Map<string, number>();
     const calculateDepth = (node: TaskNodeInput): number => {
@@ -89,9 +91,9 @@ export class ExecutionSchedulerService {
     const eligible = (node: TaskNodeInput) => {
       const fact = facts.get(node.id);
       if (!fact || !executableStatuses.has(fact.status) || fact.confirmation_state !== "confirmed") return false;
-      if ((node.dependencies ?? []).some((dependency) => facts.get(dependency)?.status !== "succeeded")) return false;
+      if ((node.dependencies ?? []).some((dependency) => !complete(dependency))) return false;
       if (node.executionPhase === "verification"
-        && node.children.some((child) => facts.get(child)?.status !== "succeeded")) return false;
+        && node.children.some((child) => !complete(child))) return false;
       return true;
     };
 
@@ -102,7 +104,7 @@ export class ExecutionSchedulerService {
     } else if (workflow.stage === "root_verification") {
       const root = document.nodes.find((node) => node.parentId === null);
       if (root && root.executionPhase === "verification"
-        && root.children.every((child) => facts.get(child)?.status === "succeeded") && eligible(root)) candidates = [root];
+        && root.children.every(complete) && eligible(root)) candidates = [root];
     } else {
       const branchId = workflow.active_branch_node_id;
       if (!branchId) return null;

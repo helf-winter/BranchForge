@@ -43,6 +43,46 @@ async function fixture(classification: RequestRouteClassification, confidence: n
 }
 
 describe("RuntimeProfileService", () => {
+  it("persists a pause so Stop hooks do not resurrect structured coding", async () => {
+    const f = await fixture("task_tree_workflow", 0.95);
+    const initial = await f.profiles.resolveForPrompt({ cwd: f.projectDirectory, sessionId: "session-1", prompt: "实现完整应用" });
+    const proposal = new (await import("../../src/application/task-affiliation-service.js")).TaskAffiliationService(f.database, f.profiles).propose({ projectId: initial.projectId!, requestTitle: "Pause", recommendation: "new_tree" });
+    f.profiles.applyAffiliationChoice({ projectId: initial.projectId!, sessionId: "session-1", affiliationDecisionId: proposal.decisionId, choice: "pause" });
+    expect(f.profiles.current(initial.projectId!, "session-1")).toMatchObject({ profile: "conversation", reasonCode: "affiliation:pause", nextAction: "await_user_direction" });
+    f.database.close();
+  });
+  it("establishes structured coding from explicit intent even when Jev is disabled", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "harness-explicit-profile-"));
+    dirs.push(root);
+    const projectDirectory = path.join(root, "project");
+    await import("node:fs/promises").then((fs) => fs.mkdir(projectDirectory));
+    const database = new RuntimeDatabase(path.join(root, "runtime.db"));
+    const projects = new ProjectIdentityService(database);
+    const config = resolveJevRequestRoutingConfiguration({});
+    const provider = { route: vi.fn() };
+    const profiles = new RuntimeProfileService(
+      database,
+      projects,
+      new RequestRoutingService(database, config, provider),
+      config,
+    );
+
+    await expect(profiles.resolveForPrompt({
+      cwd: projectDirectory,
+      sessionId: "session-explicit",
+      prompt: "请先和我讨论并完善需求，确认规划之后再开始实现。",
+    })).resolves.toMatchObject({
+      projectId: expect.any(String),
+      profile: "structured_coding",
+      disposition: "accepted",
+      nextAction: "establish_task_tree",
+      additionalContext: expect.stringMatching(/task-tree-planning[\s\S]*harness_propose_task_affiliation/),
+    });
+    expect(provider.route).not.toHaveBeenCalled();
+    expect(database.all("SELECT id FROM projects")).toHaveLength(1);
+    database.close();
+  });
+
   it("keeps an accepted direct response transient in a new directory", async () => {
     const { projectDirectory, database, profiles } = await fixture("direct_response", 0.95);
     await expect(profiles.resolveForPrompt({
@@ -94,14 +134,11 @@ describe("RuntimeProfileService", () => {
       profile: "structured_coding",
       disposition: "accepted",
       nextAction: "establish_task_tree",
-      additionalContext: [
-        "Harness runtime profile: structured_coding.",
-        "Establish and obtain native approval for a first-class Task Tree revision before project mutation.",
-      ].join("\n"),
+      additionalContext: expect.stringMatching(/task-tree-planning[\s\S]*harness_propose_task_affiliation/),
     });
     expect(result.additionalContext).not.toContain("artifactIds");
     expect(result.additionalContext).not.toContain("nodes");
-    expect(result.additionalContext!.length).toBeLessThan(240);
+    expect(result.additionalContext!.length).toBeLessThan(700);
     database.close();
   });
 

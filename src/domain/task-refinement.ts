@@ -299,12 +299,49 @@ export function analyzePlanReadiness(document: TaskTreeDocument, scopeRootNodeId
       const branchScope = descendantsOf(branchId);
       const skeletonNodes = [...branchScope].map((id) => byId.get(id)!)
         .filter((node) => node.executionPhase === "skeleton" && node.requiredEvidence?.length);
+      const skeletonNodeIds = new Set(skeletonNodes.map((node) => node.id));
       if (!skeletonNodes.length) {
         blockingIssues.push(issue({
           code: "skeleton_task_missing", category: "acceptance_skeleton", severity: "blocking",
           summary: "Define schedulable Skeleton work for " + (byId.get(branchId)?.title ?? branchId),
           affectedRefs: [branchId],
         }));
+      }
+      if (criterion && document.artifacts.length > 0) {
+        const artifactsByRef = new Map(document.artifacts.flatMap((artifact) => [
+          [artifact.id, artifact] as const,
+          [artifact.locator, artifact] as const,
+        ]));
+        for (const artifactRef of criterion.expectedArtifacts) {
+          const artifact = artifactsByRef.get(artifactRef);
+          const ownerNodeIds = artifact
+            ? (document.artifactLinks ?? [])
+              .filter((link) => link.artifactId === artifact.id
+                && ["creates", "modifies", "implements"].includes(link.relationType))
+              .map((link) => link.taskNodeId)
+            : [];
+          if (!artifact || !ownerNodeIds.some((nodeId) => skeletonNodeIds.has(nodeId))) {
+            blockingIssues.push(issue({
+              code: "skeleton_artifact_not_owned_by_skeleton", category: "acceptance_skeleton", severity: "blocking",
+              summary: `Skeleton artifact ${artifactRef} must be created, modified, or implemented by Skeleton work in ${byId.get(branchId)?.title ?? branchId}`,
+              affectedRefs: [branchId, artifactRef, ...ownerNodeIds],
+            }));
+          }
+        }
+      }
+      if (criterion && (document.artifactContracts?.length ?? 0) > 0) {
+        const contractsById = new Map((document.artifactContracts ?? []).map((contract) => [contract.id, contract]));
+        for (const contractRef of criterion.requiredContracts) {
+          const contract = contractsById.get(contractRef);
+          const providerNodeIds = contract?.providerNodeIds ?? [];
+          if (!contract || !providerNodeIds.some((nodeId) => skeletonNodeIds.has(nodeId))) {
+            blockingIssues.push(issue({
+              code: "skeleton_contract_not_provided_by_skeleton", category: "acceptance_skeleton", severity: "blocking",
+              summary: `Skeleton contract ${contractRef} must be provided by Skeleton work in ${byId.get(branchId)?.title ?? branchId}`,
+              affectedRefs: [branchId, contractRef, ...providerNodeIds],
+            }));
+          }
+        }
       }
       const verificationNodes = [...branchScope].map((id) => byId.get(id)!)
         .filter((node) => node.executionPhase === "verification" && node.requiredEvidence?.length);

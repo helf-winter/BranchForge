@@ -23,8 +23,11 @@ describe("Claude plugin contract", () => {
   });
 
   it("has valid metadata and self-contained MCP and hook commands", async () => {
-    const manifest = JSON.parse(await readFile(path.join(root, ".claude-plugin", "plugin.json"), "utf8")) as { name: string };
+    const manifest = JSON.parse(await readFile(path.join(root, ".claude-plugin", "plugin.json"), "utf8")) as { name: string; version: string };
+    const packageManifest = JSON.parse(await readFile(path.join(repositoryRoot, "package.json"), "utf8")) as { version: string };
     expect(manifest.name).toBe("agent-harness");
+    expect(manifest.version).toBe("0.1.4");
+    expect(packageManifest.version).toBe(manifest.version);
     const mcp = JSON.parse(await readFile(path.join(root, ".mcp.json"), "utf8")) as { mcpServers: Record<string, { command: string; args: string[] }> };
     expect(mcp.mcpServers["agent-harness"]?.args.join(" ")).toContain("${CLAUDE_PLUGIN_ROOT}/runtime/mcp.mjs");
     const hooksText = await readFile(path.join(root, "hooks", "hooks.json"), "utf8");
@@ -58,6 +61,8 @@ describe("Claude plugin contract", () => {
     expect(planning).toContain("native Plan approval exactly once");
     expect(planning).toContain("Never write a JSON manifest");
     expect(planning).toContain("Never ask for a second Harness confirmation");
+    expect(planning).toContain("resolved affiliation answer Trace");
+    expect(planning).toContain("PostToolUse");
   });
 
   it("binds branch execution to the deterministic scheduler and Attempt lifecycle", async () => {
@@ -86,6 +91,52 @@ describe("Claude plugin contract", () => {
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout).toBe("");
       await expect(readFile(path.join(cwd, ".agent-harness-project.json"))).rejects.toThrow();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("routes explicit structured intent without Jev and returns minimal runtime context", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "harness compiled explicit route "));
+    try {
+      const input = JSON.stringify({
+        hook_event_name: "UserPromptSubmit", session_id: "s-explicit", cwd,
+        prompt: "请先和我讨论并完善需求，确认规划之后再开始实现。",
+      });
+      const result = spawnSync(process.execPath, [path.join(root, "runtime", "hook.mjs")], {
+        input, encoding: "utf8", env: {
+          ...process.env,
+          AGENT_HARNESS_DATA_HOME: path.join(cwd, "data"),
+          HARNESS_JEV_ROUTING_ENABLED: "false",
+          TYPESAFE_API_KEY: "",
+        },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        hookSpecificOutput: {
+          hookEventName: "UserPromptSubmit",
+          additionalContext: expect.stringMatching(/task-tree-planning[\s\S]*harness_propose_task_affiliation/),
+        },
+      });
+      const firstStop = spawnSync(process.execPath, [path.join(root, "runtime", "hook.mjs")], {
+        input: JSON.stringify({
+          hook_event_name: "Stop", session_id: "s-explicit", cwd,
+          timestamp: "2030-01-01T00:01:00.000Z",
+        }),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          AGENT_HARNESS_DATA_HOME: path.join(cwd, "data"),
+          HARNESS_JEV_ROUTING_ENABLED: "false",
+          TYPESAFE_API_KEY: "",
+        },
+      });
+      expect(firstStop.status, firstStop.stderr).toBe(0);
+      expect(JSON.parse(firstStop.stdout)).toMatchObject({
+        decision: "block",
+        reason: expect.stringContaining("harness_propose_task_affiliation"),
+      });
+      await expect(readFile(path.join(cwd, ".agent-harness-project.json"), "utf8")).resolves.toContain("project_id");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

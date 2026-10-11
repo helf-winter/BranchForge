@@ -59,20 +59,53 @@ harness tree snapshot --json
 
 ## 3. Claude 插件
 
+如果使用用户级安装，先刷新并确认不是旧缓存：
+
 ```bash
 cd '/mnt/d/code/创业/Agent-Harness'
 npm run build
-claude --plugin-dir ./plugin
+claude plugin marketplace update agent-harness-local
+claude plugin update agent-harness@agent-harness-local --scope user
+claude plugin list --json
+harness doctor --json
 ```
 
-在 Claude 中：
+预期插件版本为 `0.1.4`。Doctor 的 `requestRouting.readiness` 可以是 `disabled` 或 `ready`；若为 `misconfigured`，说明当前 Bash/WSL 进程没有读到 Jev Key，但下面的显式规划请求仍必须由确定性路由进入 `structured_coding`。
 
-1. 输入 `/agent-harness:taskroot 实现一个可测试的健康检查接口`。
-2. 要求展示当前 Runtime Snapshot。
-3. 提供一个小型 coding 需求，检查 Claude 是否先询问“新建还是归并”。
-4. 完成局部精炼后，检查是否给出完整 Task Tree 并等待执行确认。
-5. 确认后检查是否先建立 Skeleton，再实现分支。
-6. 退出并重新进入同一目录，查询 Snapshot 和 Trace，确认状态仍存在。
+使用工作区插件进行隔离验收：
+
+```bash
+cd '/mnt/d/code/创业/Agent-Harness'
+npm run build
+rm -rf /tmp/pinbean-harness-acceptance
+mkdir -p /tmp/pinbean-harness-acceptance
+cd /tmp/pinbean-harness-acceptance
+claude --plugin-dir '/mnt/d/code/创业/Agent-Harness/plugin'
+```
+
+在 Claude 中输入：
+
+```text
+我想从零开发一个可实际使用的拼豆图案设计网页。
+
+用户可以创建不同尺寸的拼豆画布，在网格中点击或拖动放置拼豆，支持颜色选择、橡皮擦、撤销和重做。作品需要自动保存在浏览器本地，并支持导出 PNG 图片、导入和导出 JSON 工程文件，同时统计不同颜色拼豆的使用数量。
+
+使用 React、TypeScript 和 Vite 开发，需要支持桌面浏览器和移动端触控，并提供必要的自动化测试。
+
+请先和我讨论并完善需求，确认规划之后再开始实现。
+```
+
+验收顺序：
+
+1. 无论 Jev 是否启用，上述显式“先讨论、确认规划后再实现”请求都必须使当前 Profile 成为 `structured_coding`；该次请求的动态上下文必须明确指向 `agent-harness:task-tree-planning` 和 `harness_propose_task_affiliation`，不得依赖 Claude 偶然发现 Skill。对其他模糊请求，Jev 未配置或 Provider 失败时 Claude 仍能原生判断并继续，不得中断会话。
+2. Claude 应先加载规划 Skill、调用 `harness_propose_task_affiliation`，再使用原生问题交互让用户选择新建、归并、直接执行或暂停；确认前不得创建完整执行树或修改项目文件。若 Claude 首次忽略入口并准备结束，`Stop` Hook 应只唤醒一次并指回该工具；已有待确认项或第二次停止时不得重复阻断。
+3. 选择新建后，确认产生完整 Task Tree draft；讨论中修改一个分支，确认只产生一个新 revision 和对应 Decision Record。
+4. 就绪检查通过后，Claude 展示完整原生 Plan，其中只包含一段 Runtime 生成的 canonical Task Tree block；不得出现 JSON manifest，也不得再弹出第二个 Harness 确认。
+5. 批准原生 Plan 一次。确认 approval reference 变为 `consumed`，Workflow 进入 `skeleton_pass`。
+6. 第一次 `harness_get_next_executable_node` 必须返回 Skeleton 节点。Claude 先调用 `harness_start_node_attempt`，再使用原生工具修改代码；Trace、Artifact 和 Attempt 必须绑定同一节点。
+7. 所有 Skeleton 证据齐全且 Gate 通过后，调度器进入第一个 active branch；同一分支的 implementation 和 verification 完成前不得跳到兄弟分支。
+8. 退出并重新进入同一目录，查询 Profile、Tree revision、approval、Workflow、scheduler、Trace 和 Attempt，确认状态仍存在且下一节点一致。
+9. 最后输入“只改 README 里的一个错别字，不建立或修改任务树，直接执行”。确认 `direct_execution` 归属后修改被放行，Task Tree 数量和 revision 不变。
 
 ## 4. 节点执行与 Evaluation
 
@@ -274,15 +307,20 @@ npm test -- --run tests/unit/task-tree.test.ts tests/integration/runtime-query.t
 
 ## 16. Task Affiliation Confirmation
 
-在一个尚无 Task Tree 的 Project 发起普通 coding 请求归属提议：
+分别验证小型直接执行和复杂 Task Tree 规划：
 
-1. 调用 `harness_propose_task_affiliation`；确认结果包含确定性候选快照、Agent 建议、Runtime Action 和待确认提示，数据库中仍不存在新 Task Tree。
-2. 在同一 Project 再次提议；必须返回 `confirmation_required`，不得创建第二个待确认归属。
-3. 在没有 active Workflow 的情况下提交用户回答；Hook 必须记录 `UserPromptSubmit` Trace。对一个全新目录进行普通解释性对话时仍必须返回 `inactive`，且不得创建 Project marker。
-4. 使用提示之前、其他 Project 或非 `UserPromptSubmit` Trace 解决决定；必须拒绝且不改变 Task Tree。使用有效回答选择 `new_tree` 后才创建并选择根任务。
-5. 为已有 Task Tree 提议 `merge`；候选快照必须包含目标树。确认时重新校验目标属于当前 Project 且未归档，然后只选择该树，不创建新树。
-6. 选择 `pause`；确认提示关闭，但不得创建、选择或修改 Task Tree。重复提交相同已解决选择应返回原结果，不产生第二棵树。
-7. 重启 Runtime 后查询 `harness_get_task_affiliations` 和 Runtime Snapshot；候选快照、回答 Trace、最终树、待确认计数和可用动作必须稳定恢复。
+1. 启动会话不得注入完整 Runtime State、Task/Artifact 数据或 Conversation Frame，也不得仅因启动创建 Project marker。Skill 应由宿主原生发现机制触发。
+2. 在没有活动 Task Tree Workflow 时，项目内 Write/Edit/NotebookEdit、mutating Bash 和 Claude 原生 Plan Mode 必须正常放行；修改事件应由 Hooks 记录，但不得因为缺少 Task Tree 产生 `workflow_violation`。
+3. `EnterPlanMode`、`AskUserQuestion`、读取和 Runtime 工具在任何 Profile 中均可用。`structured_coding` 在当前 revision 尚无 consumed native approval 时，只有项目 mutation 被拒绝，原因必须指向 `harness_prepare_task_tree_approval` 和原生 Plan 批准。
+4. 原生 Plan 批准后但尚无 active Attempt 时，项目 mutation 必须被拒绝，原因必须只指向 `harness_get_next_executable_node` 与 `harness_start_node_attempt`。启动精确节点 Attempt 后 mutation 放行，并把 Trace 绑定到 Attempt 节点。
+5. 调用 `harness_propose_task_affiliation`；确认结果包含确定性候选快照、Agent 建议、Runtime Action 和待确认提示，数据库中仍不存在新 Task Tree。
+6. 在同一 Project 再次提议；必须返回 `confirmation_required`，不得创建第二个待确认归属。
+7. 在没有 active Workflow 的情况下提交用户回答；Hook 必须记录 `UserPromptSubmit` Trace。对一个全新目录进行普通解释性对话时仍必须返回 `inactive`，且不得创建 Project marker。
+8. 使用提示之前、其他 Project 或非 `UserPromptSubmit` Trace 解决决定；必须拒绝且不改变 Task Tree。使用有效回答选择 `new_tree` 后才创建并选择根任务。
+9. 为已有 Task Tree 提议 `merge`；候选快照必须包含目标树。确认时重新校验目标属于当前 Project 且未归档，然后只选择该树，不创建新树。
+10. 选择 `direct_execution`，或在自由文本中明确要求“不建树，直接执行”；Agent 必须将该回答 Trace 绑定到决定，关闭待定归属且不创建、选择或修改 Task Tree，然后遵循最新用户指令。选择 `pause` 则停止当前请求。重复提交相同已解决选择应返回原结果。
+11. `harness_get_task_tree_summary` 必须同时返回数字 `revision` 和可直接作为草案写入 `baseRevisionId` 的 `revisionId`；工具描述必须明确二者不可混用。
+12. 重启 Runtime 后查询 `harness_get_task_affiliations` 和 Runtime Snapshot，候选快照、`direct_execution` / Task Tree 回答 Trace、最终树、待确认计数和可用动作必须稳定恢复。Agent 不得建议用户通过 shell escape、外部终端或其他方式绕过 Harness。
 
 自动回归入口：
 
@@ -379,7 +417,7 @@ npm test -- --run tests/integration/final-report-service.test.ts tests/integrati
 ## 22. 安全检查
 
 - 在 Hook 输入的 `apiKey`、`authorization`、`token`、`cookie` 或 `password` 字段中放入测试字符串；数据库 Trace 中只能出现 `[REDACTED]`。
-- 在未确认范围时触发实质变更；Trace 应出现 `workflow_violation`，工具本身不应被 Harness 阻塞。
+- 在 `structured_coding` 的未批准 revision 上触发项目 mutation；Trace 应出现 `workflow_violation`，Hook 应只阻止该次 mutation 并给出原生 Plan 批准恢复路径，其他原生工具仍可用。
 - 将一个项目的 marker 复制到另一个仍存在的目录；inspect 应返回 `copy_detected`，持久化时必须创建独立 Project，不得共享可写状态。
 - 篡改 marker 的 `identity_token` 或填写未知 `project_id`；解析结果应为 `identity_conflict`，不得读取或改写现有 Project。
 

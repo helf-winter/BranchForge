@@ -37,6 +37,38 @@ function answer(database: RuntimeDatabase, projectId: string, eventId: string, o
 }
 
 describe("TaskAffiliationService", () => {
+  it.each(["pause", "direct_execution"] as const)("persists an honest %s recommendation without creating a tree", async (choice) => {
+    const { database, service } = await fixture();
+    const proposal = service.propose({ projectId: "p1", requestTitle: "Close current request", recommendation: choice });
+    expect(proposal.recommendation).toBe(choice);
+    answer(database, "p1", "choice-answer");
+    expect(await service.resolve({ projectId: "p1", decisionId: proposal.decisionId, choice, answerTraceEventId: "choice-answer" }))
+      .toMatchObject({ recommendation: choice, resolvedTreeId: null });
+    expect(database.all("SELECT id FROM task_trees")).toHaveLength(0);
+    database.close();
+  });
+
+  it("accepts completed native question answers but not questions or arbitrary tool results", async () => {
+    const { database, service, profiles } = await fixture();
+    const proposal = service.propose({ projectId: "p1", requestTitle: "Pause", recommendation: "pause" });
+    for (const [id, event, payload] of [
+      ["asked", "PreToolUse", { toolName: "AskUserQuestion", toolInput: { questions: [] } }],
+      ["unanswered", "PostToolUse", { toolName: "AskUserQuestion", toolResponse: { answers: {} } }],
+      ["fake", "PostToolUse", { toolName: "Bash", toolResponse: { answers: { choice: "pause" } } }],
+      ["clicked", "PostToolUse", { toolName: "AskUserQuestion", toolResponse: { answers: { "Choose": "Pause" } } }],
+    ] as const) {
+      database.run(`INSERT INTO trace_events (id, project_id, session_id, event_name, payload_json, execution_context_json, occurred_at, idempotency_key)
+        VALUES (?, 'p1', 'native-session', ?, ?, '{}', '9999-01-01', ?)`, id, event, JSON.stringify(payload), id);
+    }
+    for (const id of ["asked", "unanswered", "fake"]) {
+      await expect(service.resolve({ projectId: "p1", decisionId: proposal.decisionId, choice: "pause", answerTraceEventId: id }))
+        .rejects.toMatchObject({ code: "evidence_scope_mismatch" });
+    }
+    expect(await service.resolve({ projectId: "p1", decisionId: proposal.decisionId, choice: "pause", answerTraceEventId: "clicked" }))
+      .toMatchObject({ status: "paused", answerTraceEventId: "clicked" });
+    expect(profiles.current("p1", "native-session")).toMatchObject({ profile: "conversation", nextAction: "await_user_direction" });
+    database.close();
+  });
   it("persists bounded deterministic candidates and permits only one pending choice", async () => {
     const { database, service, trees, profiles } = await fixture();
     const existing = await trees.createTaskRoot({ projectId: "p1", title: "Authentication repair" });
@@ -115,7 +147,7 @@ describe("TaskAffiliationService", () => {
       projectId: "p2", decisionId: pauseProposal.decisionId, choice: "pause", answerTraceEventId: "pause-answer",
     })).toMatchObject({ status: "paused", resolvedTreeId: null });
     expect(database.all("SELECT id FROM task_trees WHERE project_id = 'p2'")).toHaveLength(0);
-    expect(profiles.current("p2", "run")).toBeNull();
+    expect(profiles.current("p2", "run")).toMatchObject({ profile: "conversation", nextAction: "await_user_direction" });
     database.close();
   });
 

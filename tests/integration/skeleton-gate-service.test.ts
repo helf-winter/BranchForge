@@ -79,6 +79,46 @@ async function confirmedFixture() {
 }
 
 describe("SkeletonGateService", () => {
+  it.each(["root", "contract", "criterion", "rerun"])("reuses Skeleton facts only when their execution context is unchanged (%s)", async (change) => {
+    const f = await confirmedFixture();
+    const attempt = f.runtime.executions.startAttempt({ projectId: f.project.projectId, nodeId: "api-skeleton", expectedTreeRevisionId: f.revision.revisionId, sourceTraceEventId: f.answerTraceEventId });
+    await f.runtime.hooks.ingest(mapClaudeHook({ hook_event_name: "PostToolUse", session_id: "gate-run", cwd: f.projectDir, tool_name: "Write", tool_use_id: "carry-write", tool_input: { file_path: "src/api.ts" }, tool_response: { ok: true } }));
+    const build = await f.runtime.hooks.ingest(mapClaudeHook({ hook_event_name: "PostToolUse", session_id: "gate-run", cwd: f.projectDir, tool_name: "Bash", tool_use_id: "carry-build", tool_input: { command: "npm run build" }, tool_response: { exitCode: 0 } }));
+    if (!build.recorded) throw new Error("missing build evidence");
+    f.runtime.executions.attachEvidence({ projectId: f.project.projectId, attemptId: attempt.attemptId, requiredEvidenceKey: "contract-check", traceEventId: build.eventId });
+    f.runtime.executions.beginVerification({ projectId: f.project.projectId, attemptId: attempt.attemptId, expectedStatus: "running" });
+    f.runtime.evaluations.evaluateAttempt({ projectId: f.project.projectId, attemptId: attempt.attemptId, proposedVerdict: "succeeded", riskSummary: null });
+    const revised = structuredClone(document);
+    if (change === "root" || change === "rerun") revised.nodes.find((node) => node.id === "root")!.title = "Locally refined root";
+    if (change === "contract") revised.artifactContracts[0]!.schemaOrSignature = "GET /api -> { items: string[] }";
+    if (change === "criterion") revised.skeletonCriteria[0]!.verificationCommands = ["npm run build -- --strict"];
+    const revision = f.runtime.taskTrees.saveDraftRevision({ projectId: f.project.projectId, treeId: f.root.treeId, baseRevisionId: f.revision.revisionId, document: revised });
+    f.runtime.database.run("UPDATE task_node_confirmation_states SET state = 'confirmed' WHERE tree_revision_id = ?", revision.revisionId);
+    f.runtime.database.run("UPDATE workflow_states SET stage = 'skeleton_pass' WHERE tree_id = ?", f.root.treeId);
+    let expectedAttemptId = attempt.attemptId;
+    if (change === "rerun") {
+      f.runtime.database.run("UPDATE execution_attempts SET attempt_number = 2 WHERE id = ?", attempt.attemptId);
+      f.runtime.database.run("UPDATE task_nodes SET status = 'needs_revalidation' WHERE id = 'api-skeleton'");
+      const next = f.runtime.executions.startAttempt({ projectId: f.project.projectId, nodeId: "api-skeleton", expectedTreeRevisionId: revision.revisionId, sourceTraceEventId: f.answerTraceEventId });
+      const rerunBuild = await f.runtime.hooks.ingest(mapClaudeHook({ hook_event_name: "PostToolUse", session_id: "gate-run", cwd: f.projectDir, tool_name: "Bash", tool_use_id: "rerun-build", tool_input: { command: "npm run build" }, tool_response: { exitCode: 0 } }));
+      if (!rerunBuild.recorded) throw new Error("missing rerun build evidence");
+      f.runtime.executions.attachEvidence({ projectId: f.project.projectId, attemptId: next.attemptId, requiredEvidenceKey: "contract-check", traceEventId: rerunBuild.eventId });
+      f.runtime.executions.beginVerification({ projectId: f.project.projectId, attemptId: next.attemptId, expectedStatus: "running" });
+      f.runtime.evaluations.evaluateAttempt({ projectId: f.project.projectId, attemptId: next.attemptId, proposedVerdict: "succeeded", riskSummary: null });
+      expectedAttemptId = next.attemptId;
+    }
+    const workflow = f.runtime.database.get<{ revision: number }>("SELECT revision FROM workflow_states WHERE tree_id = ?", f.root.treeId)!;
+    const gate = f.runtime.skeletonGates.evaluate({ projectId: f.project.projectId, treeId: f.root.treeId, workflowRevision: workflow.revision });
+    if (change === "root" || change === "rerun") expect(gate).toMatchObject({ status: "passed", blockers: [], attemptIds: [expectedAttemptId] });
+    else {
+      expect(gate.status).not.toBe("passed");
+      expect(gate.attemptIds).toEqual([]);
+      expect(f.runtime.database.get("SELECT status FROM task_nodes WHERE id = 'api-skeleton'")).toEqual({ status: "needs_revalidation" });
+      expect(f.runtime.scheduler.next({ projectId: f.project.projectId, treeId: f.root.treeId })).toMatchObject({ nodeId: "api-skeleton" });
+    }
+    expect(f.runtime.database.get("SELECT tree_revision_id FROM execution_attempts WHERE id = ?", attempt.attemptId)).toEqual({ tree_revision_id: f.revision.revisionId });
+    f.runtime.close();
+  });
   it("persists blockers, remains executable, then advances only after every planned fact exists", async () => {
     const fixture = await confirmedFixture();
     const first = fixture.runtime.skeletonGates.evaluate({

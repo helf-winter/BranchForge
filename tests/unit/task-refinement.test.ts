@@ -87,6 +87,44 @@ describe("Task refinement domain", () => {
     ]));
   });
 
+  it("rejects Skeleton acceptance criteria owned only by implementation work", () => {
+    const draft = document();
+    draft.artifacts = [
+      { id: "a-skeleton-file", kind: "file", locator: "src/a-skeleton.ts" },
+      { id: "a-implementation-file", kind: "file", locator: "src/a-impl.ts" },
+      { id: "a-contract-artifact", kind: "contract", locator: "contract:a" },
+    ];
+    draft.artifactLinks = [
+      { taskNodeId: "a-skeleton", artifactId: "a-skeleton-file", relationType: "creates" },
+      { taskNodeId: "a-impl", artifactId: "a-implementation-file", relationType: "creates" },
+      { taskNodeId: "a-impl", artifactId: "a-contract-artifact", relationType: "implements" },
+    ];
+    draft.artifactContracts = [{
+      id: "a-contract", artifactId: "a-contract-artifact", name: "A contract", version: "1",
+      compatibilityPolicy: "exact", schemaOrSignature: "run(): void",
+      providerNodeIds: ["a-impl"], consumerNodeIds: ["a-skeleton"], validationRefs: ["a-impl-test"],
+    }];
+    draft.skeletonCriteria![0] = {
+      ...draft.skeletonCriteria![0]!,
+      expectedArtifacts: ["src/a-impl.ts"],
+      requiredContracts: ["a-contract"],
+    };
+
+    const result = analyzePlanReadiness(draft, "branch-a");
+
+    expect(result.ready).toBe(false);
+    expect(result.blockingIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "skeleton_artifact_not_owned_by_skeleton",
+        affectedRefs: expect.arrayContaining(["branch-a", "src/a-impl.ts", "a-impl"]),
+      }),
+      expect.objectContaining({
+        code: "skeleton_contract_not_provided_by_skeleton",
+        affectedRefs: expect.arrayContaining(["branch-a", "a-contract", "a-impl"]),
+      }),
+    ]));
+  });
+
   it("classifies one-branch changes as direct and multi-branch/root changes as preview-required", () => {
     const base = document();
     const local = document();

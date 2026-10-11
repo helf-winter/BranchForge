@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { openRuntime } from "../../application/runtime.js";
 import { HarnessError } from "../../domain/errors.js";
+import { findUserDecisionEvidence } from "../../application/user-decision-evidence.js";
 import type { TaskNodeInput, TaskTreeDocument } from "../../domain/task-tree.js";
 import type { FailureReproductionContract, ReproductionValidationObservation } from "../../domain/failure-case.js";
 import type { PluginRevisionManifest } from "../../domain/plugin-composition.js";
@@ -104,11 +105,8 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   };
   const guarded = <T>(handler: () => Promise<T> | T) => Promise.resolve().then(handler).then(result, failure);
   const requireUserMessage = (projectId: string, traceEventId: string) => {
-    const trace = runtime.database.get<{ session_id: string; occurred_at: string; tree_id: string | null }>(`
-      SELECT session_id, occurred_at, tree_id FROM trace_events
-      WHERE id = ? AND project_id = ? AND event_name = 'UserPromptSubmit'
-    `, traceEventId, projectId);
-    if (!trace) throw new HarnessError("evidence_scope_mismatch", "a same-Project UserPromptSubmit Trace Event is required");
+    const trace = findUserDecisionEvidence(runtime.database, projectId, traceEventId);
+    if (!trace) throw new HarnessError("evidence_scope_mismatch", "a same-Project user prompt or completed native question answer Trace Event is required");
     return trace;
   };
 
@@ -235,7 +233,7 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
     description: "For work that merits Task Tree planning, persist deterministic candidates and ask the user to choose direct execution, new tree, merge, or pause.",
     inputSchema: {
       cwd: cwdSchema, requestTitle: z.string().min(1), candidateQuery: z.string().min(1).optional(),
-      recommendation: z.enum(["new_tree", "merge"]), recommendedTreeId: z.string().min(1).optional(),
+      recommendation: z.enum(["new_tree", "merge", "direct_execution", "pause"]), recommendedTreeId: z.string().min(1).optional(),
       runId: z.string().min(1).optional(),
     },
   }, ({ cwd, requestTitle, candidateQuery, recommendation, recommendedTreeId, runId }) => guarded(async () => runtime.affiliations.propose({
@@ -345,9 +343,9 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
       SELECT d.id FROM task_affiliation_decisions d
       JOIN trace_events answer ON answer.id = d.answer_trace_event_id
       WHERE d.project_id = ? AND d.resolved_tree_id = ? AND d.status IN ('new_tree', 'merged')
-        AND d.resolved_at IS NOT NULL AND d.resolved_at <= ? AND answer.session_id = ?
+        AND d.resolved_at IS NOT NULL AND (d.answer_trace_event_id = ? OR d.resolved_at <= ?) AND answer.session_id = ?
       ORDER BY d.resolved_at DESC, d.id DESC LIMIT 1
-    `, project.projectId, treeId, trace.occurred_at, trace.session_id);
+    `, project.projectId, treeId, sourceUserMessageTraceEventId, trace.occurred_at, trace.session_id);
     if (!affiliation) {
       throw new HarnessError("evidence_scope_mismatch", "approval evidence must follow the Task Tree's resolved affiliation");
     }

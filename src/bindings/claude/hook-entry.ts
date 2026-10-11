@@ -18,6 +18,11 @@ try {
         permissionDecisionReason: result.directive.reason,
       },
     })}\n`);
+  } else if (result.directive?.kind === "stop") {
+    process.stdout.write(`${JSON.stringify({
+      decision: "block",
+      reason: result.directive.reason,
+    })}\n`);
   } else if (result.directive?.kind === "context") {
     process.stdout.write(`${JSON.stringify({
       hookSpecificOutput: {

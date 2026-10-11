@@ -8,7 +8,7 @@
 | --- | --- |
 | 项目名称 | Self-Evolving Agent Harness |
 | 文档名称 | 软件需求规格说明书 |
-| 文档版本 | v0.35 |
+| 文档版本 | v0.38 |
 | 创建日期 | 2026-09-13 |
 | 作者 | 项目发起人、Codex |
 | 状态 | 草稿 |
@@ -52,6 +52,9 @@
 | v0.33 | 2026-09-28 | 增加活动分支、分支进度与 implementation / branch verification / root verification 确定性阶段 Gate | Codex |
 | v0.34 | 2026-09-29 | 增加不可变 Final Report、确定性完成门禁和 Task Tree 原子收口语义 | Codex |
 | v0.35 | 2026-09-29 | 增加验证证据新鲜度、Artifact 影响传播、不可变 Verification Invalidation 与 Workflow 确定性回退 | Codex |
+| v0.36 | 2026-10-01 | 增加跨模型 Skill 激活可靠性兜底、确定性 Plan/Mutation 门禁与 revisionId MCP 契约 | Codex |
+| v0.37 | 2026-10-01 | 增加小型请求直接执行路径，将 Task Tree 门禁限定于用户已进入的活动结构化工作流 | Codex |
+| v0.38 | 2026-10-04 | 明确三类 Runtime Profile、Jev 建议路由、原生 Plan 单次批准、可恢复 mutation 边界与确定性节点调度 | Codex |
 
 ## 2. 项目概述
 
@@ -172,7 +175,7 @@ Harness 面向多 Agent Runtime 设计，不绑定 Claude、Codex 或任何单�
 - Project Identity 与 Project Path 必须分离：路径用于当前数据可见范围，稳定 `project_id` 用于识别目录移动、重命名和复制；
 - 目录移动或重命名时保留原 `project_id` 并更新 canonical_path；目录复制时创建新 `project_id`，复制必要的 Task Tree 与工程记忆，并让两个 Project 此后独立演进；
 - Agent Runtime 默认只能查询当前 Project Path 绑定的数据，不得跨 Project 返回 Task Tree 候选或运行事实；
-- 所有具有工程变更目标的 coding 请求都必须进入 Task Tree Workflow；普通问答、概念解释和不产生工程变更目标的代码阅读不进入 Task Tree；
+- 小型、自包含的 coding 请求可以直接执行并由 Hooks 记录，不强制进入 Task Tree；复杂、多阶段、跨模块、存在未决设计问题或用户明确要求结构化规划的请求进入 Task Tree Workflow；用户的最新明确指令可以在执行前选择或退出该工作流；
 - Agent 收到 coding 请求后，应先查询当前 Project 下已有 Task Tree 摘要，分析该需求应新建 Task Tree 还是归并到已有 Task Tree，并将推荐结果、理由和影响范围交给用户决定；
 - 用户确认任务归属后，Agent 才能创建新的 Task Tree 或修改已有 Task Tree；`/taskroot [任务名称]` 用于用户显式强制新建并命名根任务；
 - Agent 应按照 Task Tree 方法分解需求并与用户讨论目标、边界、方案、接口和验收条件，形成完整 draft Task Tree；用户确认计划前不得执行会修改项目的任务节点；
@@ -214,7 +217,7 @@ Harness 面向多 Agent Runtime 设计，不绑定 Claude、Codex 或任何单�
 - 自然语言理解是 Agent 的基础能力，不作为独立模块写入系统组件；
 - Agent 需要当前任务、状态、Artifact、Drift 或等待确认项时，应通过 Harness Runtime Skill 使用 Runtime Introspection Tools，而不是依赖每轮预注入上下文；
 - Runtime Introspection Tools 应采用 Snapshot、Summary、Detail 三档查询粒度，默认返回最小充分摘要，避免一次性返回完整历史；
-- Harness Runtime Skill 的触发应依赖 Skill 自身的 description / trigger rules，不依赖外部提示词手动提醒；
+- Harness Runtime Skill 的首选触发应依赖 Skill 自身的 description / trigger rules；Runtime Binding 可在会话启动时提供一次不含运行时状态的最小激活提醒，作为第三方模型漏选 Skill 时的兼容兜底，但不得演化为每轮固定提示或 Conversation Frame；
 - 需要用户确定性选择时，Agent 应发起 Runtime Confirmation Prompt；
 - Runtime State Safety Rules 只定义哪些高风险状态变化必须确认，不替代 Agent 的自然语言判断；
 - 自然语言直接进入 Agent Core；Agent 对自然语言的理解只能提出结构化 Runtime Action，是否提交状态变化由代码根据 action type、目标、expected revision 和 Safety Rules 确定；
@@ -667,7 +670,7 @@ Project 解析顺序如下：
 | 输入 | coding 请求、当前 Project 的已有 Task Tree 摘要、`/taskroot [任务名称]`、用户补充信息、任务约束、验收标准 |
 | 处理 | 分析并请求用户确认新建或归并；创建根节点或更新已有节点；生成完整 draft Task Tree；维护 revision、父子关系、依赖关系和节点状态 |
 | 输出 | Task Tree、节点状态、任务进度 |
-| 业务规则 | 所有具有工程变更目标的 coding 请求必须进入 Task Tree Workflow；新建或归并必须由用户确认；`/taskroot [任务名称]` 用于显式强制新建并命名根任务；Task Tree 类似 OpenSpec 的 `tasks.md`，但以树/图结构表达；Task Tree 来源于 Agent 在 Workflow 约束下的规划判断，不是执行痕迹的反推结果，也不是外部系统分配给 Agent 的任务清单。 |
+| 业务规则 | 小型、自包含的 coding 请求可以不建立 Task Tree，由 Agent 直接执行并由 Hooks 记录事实；复杂、多阶段、跨模块、存在未决设计问题或用户明确要求结构化规划的请求进入 Task Tree Workflow，新建或归并必须由用户确认；用户可在执行前明确要求“不建树，直接执行”；`/taskroot [任务名称]` 用于显式强制新建并命名根任务；Task Tree 类似 OpenSpec 的 `tasks.md`，但以树/图结构表达。 |
 
 Task Tree 归属候选的检索流程如下：
 
@@ -1444,7 +1447,7 @@ Runtime Native Commands 应通过命令注册表进行处理，并直接进入�
 
 Harness Runtime Skill 是 Agent 使用 Harness Runtime Layer 能力的行为规范入口。它不是 Harness Runtime Layer 本身，也不是 Agent 与 Harness 之间的通信桥梁；它用于让 Agent 在任务规划、执行、状态查询、Drift 和确认场景中以正确方式使用 Runtime Layer。
 
-Harness Runtime Skill 不依赖外部提示词手动提醒，而应通过 Skill 自身的 description / trigger rules 被 Agent 环境发现和加载。
+Harness Runtime Skill 应首先通过 Skill 自身的 description / trigger rules 被 Agent 环境发现和加载。考虑到同一 Agent 宿主切换第三方模型后，Skill 自动选择可能不稳定，Agent Runtime Binding 可以在 `SessionStart` 注入一次只声明触发条件和 Skill 名称的最小激活提醒；该提醒不得携带 Runtime State、Task Tree、Artifact、等待项或 Conversation Frame，不得在每轮重复注入，也不替代 Skill 正文。
 
 Harness Runtime Skill 的触发条件应覆盖以下场景：
 
@@ -1677,10 +1680,26 @@ Coding Constraints 分为三类：
 
 ```text
 约束决定 Agent 应该怎么做
-Hooks 记录 Agent 实际做了什么
+Hooks 记录 Agent 实际做了什么，并在确定性执行边界实施有限门禁
 Evaluation 判断做得怎么样
 Evolution 沉淀下次如何做得更好
 ```
+
+Planning Skill 应通过准确的 `description` / trigger rules 覆盖复杂、多阶段、跨模块、存在未决设计问题或用户显式要求规划的 coding 请求；小型、自包含请求以及用户明确要求“不建树，直接执行”的请求不应被强制进入该 Skill。Binding 不得每轮注入完整 Workflow、Task、Artifact 或 Conversation Frame；Agent 应按需使用 Runtime Introspection Tools。
+
+每次用户请求可以形成以下三类 Runtime Profile：
+
+| Profile | 行为 |
+| --- | --- |
+| `conversation` | 原生回答或讨论，不建立 Task Tree，不因对话创建 Project 状态 |
+| `direct_coding` | 使用原生工具直接完成小型、自包含修改，由 Hooks 记录事实，不要求 Task Tree |
+| `structured_coding` | 进入任务归属、Task Tree 精炼、原生 Plan 批准和确定性节点执行流程 |
+
+可选 Jev Request Router 只提供建议，不生成 Task Tree、不修改 Runtime State。它最多接收当前 prompt、是否存在活动树、活动树标题、当前节点标题和是否存在活动 Workflow，不得接收源码、完整对话、工具输出、环境变量、密钥或隐藏推理。`confidence >= 0.80` 的建议可以采用，`0.50 <= confidence < 0.80` 只作 advisory，更低置信度回退到 Agent 原生判断；未配置、401、429、529、超时、网络错误和畸形响应均必须 fail-open。
+
+结构化规划必须复用宿主 Agent 的原生讨论、`AskUserQuestion` 与 Plan Mode。Task Tree revision 是规划事实源，原生 Plan 是展示和用户批准界面。Runtime 只把确定生成的 canonical Task Tree block 与一次性 approval reference 放入 Plan，不得从任意 Markdown 或 JSON manifest 反向重建 Task Tree。成功的原生 `ExitPlanMode` 同时批准精确 revision，不得再要求第二次 Harness 确认。
+
+`PreToolUse` 只允许在两个精确边界拒绝项目 mutation：一是 `structured_coding` 的当前 revision 没有 consumed native approval；二是已批准且可执行的 Workflow 尚未启动当前调度节点的 active Attempt。第一种返回 `harness_prepare_task_tree_approval` 与原生 Plan 批准路径，第二种返回 `harness_get_next_executable_node` → `harness_start_node_attempt` 路径。原生 Plan Mode、提问、读取和 Runtime 工具始终可用；`conversation`、`direct_coding` 和用户明确选择的 `direct_execution` 不受这两个门禁影响。Task Tree 查询接口必须区分可读数字 revision 与并发写入所需的 revisionId。
 
 ### 5.23 Lifecycle Hooks
 
@@ -2057,15 +2076,15 @@ Project Identity Marker 是项目目录中的最小身份文件，不是 Runtime
 | candidate_snapshot | 提议时返回的有界 Task Tree 候选及 matched_by 依据快照 |
 | recommendation | Agent 提出的 new_tree 或 merge 建议 |
 | recommended_tree_id | 建议归并的候选树，可为空 |
-| confirmation_prompt_id | 明确要求用户选择 new_tree、merge 或 pause 的 Runtime Confirmation Prompt |
+| confirmation_prompt_id | 明确要求用户选择 direct_execution、new_tree、merge 或 pause 的 Runtime Confirmation Prompt |
 | runtime_action_id | 对应的结构化 Task 归属 Runtime Action |
 | answer_trace_event_id | 提示之后、同一 Project 的 UserPromptSubmit Trace，可为空 |
-| status | pending、new_tree、merged、paused |
-| resolved_tree_id | 最终新建或选择的 Task Tree；paused 时为空 |
+| status | pending、direct_execution、new_tree、merged、paused |
+| resolved_tree_id | 最终新建或选择的 Task Tree；direct_execution 或 paused 时为空 |
 | created_at | 提议时间 |
 | resolved_at | 解决时间，可为空 |
 
-每个 Project 同时最多存在一个 pending Task Affiliation Decision。提议阶段不得创建、选择或修改 Task Tree；只有有效回答 Trace 绑定决定后，Runtime 才能原子推进对应的新建或归并结果。显式 `/taskroot` 属于用户直接授权新建根任务，不创建普通归属决定。
+每个 Project 同时最多存在一个 pending Task Affiliation Decision。提议阶段不得创建、选择或修改 Task Tree；只有有效回答 Trace 绑定决定后，Runtime 才能原子推进对应的新建、归并或直接执行结果。`direct_execution` 只结束待定归属并记录用户选择，不创建 Task Tree，也不构成额外的项目修改许可。显式 `/taskroot` 属于用户直接授权新建根任务，不创建普通归属决定。
 
 #### Task Tree
 
@@ -3004,7 +3023,7 @@ Runtime Record 接口必须读写 Harness 公共数据库，并根据当前 Agen
 
 系统需要支持按当前 Project、Task Tree、Task Node、Execution Context、Artifact 查询任务和执行记录。Task Tree 候选查询必须先按 canonical_path 隔离 Project，再按显式 Tree ID / 名称、Artifact 路径、模块 / 符号、关键词、状态和更新时间执行确定性排序，并返回匹配依据。
 
-普通 coding 请求的 Task Tree 归属必须通过 Task Affiliation 接口持久化：proposal 保存候选快照、Agent 建议、Runtime Action 和确认提示，但不改变 Task Tree；resolve 必须绑定提示之后、同一 Project 的 `UserPromptSubmit` Trace，并重新校验 merge 目标。接口需要支持 `new_tree`、`merge` 和 `pause`，对同一已解决选择保持幂等，并在 Runtime 重启后可查询恢复。
+需要 Task Tree 的 coding 请求必须通过 Task Affiliation 接口持久化：proposal 保存候选快照、Agent 建议、Runtime Action 和确认提示，但不改变 Task Tree；resolve 必须绑定提示之后、同一 Project 的 `UserPromptSubmit` Trace，并重新校验 merge 目标。接口需要支持 `direct_execution`、`new_tree`、`merge` 和 `pause`；用户可以用自由文本明确退出规划并直接执行，Agent 应将其映射为 `direct_execution`。所有选择对相同重复提交保持幂等，并可在 Runtime 重启后查询恢复。
 
 Task Node 创建或更新接口应支持提交 Leaf Task Contract，并返回结构硬校验结果、错误字段和启发式警告。结构校验通过不代表语义判断通过；叶子边界仍需包含在用户确认的 Task Tree Revision 中。
 
@@ -3193,7 +3212,7 @@ Runtime Action 接口必须对 `action_type`、`target_id`、`expected_revision`
 | --- | --- | --- |
 | 过度依赖 LLM 判断任务 | 状态不稳定、难以复现 | 基础状态迁移使用确定性规则 |
 | 未确认 Task Tree 分支就开始执行 | 用户失去对计划的控制 | Task Tree 分支必须经用户确认后才能执行该分支下会修改项目的任务节点 |
-| coding 请求未进入 Task Tree Workflow | Agent 在普通请求中绕过用户定义的工程方法 | 所有具有工程变更目标的 coding 请求必须先完成 Task Tree 新建或归并确认及计划确认 |
+| 复杂 coding 请求未进入 Task Tree Workflow | Agent 在多阶段或跨模块工作中绕过用户定义的工程方法 | Planning Skill 应识别复杂任务并提出 Task Tree；小型直接执行不视为绕过，用户最新明确选择优先 |
 | Agent 静默归并到错误 Task Tree | 任务边界和 Trace 归属错误 | Agent 只能提出新建或归并建议，最终归属由用户确认 |
 | 修改已有节点覆盖历史 | 已完成事实、确认基准和影响范围无法追溯 | 每次结构修改生成新 revision，保留旧 revision，并计算 affected scope |
 | 初始 Task Tree 直接进入确认 | 粗略树缺少边界、契约和验收细节，用户只能整体接受或反复推翻 | 生成初始全量 draft 后进入问题驱动的 Refinement Loop，并用 Plan Readiness Gate 控制确认 |
@@ -3315,9 +3334,9 @@ Skill 应描述：
 
 Skill 不应只是一次成功操作的记录。它必须能被后续任务触发、执行和验证，并且要能追溯到来源 Experience 和 Evaluation。
 
-Harness Runtime Skill 是 Agent 使用 Harness Runtime Layer 的行为规范入口。它应通过 Skill 自身的 `description` / trigger rules 描述触发条件，而不是依赖外部提示词手动提醒。其触发条件应覆盖任务规划、已确认分支执行、Coding Constraints、Lifecycle Hooks、运行时状态查询、User Change Request、Plan Drift、Artifact Drift、分支确认、等待事项处理和 Runtime Introspection Tools 使用决策。
+Harness Runtime Skill 是 Agent 使用 Harness Runtime Layer 的行为规范入口。它应通过 Skill 自身的 `description` / trigger rules 描述触发条件；Runtime Binding 只允许在会话启动时提供一次不含状态的最小激活提醒作为跨模型兼容兜底，不得以每轮固定提示替代 Skill。其触发条件应覆盖任务规划、已确认分支执行、Coding Constraints、Lifecycle Hooks、运行时状态查询、User Change Request、Plan Drift、Artifact Drift、分支确认、等待事项处理和 Runtime Introspection Tools 使用决策。
 
-当目标 Agent 环境支持 Skill 机制时，应优先使用 Skill 原生机制触发 Harness Runtime Skill。当目标 Agent 环境不支持 Skill 机制时，才由 Agent Runtime Binding 提供等效的运行时规则绑定方式。
+当目标 Agent 环境支持 Skill 机制时，应优先使用 Skill 原生机制触发 Harness Runtime Skill；当宿主允许切换第三方模型且实测存在漏选时，Binding 可增加上述一次性最小激活提醒。目标 Agent 环境不支持 Skill 机制时，才由 Agent Runtime Binding 提供完整的等效运行时规则绑定方式。
 
 首版 Harness Plugin 至少应包含以下 Skill：
 
@@ -3366,9 +3385,11 @@ Agent Runtime 的长期工程记忆由以下结构组成：
 Agent Runtime 工作流应遵循以下顺序：
 
 ```text
-接收 coding 请求并查询已有 Task Tree
+接收 coding 请求；可选 Jev 给出三分类建议，Agent 确定 Runtime Profile
   ↓
-提出新建或归并建议，等待用户确认任务归属
+conversation 原生回答 / direct_coding 原生执行 / structured_coding 继续以下流程
+  ↓
+查询已有 Task Tree，提出直接执行、新建、归并或暂停建议，等待用户确认任务归属
   ↓
 应用 Planning Constraints
   ↓
@@ -3382,7 +3403,11 @@ Task Tree Refinement Loop：扫描未决问题并按影响优先级逐项讨论
   ↓
 待确认范围通过 Plan Readiness Gate
   ↓
-展示 Task Tree 节点架构图，等待用户确认整棵树或选定分支
+Runtime 生成 canonical Task Tree block，Agent 原样嵌入宿主原生 Plan
+  ↓
+用户批准一次原生 Plan，Runtime 绑定并确认精确 Task Tree revision
+  ↓
+确定性 Scheduler 返回下一可执行节点，Agent 启动该节点 Attempt
   ↓
 Skeleton Pass：在已确认范围内搭建整体骨架
   ↓
@@ -3408,6 +3433,8 @@ Parent / Root Verification：聚合并验证父级或根任务
 其中 Task Tree Refinement Loop 采用问题驱动的局部精炼：Agent 默认推荐影响最高的下一项讨论内容，用户可以随时点名其他分支；每次结构性讨论结论只修改受影响范围，并形成 Draft Change Set 与新 revision。Plan Readiness Gate 按待确认范围判断，只有就绪范围才能进入 branch_confirmation。
 
 Skeleton Pass 作用于全部已确认范围内的结构性任务；Implementation 和 Verification 以分支为单位深度推进。Skeleton Gate 以任务专属验收标准为判断基准，以 Lifecycle Hooks 采集的 Artifact、文件、命令和验证结果为事实证据，默认自动判断阶段迁移；只有失败、blocking Drift 或无法判断时才请求用户处理。所有阶段都只能在已确认范围中执行，并且需要遵守 `depends_on` 依赖关系。Coding Constraints 约束 Agent 在各阶段应该如何行动；Lifecycle Hooks 记录 Agent 实际做了什么。Trace、Artifact 和 Runtime State 不是执行结束后的旁观记录，而是 Agent Runtime 执行过程中由 Harness Runtime Layer 同步维护的工程记忆。
+
+节点调度必须是确定性投影，不由 Agent 临时发明跨分支顺序：`skeleton_pass` 按节点深度升序、再按 Task Tree 文档顺序选择；`branch_implementation` 只在当前 active branch 内选择最深的 eligible implementation 叶子；`branch_verification` 只选择该分支 verification 节点；所有直接子分支成功后才返回 root verification。未确认节点、未满足依赖、blocking Drift、过期 branch revision 或任一 active Attempt 都会使对应调度返回空。Scheduler 只返回下一节点，不启动 Attempt；状态变更必须由 `harness_start_node_attempt` 完成。
 
 Workflow State Machine 应维护以下内容：
 
@@ -3581,6 +3608,10 @@ Lifecycle Hooks 应将 contract provider 变化、composition state 迁移、Eff
 | Execution Context | Trace Event 的运行环境元信息，用于审计、诊断、恢复和统计 |
 | Agent Runtime Binding | 不同 Agent Runtime 的兼容绑定机制，用于绑定 Harness Runtime Layer，并规范化运行时事实事件 |
 | Runtime Interaction Loop | Agent Runtime 内生的用户交互循环，用于处理命令、自然语言、状态迁移和继续执行 |
+| Runtime Profile | 单次请求在当前 Project / Session 中采用的运行方式，取值为 conversation、direct_coding 或 structured_coding |
+| Jev Request Router | 仅接收有界请求事实并给出 Runtime Profile 建议的可选 Provider；失败必须 fail-open，不能生成任务树或改变状态 |
+| Native Plan Approval | 用户在宿主 Agent 原生 Plan Mode 中对精确 Task Tree revision 的一次性批准，通过 canonical block hash 与 opaque approval reference 绑定 |
+| Execution Scheduler | 根据 Workflow、Branch State、节点阶段、依赖、确认、Drift 和 Attempt 事实确定性投影下一可执行 Task Node 的 Runtime 服务 |
 | Runtime Native Command | Agent Runtime 暴露的 slash command 原生命令能力，不需要 LLM 判断 |
 | Harness Runtime Skill | Agent 使用 Harness Runtime Layer 的行为规范入口，通过 description / trigger rules 在任务规划、分支执行、约束应用、Hooks 记录、状态查询、Drift 和用户变更等场景触发 |
 | Runtime Introspection Tool | Agent 按需查询运行时状态、任务、Artifact、Drift、等待事项和可用动作的工具 |

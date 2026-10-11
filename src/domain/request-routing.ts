@@ -43,6 +43,12 @@ export interface RequestRouteResult {
   fallbackReason: string | null;
 }
 
+export interface ExplicitRequestRoute {
+  classification: RequestRouteClassification;
+  treeRelation: TaskTreeRelationSuggestion;
+  reasonCode: string;
+}
+
 export interface RuntimeProfileResolutionInput {
   route: RequestRouteResult | null;
   config: Pick<JevRequestRoutingConfiguration, "acceptedConfidence" | "advisoryConfidence">;
@@ -61,6 +67,47 @@ type Environment = Record<string, string | undefined>;
 
 const DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const DEFAULT_MODEL = "jev-1.13.0";
+
+/**
+ * Recognize only explicit workflow contracts that the user stated directly.
+ * Ambiguous coding requests intentionally return null so Jev or the Agent's
+ * native contextual judgment remains responsible for them.
+ */
+export function detectExplicitRequestRoute(prompt: string): ExplicitRequestRoute | null {
+  const normalized = prompt.replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+
+  const optsOutOfTree =
+    /(?:不用|不要|不需要|无需|跳过)[^。！？.!?]{0,18}(?:任务树|task\s*tree)/i.test(normalized)
+    || /(?:不建立|不创建|不修改|不更改)[^。！？.!?]{0,10}(?:任务树|task\s*tree)/i.test(normalized)
+    || /(?:without|skip|no)\s+(?:a\s+)?task\s*tree/i.test(normalized);
+  const requestsImmediateExecution =
+    /(?:直接|立即|马上)[^。！？.!?]{0,12}(?:执行|实现|开发|修改|更改|删除|处理|动手|开始)/.test(normalized)
+    || /(?:execute|implement|change|delete)\s+(?:it\s+)?(?:directly|now|immediately)/i.test(normalized);
+  if (optsOutOfTree && requestsImmediateExecution) {
+    return {
+      classification: "direct_execution",
+      treeRelation: "unclear",
+      reasonCode: "explicit_intent:direct_execution",
+    };
+  }
+
+  const requestsDiscussion =
+    /(?:先|首先)[^。！？.!?]{0,18}(?:讨论|澄清|梳理|完善)[^。！？.!?]{0,18}(?:需求|方案|规划|计划)/.test(normalized)
+    || /(?:discuss|clarify|refine)[^.!?]{0,40}(?:requirements?|plan|design)\s+first/i.test(normalized);
+  const requiresApprovalBeforeImplementation =
+    /(?:确认|批准|同意)[^。！？.!?]{0,18}(?:规划|计划|方案|需求)?[^。！？.!?]{0,12}(?:后|之后|以后|再)[^。！？.!?]{0,12}(?:实现|开发|编码|执行|修改|动手)/.test(normalized)
+    || /(?:after|once)[^.!?]{0,30}(?:confirm|approve)[^.!?]{0,30}(?:implement|code|execute|start)/i.test(normalized);
+  if (requestsDiscussion && requiresApprovalBeforeImplementation) {
+    return {
+      classification: "task_tree_workflow",
+      treeRelation: "unclear",
+      reasonCode: "explicit_intent:discussion_before_implementation",
+    };
+  }
+
+  return null;
+}
 
 function optionalNumber(environment: Environment, key: string, defaultValue: number): number {
   const raw = environment[key]?.trim();

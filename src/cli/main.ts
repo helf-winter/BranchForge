@@ -2,6 +2,7 @@ import { HarnessError } from "../domain/errors.js";
 import { openRuntime } from "../application/runtime.js";
 import { mapClaudeHook } from "../bindings/claude/hook-mapper.js";
 import { present } from "./presenter.js";
+import { resolveJevRequestRoutingConfiguration } from "../domain/request-routing.js";
 
 function option(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
@@ -35,9 +36,16 @@ export async function runCli(args = process.argv.slice(2)): Promise<number> {
   if (words[0] === "doctor") {
     const [major, minor] = process.versions.node.split(".").map(Number);
     const supported = (major ?? 0) > 22 || ((major ?? 0) === 22 && (minor ?? 0) >= 13);
+    const routing = resolveJevRequestRoutingConfiguration(process.env);
     const result = {
       node: { ok: supported, version: process.versions.node, minimum: "22.13.0" },
       sqlite: { ok: true, implementation: "node:sqlite" },
+      requestRouting: {
+        enabled: routing.enabled,
+        readiness: routing.readiness,
+        apiKeyConfigured: Boolean(routing.apiKey),
+        model: routing.model,
+      },
     };
     process.stdout.write(`${present(result, json)}\n`);
     return 0;

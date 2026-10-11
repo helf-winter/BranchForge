@@ -1,4 +1,5 @@
 import { HarnessError } from "../domain/errors.js";
+import { findUserDecisionEvidence } from "./user-decision-evidence.js";
 import { newId, nowIso } from "../domain/ids.js";
 import {
   statusForAffiliationChoice,
@@ -139,12 +140,9 @@ export class TaskAffiliationService {
         }
         return this.mapDecision(decision);
       }
-      const answer = this.database.get<{ occurred_at: string; session_id: string }>(`
-        SELECT occurred_at, session_id FROM trace_events
-        WHERE id = ? AND project_id = ? AND event_name = 'UserPromptSubmit'
-      `, input.answerTraceEventId, input.projectId);
+      const answer = findUserDecisionEvidence(this.database, input.projectId, input.answerTraceEventId);
       if (!answer || answer.occurred_at < decision.created_at) {
-        throw new HarnessError("evidence_scope_mismatch", "affiliation answer must be a later UserPromptSubmit in the same Project");
+        throw new HarnessError("evidence_scope_mismatch", "affiliation answer must be a later user prompt or completed native question answer in the same Project");
       }
 
       let resolvedTreeId: string | null = null;

@@ -13,6 +13,7 @@ import type { RuntimeDatabase } from "../storage/database.js";
 import { FailureCaseService } from "./failure-case-service.js";
 import { EvolutionService } from "./evolution-service.js";
 import { loadSemanticEvidenceSnapshot } from "./semantic-evaluation-service.js";
+import { loadNodeCompletion } from "./node-completion.js";
 
 interface EvaluationAttemptRow {
   id: string;
@@ -188,25 +189,19 @@ export class EvaluationService {
   }
 
   private dependenciesSucceeded(treeId: string, dependencies: string[]): boolean {
-    return dependencies.every((dependencyId) => this.database.get<{ status: string }>(
-      `SELECT n.status
-       FROM task_nodes n
-       JOIN task_trees t ON t.id = n.tree_id
-       JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
-       WHERE n.id = ? AND n.tree_id = ?`,
-      dependencyId, treeId,
-    )?.status === "succeeded");
+    return dependencies.every(loadNodeCompletion(this.database, treeId));
   }
 
   private childrenSucceeded(treeId: string, nodeId: string): boolean {
-    return this.database.all<{ status: string }>(
-      `SELECT n.status
+    const complete = loadNodeCompletion(this.database, treeId);
+    return this.database.all<{ id: string }>(
+      `SELECT n.id
        FROM task_nodes n
        JOIN task_trees t ON t.id = n.tree_id
        JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
        WHERE n.tree_id = ? AND n.parent_id = ?`,
       treeId, nodeId,
-    ).every((child) => child.status === "succeeded");
+    ).every((child) => complete(child.id));
   }
 
   private hasUnresolvedBlockingDrift(projectId: string, treeId: string, nodeId: string): boolean {

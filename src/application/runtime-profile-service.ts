@@ -50,7 +50,9 @@ export interface RuntimeProfileDecisionView {
 
 const structuredContext = [
   "Harness runtime profile: structured_coding.",
-  "Establish and obtain native approval for a first-class Task Tree revision before project mutation.",
+  "Load and follow the installed agent-harness:task-tree-planning Skill now; keep Claude's native discussion, AskUserQuestion, and Plan Mode.",
+  "Before ordinary requirement-detail questions, call harness_propose_task_affiliation and ask the user to choose direct execution, a new Task Tree, merge, or pause.",
+  "After affiliation is resolved, persist the discussed plan as a first-class Task Tree revision and obtain native Plan approval before project mutation.",
 ].join("\n");
 
 function nextAction(profile: RuntimeProfile, hasActiveWorkflow: boolean): RuntimeProfileNextAction {
@@ -149,25 +151,16 @@ export class RuntimeProfileService {
     choice: TaskAffiliationChoice;
   }): RuntimeProfileDecisionView {
     if (input.choice === "pause") {
-      const current = this.current(input.projectId, input.sessionId);
-      return {
-        ...(current ?? this.view({
-          projectId: input.projectId,
-          sessionId: input.sessionId,
-          profile: "conversation",
-          disposition: "explicit_override",
-          reasonCode: "affiliation:pause",
-          routeDecisionId: null,
-          affiliationDecisionId: input.affiliationDecisionId,
-          hasActiveWorkflow: false,
-          updatedAt: nowIso(),
-        })),
+      return this.persist({
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        profile: "conversation",
         disposition: "explicit_override",
         reasonCode: "affiliation:pause",
+        routeDecisionId: null,
         affiliationDecisionId: input.affiliationDecisionId,
-        nextAction: "await_user_direction",
-        additionalContext: null,
-      };
+        hasActiveWorkflow: false,
+      });
     }
     const profile: RuntimeProfile = input.choice === "direct_execution" ? "direct_coding" : "structured_coding";
     return this.persist({
@@ -276,7 +269,7 @@ export class RuntimeProfileService {
       reasonCode: input.reasonCode,
       routeDecisionId: input.routeDecisionId,
       affiliationDecisionId: input.affiliationDecisionId,
-      nextAction: nextAction(input.profile, input.hasActiveWorkflow),
+      nextAction: input.reasonCode === "affiliation:pause" ? "await_user_direction" : nextAction(input.profile, input.hasActiveWorkflow),
       additionalContext: input.profile === "structured_coding" ? structuredContext : null,
       updatedAt: input.updatedAt,
     };
