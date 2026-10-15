@@ -84,7 +84,7 @@ export class FailureCaseService {
       FROM evaluations e
       JOIN execution_attempts a ON a.id = e.execution_attempt_id
       JOIN task_nodes n ON n.id = e.task_node_id
-      JOIN task_node_revisions nr ON nr.id = e.task_node_revision_id
+      JOIN runtime_task_node_revisions nr ON nr.id = e.task_node_revision_id
       JOIN lifecycle_transition_records l ON l.evaluation_id = e.id
       WHERE e.id = ? AND e.project_id = ?
     `, input.evaluationId, input.projectId);
@@ -122,7 +122,7 @@ export class FailureCaseService {
     const artifactIds = this.database.all<{ artifact_id: string }>(`
       SELECT DISTINCT l.artifact_id
       FROM task_node_artifact_links l
-      JOIN task_node_revisions nr ON nr.node_id = l.task_node_id AND nr.tree_revision_id = l.tree_revision_id
+      JOIN runtime_task_node_revisions nr ON nr.node_id = l.task_node_id AND nr.tree_revision_id = l.tree_revision_id
       WHERE nr.id = ?
       ORDER BY l.artifact_id
     `, evaluation.task_node_revision_id).map((row) => row.artifact_id);

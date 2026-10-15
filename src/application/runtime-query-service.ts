@@ -11,6 +11,7 @@ import type { PlanDriftResolutionStatus, PlanDriftSeverity } from "./plan-drift-
 import type { UserChangeType } from "../domain/runtime-action.js";
 import type { FailureAvailabilityStatus, FailureMaturityLevel } from "../domain/failure-case.js";
 import { disposalCapability, type EffectDisposalStatus, type ReplacementStatus, type TaskNodeEffectType } from "../domain/composition.js";
+import { idleNativeExecutionGuidance } from "../domain/native-execution-guidance.js";
 
 interface TraceRow {
   id: string;
@@ -158,6 +159,7 @@ export class RuntimeQueryService {
       projectId,
       selectedTreeId: state?.selected_tree_id ?? null,
       selectedNodeId: state?.selected_node_id ?? null,
+      ...this.iterationDeliveryState(projectId, state?.selected_tree_id ?? workflow?.tree_id ?? null),
       workflow: workflow ? {
         treeId: workflow.tree_id, stage: workflow.stage, revision: workflow.revision,
         activeBranchNodeId: workflow.active_branch_node_id,
@@ -186,6 +188,15 @@ export class RuntimeQueryService {
         branchNodeId: branch.branch_node_id, order: branch.branch_order, status: branch.status,
       })),
       availableActions: this.availableActions(workflow?.stage, pendingAffiliationCount > 0),
+      availableActionsScope: "task_tree_workflow" as const,
+      nativeAgentGuidance: {
+        requiresRequestProfileCheck: true,
+        inactiveTreeBlocksNativeExecution: false,
+        recordedWarningsArePendingWork: false,
+        message: workflow
+          ? "An active Task Tree workflow exists. Follow the current request profile and its approval/Attempt gates; availableActions lists workflow actions, not all native tool permissions."
+          : idleNativeExecutionGuidance,
+      },
     };
   }
 
@@ -194,7 +205,7 @@ export class RuntimeQueryService {
       "SELECT id, title, status, current_revision_id FROM task_trees WHERE id = ? AND project_id = ?", treeId, projectId,
     );
     if (!tree) throw new HarnessError("not_found", "Task Tree was not found in the current project");
-    const revision = this.database.get<{ revision: number; document_json: string }>("SELECT revision, document_json FROM task_tree_revisions WHERE id = ?", tree.current_revision_id)!;
+    const revision = this.database.get<{ revision: number; document_json: string }>("SELECT revision, document_json FROM runtime_task_tree_revisions WHERE id = ?", tree.current_revision_id)!;
     const document = JSON.parse(revision.document_json) as TaskTreeDocument;
     const artifacts = this.database.all<{ id: string; kind: string; locator: string; status: string }>(
       "SELECT id, kind, locator, status FROM artifacts WHERE project_id = ? AND tree_id = ? ORDER BY kind, locator", projectId, treeId,
@@ -210,6 +221,7 @@ export class RuntimeQueryService {
     const artifactCounts = { total: artifacts.length };
     return {
       treeId: tree.id, revisionId: tree.current_revision_id, title: tree.title, status: tree.status, revision: revision.revision,
+      ...this.iterationDeliveryState(projectId, tree.id),
       nodes: document.nodes.map((node) => ({
         id: node.id, parentId: node.parentId, title: node.title, children: node.children,
         confirmationState: confirmationByNode.get(node.id) ?? "draft",
@@ -222,6 +234,16 @@ export class RuntimeQueryService {
       artifactCounts,
       driftCounts: this.getDriftCounts(projectId, treeId),
       confirmationCounts: this.getConfirmationCounts(projectId, treeId),
+    };
+  }
+
+  private iterationDeliveryState(projectId: string, treeId: string | null) {
+    const report = treeId ? this.database.get<{ id: string; tree_revision_id: string; created_at: string }>(`SELECT r.id, r.tree_revision_id, r.created_at FROM final_reports r JOIN task_trees t ON t.current_revision_id = r.tree_revision_id WHERE t.id = ? AND t.project_id = ? AND r.project_id = ?`, treeId, projectId, projectId) : null;
+    const iteration = treeId ? this.database.get<{ id: string; base_revision_id: string; base_report_id: string; result_revision_id: string; impact_json: string; reuse_json: string; created_at: string }>(`SELECT i.* FROM task_tree_iteration_records i JOIN task_tree_revisions r ON r.id = i.result_revision_id WHERE i.project_id = ? AND i.tree_id = ? ORDER BY r.revision DESC LIMIT 1`, projectId, treeId) : null;
+    return {
+      currentRevisionFinalReport: report ? { reportId: report.id, treeRevisionId: report.tree_revision_id, status: "completed" as const, createdAt: report.created_at } : null,
+      latestIteration: iteration ? { iterationId: iteration.id, baseRevisionId: iteration.base_revision_id, baseReportId: iteration.base_report_id, resultRevisionId: iteration.result_revision_id,
+        ...(JSON.parse(iteration.impact_json) as { addedNodeIds: string[]; revalidationNodeIds: string[] }), reusedNodeIds: (JSON.parse(iteration.reuse_json) as Array<{ nodeId: string }>).map(grant => grant.nodeId), createdAt: iteration.created_at } : null,
     };
   }
 
@@ -244,7 +266,7 @@ export class RuntimeQueryService {
     }>("SELECT id, title, status, current_revision_id FROM task_trees WHERE id = ? AND project_id = ?", query.treeId, projectId);
     if (!tree) throw new HarnessError("not_found", "Task Tree was not found in the current project");
     const revision = this.database.get<{ revision: number; document_json: string }>(
-      "SELECT revision, document_json FROM task_tree_revisions WHERE id = ?", tree.current_revision_id,
+      "SELECT revision, document_json FROM runtime_task_tree_revisions WHERE id = ?", tree.current_revision_id,
     )!;
     const document = JSON.parse(revision.document_json) as TaskTreeDocument;
     const documentNodes = new Map(document.nodes.map((node) => [node.id, node]));
@@ -266,7 +288,7 @@ export class RuntimeQueryService {
       SELECT n.id AS node_id, nr.id AS node_revision_id, n.status,
              COALESCE(cs.state, 'draft') AS confirmation_state
       FROM task_nodes n
-      JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
+      JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
       LEFT JOIN task_node_confirmation_states cs
         ON cs.task_node_id = n.id AND cs.tree_revision_id = ?
       WHERE n.tree_id = ?
@@ -305,7 +327,7 @@ export class RuntimeQueryService {
       SELECT e.task_node_id, e.id, e.execution_attempt_id, e.verdict,
              e.covered_required_evidence_json, e.missing_required_evidence_json, e.created_at
       FROM evaluations e
-      JOIN task_node_revisions nr ON nr.id = e.task_node_revision_id AND nr.tree_revision_id = ?
+      JOIN runtime_task_node_revisions nr ON nr.id = e.task_node_revision_id AND nr.tree_revision_id = ?
       WHERE e.project_id = ? AND e.tree_id = ?
       ORDER BY e.task_node_id, e.created_at DESC, e.id DESC
     `, tree.current_revision_id, projectId, tree.id);
@@ -444,6 +466,10 @@ export class RuntimeQueryService {
     return {
       projectId, treeId: tree.id, treeRevisionId: tree.current_revision_id, revision: revision.revision,
       title: tree.title, status: tree.status, depth: query.depth, selectedNodeId,
+      // Return the persisted full planning input, not filtered/mutable views.
+      // A new native conversation must be able to preserve the old scope when
+      // appending branches. Snapshot/summary remain compact and read-only.
+      ...(query.depth === "detail" ? { planningDocument: document } : {}),
       relationOverlay: query.depth === "detail" && query.includeRelationOverlay === true,
       nodes: nodeViews, relations: visibleRelations,
       selectedNodeContext: selectedNodeId ? {
@@ -468,8 +494,8 @@ export class RuntimeQueryService {
     const row = this.database.get<{ tree_id: string; status: string; body_json: string; confirmation_state: string }>(
       `SELECT n.tree_id, n.status, nr.body_json, cs.state AS confirmation_state FROM task_nodes n
        JOIN task_trees t ON t.id = n.tree_id
-       JOIN task_node_revisions nr ON nr.node_id = n.id
-       JOIN task_tree_revisions tr ON tr.id = nr.tree_revision_id AND tr.id = t.current_revision_id
+       JOIN runtime_task_node_revisions nr ON nr.node_id = n.id
+       JOIN runtime_task_tree_revisions tr ON tr.id = nr.tree_revision_id AND tr.id = t.current_revision_id
        JOIN task_node_confirmation_states cs ON cs.task_node_id = n.id AND cs.tree_revision_id = t.current_revision_id
        WHERE n.id = ? AND t.project_id = ?`, nodeId, projectId,
     );
@@ -547,7 +573,7 @@ export class RuntimeQueryService {
       SELECT n.id, n.title, n.status, nr.id AS node_revision_id, nr.body_json,
              COALESCE(cs.state, 'draft') AS confirmation_state
       FROM task_nodes n
-      JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
+      JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
       LEFT JOIN task_node_confirmation_states cs ON cs.task_node_id = n.id AND cs.tree_revision_id = ?
       WHERE n.tree_id = ? AND n.parent_id = ?
       ORDER BY n.title, n.id LIMIT ? OFFSET ?
@@ -619,7 +645,7 @@ export class RuntimeQueryService {
     const statusRows = this.database.all<{ status: string; count: number }>(`
       SELECT n.status, count(*) AS count
       FROM task_nodes n
-      JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
+      JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
       WHERE n.tree_id = ? AND n.parent_id = ?
       GROUP BY n.status ORDER BY n.status
     `, currentRevision.current_revision_id, treeId, parentNodeId);

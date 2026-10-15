@@ -4,6 +4,8 @@ import type { TaskNodeInput, TaskTreeDocument } from "../domain/task-tree.js";
 import { canonicalJson } from "../domain/trace.js";
 import type { WorkflowStage } from "../domain/workflow.js";
 import type { RuntimeDatabase } from "../storage/database.js";
+import { loadNodeCompletion } from "./node-completion.js";
+import { VerificationFreshnessService } from "./verification-freshness-service.js";
 
 type PhaseStage = "branch_implementation" | "branch_verification" | "root_verification";
 type GateStatus = "passed" | "failed" | "uncertain";
@@ -51,9 +53,10 @@ export class WorkflowPhaseService {
       throw new HarnessError("workflow_transition_rejected", "the current Workflow stage has no executable phase gate");
     }
     const stage = workflow.stage as PhaseStage;
+    const recovery = new VerificationFreshnessService(this.database).reconcileIterationBaselinesWithinTransaction(input);
     const tree = this.database.get<{ current_revision_id: string; document_json: string }>(`
       SELECT t.current_revision_id, r.document_json FROM task_trees t
-      JOIN task_tree_revisions r ON r.id = t.current_revision_id
+      JOIN runtime_task_tree_revisions r ON r.id = t.current_revision_id
       WHERE t.id = ? AND t.project_id = ? AND t.archived_at IS NULL
     `, input.treeId, input.projectId);
     if (!tree) throw new HarnessError("not_found", "current Task Tree revision was not found");
@@ -69,7 +72,7 @@ export class WorkflowPhaseService {
     const rows = this.database.all<{ id: string; status: string; body_json: string; confirmation_state: string }>(`
       SELECT n.id, n.status, nr.body_json, COALESCE(cs.state, 'draft') AS confirmation_state
       FROM task_nodes n
-      JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
+      JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
       LEFT JOIN task_node_confirmation_states cs ON cs.tree_revision_id = ? AND cs.task_node_id = n.id
       WHERE n.tree_id = ? ORDER BY n.id
     `, tree.current_revision_id, tree.current_revision_id, input.treeId);
@@ -77,7 +80,8 @@ export class WorkflowPhaseService {
       && row.confirmation_state === "confirmed"
       && (JSON.parse(row.body_json) as TaskNodeInput).executionPhase === expectedPhase).map((row) => row.id);
     const statuses = new Map(rows.map((row) => [row.id, row.status]));
-    const incompleteNodeIds = requiredNodeIds.filter((nodeId) => statuses.get(nodeId) !== "succeeded");
+    const complete = loadNodeCompletion(this.database, input.treeId);
+    const incompleteNodeIds = requiredNodeIds.filter(nodeId => statuses.get(nodeId) !== "succeeded" || !complete(nodeId));
     const blockingDriftIds = this.database.all<{ id: string; task_node_id: string | null }>(`
       SELECT id, task_node_id FROM plan_drift_records
       WHERE project_id = ? AND tree_id = ? AND severity = 'blocking'
@@ -85,6 +89,7 @@ export class WorkflowPhaseService {
       ORDER BY created_at, id
     `, input.projectId, input.treeId).filter((drift) => stage === "root_verification" || drift.task_node_id === null || scope.has(drift.task_node_id)).map((drift) => drift.id);
     const blockerCodes: Array<{ code: string; ref: string }> = [];
+    for (const id of recovery?.staleNodeIds ?? []) blockerCodes.push({ code: "verification_baseline_stale", ref: id });
     if (!requiredNodeIds.length && stage !== "branch_implementation") {
       blockerCodes.push({ code: stage === "root_verification" ? "root_verification_node_missing" : "branch_verification_node_missing", ref: branchNodeId ?? root.id });
     }
@@ -92,8 +97,8 @@ export class WorkflowPhaseService {
     for (const driftId of blockingDriftIds) blockerCodes.push({ code: "blocking_drift", ref: driftId });
     const status: GateStatus = blockerCodes.some((blocker) => blocker.code.endsWith("_missing"))
       ? "uncertain" : blockerCodes.length ? "failed" : "passed";
-    let nextStage: WorkflowStage = stage;
-    let nextBranchNodeId = branchNodeId;
+    let nextStage: WorkflowStage = recovery ? recovery.workflow.stage as WorkflowStage : stage;
+    let nextBranchNodeId = recovery ? recovery.workflow.activeBranchNodeId : branchNodeId;
     if (status === "passed") {
       if (stage === "branch_implementation") {
         nextStage = "branch_verification";
@@ -139,7 +144,7 @@ export class WorkflowPhaseService {
       resultId, projectId: input.projectId, treeId: input.treeId, treeRevisionId: tree.current_revision_id,
       workflowRevision: workflow.revision, stage, branchNodeId, status, requiredNodeIds, incompleteNodeIds,
       blockingDriftIds, blockerCodes, nextStage, nextBranchNodeId,
-      workflow: { stage: status === "passed" ? nextStage : stage, revision: workflow.revision + (status === "passed" ? 1 : 0), activeBranchNodeId: status === "passed" ? nextBranchNodeId : branchNodeId },
+      workflow: recovery?.workflow ?? { stage: status === "passed" ? nextStage : stage, revision: workflow.revision + (status === "passed" ? 1 : 0), activeBranchNodeId: status === "passed" ? nextBranchNodeId : branchNodeId },
       createdAt,
     };
   }

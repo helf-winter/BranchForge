@@ -5,6 +5,9 @@ import { canonicalJson } from "../domain/trace.js";
 import type { RuntimeDatabase } from "../storage/database.js";
 import type { TaskTreeDocument } from "../domain/task-tree.js";
 import { taskNodeEvidenceContext } from "../domain/task-node-evidence-context.js";
+import { ArtifactEvidenceBaselineService } from "./artifact-evidence-baseline-service.js";
+import { isPriorEvaluationUsable, iterationForRevision } from "./evidence-reuse-policy.js";
+import { VerificationFreshnessService } from "./verification-freshness-service.js";
 
 interface FinalReportRow {
   id: string;
@@ -49,7 +52,17 @@ export class FinalReportService {
     if (!input.idempotencyKey.trim()) {
       throw new HarnessError("invalid_input", "final report idempotency key is required");
     }
-    return this.database.transaction(() => this.finalizeWithinTransaction(input));
+    const result = this.database.transaction(() => {
+      const existing = this.database.get("SELECT id FROM final_reports WHERE project_id = ? AND idempotency_key = ?", input.projectId, input.idempotencyKey);
+      const workflow = this.database.get<{ revision: number; stage: string }>("SELECT revision, stage FROM workflow_states WHERE project_id = ? AND tree_id = ? AND active = 1", input.projectId, input.treeId);
+      const recovery = !existing && workflow?.stage === "final_report" && workflow.revision === input.workflowRevision
+        ? new VerificationFreshnessService(this.database).reconcileIterationBaselinesWithinTransaction(input) : null;
+      // Commit a truthful recovery observation, then report that finalization
+      // cannot proceed yet. Throwing inside this transaction would undo repair.
+      return recovery ? { recovery } : this.finalizeWithinTransaction(input);
+    });
+    if ("recovery" in result) throw new HarnessError("workflow_transition_rejected", "Verification baseline changed; resume the reported workflow stage under the existing revision and approval", result.recovery);
+    return result;
   }
 
   list(projectId: string, options: { treeId?: string; reportId?: string } = {}) {
@@ -118,7 +131,7 @@ export class FinalReportService {
     const taskNodes = new Map<string, number>();
     for (const node of this.database.all<{ id: string; status: string }>(`
       SELECT n.id, n.status FROM task_nodes n
-      JOIN task_node_revisions nr ON nr.node_id = n.id
+      JOIN runtime_task_node_revisions nr ON nr.node_id = n.id
       WHERE n.tree_id = ? AND nr.tree_revision_id = ?
     `, input.treeId, tree.current_revision_id)) {
       const status = complete(node.id) ? "succeeded" : node.status === "succeeded" ? "needs_revalidation" : node.status;
@@ -170,17 +183,19 @@ export class FinalReportService {
       SELECT status, count(*) AS count FROM artifacts WHERE project_id = ? AND tree_id = ? GROUP BY status
     `, input.projectId, input.treeId);
     const document = JSON.parse(this.database.get<{ document_json: string }>(
-      "SELECT document_json FROM task_tree_revisions WHERE id = ?", tree.current_revision_id,
+      "SELECT document_json FROM runtime_task_tree_revisions WHERE id = ?", tree.current_revision_id,
     )!.document_json) as TaskTreeDocument;
     const matchesCurrentContext = (nodeId: string, priorDocument: string) =>
       taskNodeEvidenceContext(document, nodeId) === taskNodeEvidenceContext(JSON.parse(priorDocument) as TaskTreeDocument, nodeId);
-    const evaluationRows = this.database.all<{ id: string; status: string; task_node_id: string; execution_attempt_id: string; document_json: string }>(`
-      SELECT e.id, e.verdict AS status, e.task_node_id, e.execution_attempt_id, prior.document_json FROM evaluations e
-      JOIN task_node_revisions nr ON nr.id = e.task_node_revision_id
-      JOIN task_tree_revisions prior ON prior.id = nr.tree_revision_id
-      JOIN task_node_revisions current ON current.node_id = e.task_node_id AND current.tree_revision_id = ?
+    const evaluationRows = this.database.all<{ id: string; status: string; task_node_id: string; execution_attempt_id: string; document_json: string; source_revision_id: string }>(`
+      SELECT e.id, e.verdict AS status, e.task_node_id, e.execution_attempt_id, prior.document_json, nr.tree_revision_id AS source_revision_id FROM evaluations e
+      JOIN runtime_task_node_revisions nr ON nr.id = e.task_node_revision_id
+      JOIN runtime_task_tree_revisions prior ON prior.id = nr.tree_revision_id
+      JOIN runtime_task_node_revisions current ON current.node_id = e.task_node_id AND current.tree_revision_id = ?
       WHERE e.project_id = ? AND e.tree_id = ? AND nr.body_json = current.body_json ORDER BY e.created_at, e.id
-    `, tree.current_revision_id, input.projectId, input.treeId).filter((row) => matchesCurrentContext(row.task_node_id, row.document_json));
+    `, tree.current_revision_id, input.projectId, input.treeId).filter(row => matchesCurrentContext(row.task_node_id, row.document_json)
+      && (!iterationForRevision(this.database, tree.current_revision_id)
+        || isPriorEvaluationUsable(this.database, { ...input, targetRevisionId: tree.current_revision_id, nodeId: row.task_node_id, evaluationId: row.id })));
     const evaluations = new Map<string, number>();
     for (const row of evaluationRows) evaluations.set(row.status, (evaluations.get(row.status) ?? 0) + 1);
     const traceCount = this.count(
@@ -253,6 +268,9 @@ export class FinalReportService {
       ) VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?)
     `, reportId, input.projectId, input.treeId, tree.current_revision_id, workflow.revision,
     rootGate!.id, canonicalJson(summary), canonicalJson(evidenceRefs), input.idempotencyKey, createdAt);
+    const root = document.nodes.find(node => node.parentId === null);
+    const rootAttemptId = validEvaluations.filter(row => row.task_node_id === root?.id && row.source_revision_id === tree.current_revision_id).at(-1)?.execution_attempt_id ?? null;
+    new ArtifactEvidenceBaselineService(this.database).saveReportBaselineWithinTransaction({ projectId: input.projectId, reportId, rootAttemptId });
     this.database.run(
       "UPDATE task_trees SET status = 'completed', updated_at = ? WHERE id = ?",
       createdAt, input.treeId,

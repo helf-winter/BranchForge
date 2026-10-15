@@ -61,7 +61,24 @@ describe("Task Tree refinement vertical slice", () => {
           executionPhase: "implementation", stopDecompositionReason: "one verifiable result",
         },
       ],
-      relations: [], artifacts: [],
+      relations: [], artifacts: [
+        { id: "a-file", kind: "file", locator: "a.ts" },
+        { id: "b-file", kind: "file", locator: "b.ts" },
+        { id: "a-contract", kind: "contract", locator: "contract:a" },
+        { id: "b-contract", kind: "contract", locator: "contract:b" },
+      ],
+      artifactLinks: [
+        { taskNodeId: "a-skeleton", artifactId: "a-file", relationType: "creates" },
+        { taskNodeId: "b-skeleton", artifactId: "b-file", relationType: "creates" },
+        { taskNodeId: "a-skeleton", artifactId: "a-contract", relationType: "implements" },
+        { taskNodeId: "b-skeleton", artifactId: "b-contract", relationType: "implements" },
+      ],
+      artifactContracts: [
+        { id: "a", artifactId: "a-contract", name: "A API", version: "1", compatibilityPolicy: "exact",
+          schemaOrSignature: "a(): void", providerNodeIds: ["a-skeleton"], consumerNodeIds: ["a-implementation"], validationRefs: ["a-skeleton-test"] },
+        { id: "b", artifactId: "b-contract", name: "B API", version: "1", compatibilityPolicy: "exact",
+          schemaOrSignature: "b(): void", providerNodeIds: ["b-skeleton"], consumerNodeIds: ["b-implementation"], validationRefs: ["b-skeleton-test"] },
+      ],
       skeletonCriteria: [
         { id: "s-a", branchNodeId: "branch-a", expectedArtifacts: ["a.ts"], requiredContracts: ["a"], verificationCommands: ["npm test -- a"], readinessConditions: ["A compiles"] },
         { id: "s-b", branchNodeId: "branch-b", expectedArtifacts: ["b.ts"], requiredContracts: ["b"], verificationCommands: ["npm test -- b"], readinessConditions: ["B compiles"] },
@@ -94,6 +111,7 @@ describe("Task Tree refinement vertical slice", () => {
       },
     });
     const readiness = first.taskTrees.scanPlanReadiness({ projectId: project.projectId, treeId: root.treeId });
+    expect(readiness.blockingIssues).toEqual([]);
     expect(readiness).toMatchObject({ ready: true, revisionId: applied.revisionId });
     const decisionId = first.queries.getTaskRefinementHistory(project.projectId, root.treeId, {}).items[0]!.decisionId;
     first.close();

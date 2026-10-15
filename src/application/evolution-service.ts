@@ -97,7 +97,7 @@ export class EvolutionService {
              n.title AS task_title, nr.body_json, l.applied, l.target_status
       FROM evaluations e
       JOIN task_nodes n ON n.id = e.task_node_id
-      JOIN task_node_revisions nr ON nr.id = e.task_node_revision_id
+      JOIN runtime_task_node_revisions nr ON nr.id = e.task_node_revision_id
       JOIN lifecycle_transition_records l ON l.evaluation_id = e.id
       WHERE e.id = ? AND e.project_id = ?
     `, input.successEvaluationId, input.projectId);

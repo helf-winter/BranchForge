@@ -45,7 +45,7 @@ export class WorkflowService {
     if (!input.prompt.trim()) throw new HarnessError("invalid_input", "confirmation prompt is required");
     const tree = this.database.get<{ current_revision_id: string; document_json: string }>(`
       SELECT t.current_revision_id, r.document_json
-      FROM task_trees t JOIN task_tree_revisions r ON r.id = t.current_revision_id
+      FROM task_trees t JOIN runtime_task_tree_revisions r ON r.id = t.current_revision_id
       WHERE t.id = ? AND t.project_id = ?
     `, input.treeId, input.projectId);
     if (!tree) throw new HarnessError("not_found", "current Task Tree revision was not found");
@@ -101,7 +101,7 @@ export class WorkflowService {
     const workflow = this.requireWorkflow(input.projectId, confirmation.tree_id, input.workflowRevision);
     const tree = this.database.get<{ current_revision_id: string; document_json: string }>(`
       SELECT t.current_revision_id, r.document_json
-      FROM task_trees t JOIN task_tree_revisions r ON r.id = t.current_revision_id
+      FROM task_trees t JOIN runtime_task_tree_revisions r ON r.id = t.current_revision_id
       WHERE t.id = ? AND t.project_id = ?
     `, confirmation.tree_id, input.projectId);
     if (!tree) throw new HarnessError("not_found", "current Task Tree revision was not found");
@@ -270,7 +270,7 @@ export class WorkflowService {
     }
     if (["branch_implementation", "branch_verification", "root_verification"].includes(workflow.stage)) {
       const current = this.database.get<{ document_json: string }>(`
-        SELECT r.document_json FROM task_trees t JOIN task_tree_revisions r ON r.id = t.current_revision_id
+        SELECT r.document_json FROM task_trees t JOIN runtime_task_tree_revisions r ON r.id = t.current_revision_id
         WHERE t.id = ? AND t.project_id = ?
       `, input.treeId, input.projectId);
       const structured = current && (JSON.parse(current.document_json) as TaskTreeDocument).planningVersion === 1;

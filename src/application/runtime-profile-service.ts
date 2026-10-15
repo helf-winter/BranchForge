@@ -9,6 +9,7 @@ import type { TaskAffiliationChoice } from "../domain/task-affiliation.js";
 import type { RuntimeDatabase } from "../storage/database.js";
 import type { ProjectIdentityService } from "./project-identity-service.js";
 import type { RequestRouteDecisionView, RequestRoutingService } from "./request-routing-service.js";
+import { idleNativeExecutionGuidance, pausedNativeExecutionGuidance } from "../domain/native-execution-guidance.js";
 
 interface ProfileStateRow {
   project_id: string;
@@ -270,7 +271,9 @@ export class RuntimeProfileService {
       routeDecisionId: input.routeDecisionId,
       affiliationDecisionId: input.affiliationDecisionId,
       nextAction: input.reasonCode === "affiliation:pause" ? "await_user_direction" : nextAction(input.profile, input.hasActiveWorkflow),
-      additionalContext: input.profile === "structured_coding" ? structuredContext : null,
+      additionalContext: input.reasonCode === "affiliation:pause" ? pausedNativeExecutionGuidance
+        : input.profile === "structured_coding" ? structuredContext
+        : input.projectId && !input.hasActiveWorkflow ? idleNativeExecutionGuidance : null,
       updatedAt: input.updatedAt,
     };
   }

@@ -4,9 +4,12 @@ import { deriveConfirmationStates, resolveConfirmationScope, type ConfirmationSt
 import { normalizeArtifactInput } from "../domain/artifact-graph.js";
 import { newId, nowIso } from "../domain/ids.js";
 import { canonicalJson } from "../domain/trace.js";
-import { normalizeTaskTreeDocument, validateTaskTree, type TaskTreeDocument } from "../domain/task-tree.js";
+import { validateTaskTree, type TaskTreeDocument } from "../domain/task-tree.js";
 import { analyzeDraftImpact, analyzePlanReadiness, validateDraftStructure } from "../domain/task-refinement.js";
 import { taskNodeEvidenceContext } from "../domain/task-node-evidence-context.js";
+import { normalizeDocumentNodeIdentity } from "./task-tree-identity.js";
+import { requireIncrementalAuthority, type IncrementalRevisionInput } from "./task-tree-iteration-service.js";
+import { analyzeIncrementalStructure } from "../domain/task-tree-increment.js";
 import { restoredTaskTreeStatus, type TaskTreeCollectionAction } from "../domain/task-collection.js";
 import type { RuntimeDatabase } from "../storage/database.js";
 
@@ -79,6 +82,7 @@ export class TaskTreeService {
       return matchedBy.length ? [{
         treeId: tree.id, title: tree.title, status: tree.status, matchedBy, updatedAt: tree.updated_at,
         archivedAt: tree.archived_at, selected: selectedTreeId === tree.id,
+        ...(tree.status === "completed" ? { supportsIncrementalMerge: true } : {}),
       }] : [];
     });
     return candidates.slice(0, query || candidates.length > 5 ? 3 : candidates.length);
@@ -144,12 +148,24 @@ export class TaskTreeService {
     return this.saveDraftRevisionRecord(input, false);
   }
 
+  saveIncrementalRevisionWithinTransaction(input: IncrementalRevisionInput): TaskTreeRevisionView {
+    requireIncrementalAuthority(this.database, input);
+    const tree = this.requireTree(input.projectId, input.treeId);
+    const document = this.normalizeNodeIdentity(tree.id, input.document);
+    this.assertValidDocument(document);
+    const base = JSON.parse(this.requireRevision(input.baseRevisionId).document_json) as TaskTreeDocument;
+    const analysis = analyzeIncrementalStructure(base, document);
+    if (!analysis.allowed) throw new HarnessError("invalid_tree_structure", "Incremental revision must be additive", analysis.blockers);
+    return this.persistRevision(tree, input.projectId, document, false);
+  }
+
   private saveDraftRevisionRecord(input: { projectId: string; treeId: string; baseRevisionId: string; document: TaskTreeDocument }, wrap: boolean): TaskTreeRevisionView {
     const tree = this.requireTree(input.projectId, input.treeId);
     this.assertTreeMutable(tree);
     if (tree.current_revision_id !== input.baseRevisionId) throw new HarnessError("revision_conflict", "the Task Tree changed after this draft was based on it");
-    this.assertValidDocument(input.document);
-    return this.persistRevision(tree, input.projectId, input.document, wrap);
+    const document = this.normalizeNodeIdentity(tree.id, input.document);
+    this.assertValidDocument(document);
+    return this.persistRevision(tree, input.projectId, document, wrap);
   }
 
   applyDraftChangeSet(input: {
@@ -177,12 +193,12 @@ export class TaskTreeService {
     if (input.operations.length !== 1 || input.operations[0]?.op !== "replace_document" || !input.decisionSummary.trim()) {
       throw new HarnessError("invalid_input", "a documented replace_document operation is required");
     }
-    const document = input.operations[0].document;
+    const document = this.normalizeNodeIdentity(tree.id, input.operations[0].document);
     this.assertValidDocument(document);
     const changeSetId = newId();
     this.database.run(
       "INSERT INTO draft_change_sets (id, tree_id, base_revision_id, operations_json, affected_references_json, decision_summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      changeSetId, input.treeId, input.baseRevisionId, canonicalJson(input.operations), canonicalJson(input.affectedReferences), input.decisionSummary, nowIso(),
+      changeSetId, input.treeId, input.baseRevisionId, canonicalJson([{ op: "replace_document", document }]), canonicalJson(input.affectedReferences), input.decisionSummary, nowIso(),
     );
     return this.persistRevision(tree, input.projectId, document, false);
   }
@@ -198,9 +214,10 @@ export class TaskTreeService {
     if (tree.current_revision_id !== input.baseRevisionId) {
       throw new HarnessError("revision_conflict", "the refinement preview has a stale base revision");
     }
-    this.assertValidDocument(input.proposedDocument);
+    const document = this.normalizeNodeIdentity(tree.id, input.proposedDocument);
+    this.assertValidDocument(document);
     const base = this.requireRevision(input.baseRevisionId);
-    const impact = analyzeDraftImpact(JSON.parse(base.document_json) as TaskTreeDocument, input.proposedDocument);
+    const impact = analyzeDraftImpact(JSON.parse(base.document_json) as TaskTreeDocument, document);
     if (!impact.hasStructuralChange) {
       throw new HarnessError("invalid_input", "the proposed Task Tree does not contain a structural change");
     }
@@ -217,7 +234,7 @@ export class TaskTreeService {
           impact_json, apply_mode, status, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
       `, previewId, input.projectId, input.treeId, input.baseRevisionId, impact.proposedDocumentHash,
-      canonicalJson(input.proposedDocument), canonicalJson(impact),
+      canonicalJson(document), canonicalJson(impact),
       impact.applyMode === "preview_required" ? "preview_required" : "direct", timestamp);
     });
     return { previewId, baseRevisionId: input.baseRevisionId, ...impact };
@@ -242,7 +259,7 @@ export class TaskTreeService {
         || !decision.agentRecommendation.trim() || !decision.userDecision.trim()) {
         throw new HarnessError("invalid_input", "a complete refinement Decision Record is required");
       }
-      const document = input.operations[0].document;
+      const document = this.normalizeNodeIdentity(tree.id, input.operations[0].document);
       this.assertValidDocument(document);
       const base = this.requireRevision(input.baseRevisionId);
       const impact = analyzeDraftImpact(JSON.parse(base.document_json) as TaskTreeDocument, document);
@@ -295,7 +312,7 @@ export class TaskTreeService {
           affected_artifact_ids_json, affected_relation_refs_json, affected_contract_ids_json,
           apply_mode, preview_id, planning_trace_event_id
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, changeSetId, input.treeId, input.baseRevisionId, canonicalJson(input.operations), canonicalJson(affectedRefs),
+      `, changeSetId, input.treeId, input.baseRevisionId, canonicalJson([{ op: "replace_document", document }]), canonicalJson(affectedRefs),
       decision.userDecision, timestamp, input.projectId, input.sourceUserMessageTraceEventId,
       canonicalJson(impact.affectedNodeIds), canonicalJson(impact.affectedBranchIds), canonicalJson(impact.affectedArtifactIds),
       canonicalJson(impact.affectedRelationRefs), canonicalJson(impact.affectedContractIds),
@@ -404,7 +421,7 @@ export class TaskTreeService {
   getRevisionById(projectId: string, treeId: string, revisionId: string): TaskTreeRevisionView {
     const tree = this.requireTree(projectId, treeId);
     const revision = this.requireRevision(revisionId);
-    if (!this.database.get("SELECT id FROM task_tree_revisions WHERE id = ? AND tree_id = ?", revisionId, treeId)) {
+    if (!this.database.get("SELECT id FROM runtime_task_tree_revisions WHERE id = ? AND tree_id = ?", revisionId, treeId)) {
       throw new HarnessError("not_found", "Task Tree revision was not found in the requested tree");
     }
     return {
@@ -548,7 +565,7 @@ export class TaskTreeService {
   }
 
   private persistRevision(tree: TreeRow, projectId: string, document: TaskTreeDocument, wrap = true): TaskTreeRevisionView {
-    document = normalizeTaskTreeDocument(document);
+    document = this.normalizeNodeIdentity(tree.id, document);
     const current = this.requireRevision(tree.current_revision_id);
     const documentChanged = current.document_json !== canonicalJson(document);
     const revisionId = newId();
@@ -563,7 +580,7 @@ export class TaskTreeService {
         current.id,
       ).map((row) => [row.task_node_id, row]));
       const previousBodies = new Map(this.database.all<{ node_id: string; body_json: string }>(
-        "SELECT node_id, body_json FROM task_node_revisions WHERE tree_revision_id = ?",
+        "SELECT node_id, body_json FROM runtime_task_node_revisions WHERE tree_revision_id = ?",
         current.id,
       ).map((row) => [row.node_id, row.body_json]));
       const previousDocument = JSON.parse(current.document_json) as TaskTreeDocument;
@@ -596,7 +613,7 @@ export class TaskTreeService {
         const previous = this.database.get<{ status: string; body_json: string }>(`
           SELECT n.status, nr.body_json
           FROM task_nodes n
-          JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
+          JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
           WHERE n.id = ? AND n.tree_id = ?
         `, current.id, node.id, tree.id);
         const nextStatus = !previous || previous.status === "draft"
@@ -605,9 +622,12 @@ export class TaskTreeService {
             ? previous.status
             : previous.status === "succeeded" ? "needs_revalidation" : "pending_user_confirmation";
         this.database.run(
-          "INSERT INTO task_nodes (id, tree_id, parent_id, title, status) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET parent_id = excluded.parent_id, title = excluded.title, status = excluded.status",
+          "INSERT INTO task_nodes (id, tree_id, parent_id, title, status) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET parent_id = excluded.parent_id, title = excluded.title, status = excluded.status WHERE task_nodes.tree_id = excluded.tree_id",
           node.id, tree.id, node.parentId, node.title, nextStatus,
         );
+        if (!this.database.get("SELECT id FROM task_nodes WHERE id = ? AND tree_id = ?", node.id, tree.id)) {
+          throw new HarnessError("storage_failure", "Task Tree node ID belongs to another tree", { nodeId: node.id, treeId: tree.id });
+        }
         const nodeRevisionId = newId();
         nodeRevisionIds.set(node.id, nodeRevisionId);
         this.database.run("INSERT INTO task_node_revisions (id, node_id, tree_revision_id, body_json, created_at) VALUES (?, ?, ?, ?, ?)", nodeRevisionId, node.id, revisionId, bodyJson, timestamp);
@@ -748,6 +768,11 @@ export class TaskTreeService {
     return { treeId: tree.id, revisionId, revision, title: tree.title, status: persistedTreeStatus, document };
   }
 
+  private normalizeNodeIdentity(treeId: string, document: TaskTreeDocument): TaskTreeDocument {
+    const projectId = this.database.get<{ project_id: string }>("SELECT project_id FROM task_trees WHERE id = ?", treeId)!.project_id;
+    return normalizeDocumentNodeIdentity(this.database, { projectId, treeId, document });
+  }
+
   private assertValidDocument(document: TaskTreeDocument): void {
     if (document.planningVersion === 1) {
       const errors = validateDraftStructure(document);
@@ -776,7 +801,7 @@ export class TaskTreeService {
   }
 
   private requireRevision(revisionId: string): RevisionRow {
-    const revision = this.database.get<RevisionRow>("SELECT id, revision, document_json, created_at FROM task_tree_revisions WHERE id = ?", revisionId);
+    const revision = this.database.get<RevisionRow>("SELECT id, revision, document_json, created_at FROM runtime_task_tree_revisions WHERE id = ?", revisionId);
     if (!revision) throw new HarnessError("not_found", "Task Tree revision was not found");
     return revision;
   }

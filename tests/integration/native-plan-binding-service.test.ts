@@ -34,7 +34,20 @@ function document(): TaskTreeDocument {
         requiredEvidence: [{ key: "test", description: "Canvas test" }], executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
       },
     ],
-    relations: [], artifacts: [],
+    relations: [],
+    artifacts: [
+      { id: "canvas-file", kind: "file", locator: "canvas.ts" },
+      { id: "canvas-api-artifact", kind: "contract", locator: "contract:canvas-api" },
+    ],
+    artifactLinks: [
+      { taskNodeId: "canvas-skeleton", artifactId: "canvas-file", relationType: "creates" },
+      { taskNodeId: "canvas-skeleton", artifactId: "canvas-api-artifact", relationType: "implements" },
+    ],
+    artifactContracts: [{
+      id: "canvas-api", artifactId: "canvas-api-artifact", name: "Canvas API", version: "1",
+      compatibilityPolicy: "exact", schemaOrSignature: "render(): void",
+      providerNodeIds: ["canvas-skeleton"], consumerNodeIds: ["canvas-implementation"], validationRefs: ["skeleton-test"],
+    }],
     skeletonCriteria: [{
       id: "canvas-skeleton", branchNodeId: "canvas", expectedArtifacts: ["canvas.ts"],
       requiredContracts: ["canvas-api"], verificationCommands: ["npm test"], readinessConditions: ["module imports"],

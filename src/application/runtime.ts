@@ -30,6 +30,8 @@ import { TaskTreeValidationService } from "./task-tree-validation-service.js";
 import { TaskTreeApprovalService } from "./task-tree-approval-service.js";
 import { NativePlanBindingService } from "./native-plan-binding-service.js";
 import { ExecutionSchedulerService } from "./execution-scheduler-service.js";
+import { NodeIdentityRepairService } from "./node-identity-repair-service.js";
+import { TaskTreeIterationService } from "./task-tree-iteration-service.js";
 
 export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
   const database = new RuntimeDatabase(path.join(resolveDataHome(environment), "runtime.db"));
@@ -69,10 +71,12 @@ export function openRuntime(environment: NodeJS.ProcessEnv = process.env) {
     projects,
     taskTrees,
     taskTreeDrafts: new TaskTreeDraftService(database, taskTrees),
+    taskTreeIterations: new TaskTreeIterationService(database, taskTrees),
     taskTreeValidation: new TaskTreeValidationService(database, taskTrees),
     taskTreeApprovals,
     nativePlans,
     scheduler,
+    nodeIdentities: new NodeIdentityRepairService(database),
     affiliations,
     workflows,
     executions: new NodeExecutionService(database),

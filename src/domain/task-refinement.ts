@@ -300,6 +300,12 @@ export function analyzePlanReadiness(document: TaskTreeDocument, scopeRootNodeId
       const skeletonNodes = [...branchScope].map((id) => byId.get(id)!)
         .filter((node) => node.executionPhase === "skeleton" && node.requiredEvidence?.length);
       const skeletonNodeIds = new Set(skeletonNodes.map((node) => node.id));
+      const skeletonEvidenceKeys = new Set(skeletonNodes.flatMap((node) =>
+        (node.requiredEvidence ?? []).map((evidence) => evidence.key)));
+      const artifactsByRef = new Map(document.artifacts.flatMap((artifact) => [
+        [artifact.id, artifact] as const,
+        [artifact.locator, artifact] as const,
+      ]));
       if (!skeletonNodes.length) {
         blockingIssues.push(issue({
           code: "skeleton_task_missing", category: "acceptance_skeleton", severity: "blocking",
@@ -308,10 +314,6 @@ export function analyzePlanReadiness(document: TaskTreeDocument, scopeRootNodeId
         }));
       }
       if (criterion && document.artifacts.length > 0) {
-        const artifactsByRef = new Map(document.artifacts.flatMap((artifact) => [
-          [artifact.id, artifact] as const,
-          [artifact.locator, artifact] as const,
-        ]));
         for (const artifactRef of criterion.expectedArtifacts) {
           const artifact = artifactsByRef.get(artifactRef);
           const ownerNodeIds = artifact
@@ -329,7 +331,7 @@ export function analyzePlanReadiness(document: TaskTreeDocument, scopeRootNodeId
           }
         }
       }
-      if (criterion && (document.artifactContracts?.length ?? 0) > 0) {
+      if (criterion) {
         const contractsById = new Map((document.artifactContracts ?? []).map((contract) => [contract.id, contract]));
         for (const contractRef of criterion.requiredContracts) {
           const contract = contractsById.get(contractRef);
@@ -340,6 +342,30 @@ export function analyzePlanReadiness(document: TaskTreeDocument, scopeRootNodeId
               summary: `Skeleton contract ${contractRef} must be provided by Skeleton work in ${byId.get(branchId)?.title ?? branchId}`,
               affectedRefs: [branchId, contractRef, ...providerNodeIds],
             }));
+          }
+          for (const validationRef of contract?.validationRefs ?? []) {
+            if (skeletonEvidenceKeys.has(validationRef)) continue;
+            const validationArtifact = artifactsByRef.get(validationRef);
+            const sourceNodeIds = validationArtifact
+              ? (document.artifactLinks ?? [])
+                .filter((link) => link.artifactId === validationArtifact.id
+                  && skeletonNodeIds.has(link.taskNodeId)
+                  && ["creates", "modifies", "implements", "verifies"].includes(link.relationType))
+                .map((link) => link.taskNodeId)
+              : [];
+            if (!sourceNodeIds.length) {
+              blockingIssues.push(issue({
+                code: "skeleton_contract_validation_unresolved", category: "acceptance_skeleton", severity: "blocking",
+                summary: `Skeleton contract ${contractRef} validation ${validationRef} must resolve to declared evidence or an explicitly owned validation artifact in ${byId.get(branchId)?.title ?? branchId}`,
+                affectedRefs: [branchId, contractRef, validationRef],
+              }));
+            } else {
+              warnings.push(issue({
+                code: "skeleton_contract_validation_requires_trace_attachment", category: "acceptance_skeleton", severity: "warning",
+                summary: `Attach the source Trace for validation artifact ${validationRef} to required evidence of its Skeleton work before evaluating contract ${contractRef}`,
+                affectedRefs: [branchId, contractRef, validationRef, ...sourceNodeIds],
+              }));
+            }
           }
         }
       }
