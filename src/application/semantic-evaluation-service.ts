@@ -79,7 +79,7 @@ export function loadSemanticEvidenceSnapshot(database: RuntimeDatabase, projectI
   const attempt = database.get<SemanticAttemptRow>(`
     SELECT a.id, a.project_id, a.tree_id, a.task_node_id, a.task_node_revision_id, a.status, nr.body_json
     FROM execution_attempts a
-    JOIN task_node_revisions nr ON nr.id = a.task_node_revision_id
+    JOIN runtime_task_node_revisions nr ON nr.id = a.task_node_revision_id
     WHERE a.id = ? AND a.project_id = ?
   `, attemptId, projectId);
   if (!attempt) throw new HarnessError("not_found", "Execution Attempt was not found in this Project");

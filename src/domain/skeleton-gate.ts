@@ -4,6 +4,9 @@ export interface SkeletonGateCheck {
   ref: string;
   satisfied: boolean;
   evidenceRefs: string[];
+  failureCode?: "required_contract_missing" | "contract_validation_missing";
+  validationRefs?: string[];
+  missingValidationRefs?: string[];
 }
 
 export interface SkeletonGateBranchObservation {
@@ -12,6 +15,7 @@ export interface SkeletonGateBranchObservation {
   criterionComplete: boolean;
   skeletonNodeIds: string[];
   succeededAttemptIds: string[];
+  supportingAttemptIds?: string[];
   expectedArtifacts: SkeletonGateCheck[];
   requiredContracts: SkeletonGateCheck[];
   verificationCommands: SkeletonGateCheck[];
@@ -26,6 +30,7 @@ export interface SkeletonGateBlocker {
     | "skeleton_attempt_incomplete"
     | "expected_artifact_missing"
     | "required_contract_missing"
+    | "contract_validation_missing"
     | "verification_command_missing"
     | "readiness_evidence_missing"
     | "blocking_drift";
@@ -57,7 +62,7 @@ export function evaluateSkeletonGate(input: {
         blockers.push({ code: "expected_artifact_missing", ref: check.ref });
       }
       for (const check of branch.requiredContracts.filter((value) => !value.satisfied)) {
-        blockers.push({ code: "required_contract_missing", ref: check.ref });
+        blockers.push({ code: check.failureCode ?? "required_contract_missing", ref: check.ref });
       }
       for (const check of branch.verificationCommands.filter((value) => !value.satisfied)) {
         blockers.push({ code: "verification_command_missing", ref: check.ref });

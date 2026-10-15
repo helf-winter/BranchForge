@@ -39,6 +39,23 @@ async function finalStageFixture() {
   return { directory, projectDir, environment, runtime, project, tree, rootNodeId };
 }
 
+async function affiliatedSession(fixture: Awaited<ReturnType<typeof finalStageFixture>>, sessionId: string) {
+  const proposal = fixture.runtime.affiliations.propose({
+    projectId: fixture.project.projectId, requestTitle: "Close lifecycle",
+    recommendation: "merge", recommendedTreeId: fixture.tree.treeId,
+  });
+  const answer = await fixture.runtime.hooks.ingest(mapClaudeHook({
+    hook_event_name: "UserPromptSubmit", session_id: sessionId,
+    cwd: fixture.projectDir, prompt: "归并到现有任务树，继续执行",
+  }));
+  if (!answer.recorded) throw new Error("affiliation answer was not recorded");
+  await fixture.runtime.affiliations.resolve({
+    projectId: fixture.project.projectId, decisionId: proposal.decisionId,
+    choice: "merge", chosenTreeId: fixture.tree.treeId, answerTraceEventId: answer.eventId,
+  });
+  return proposal.decisionId;
+}
+
 async function sharedBranchesFixture() {
   const fixture = await finalStageFixture();
   fixture.runtime.database.run(
@@ -109,6 +126,174 @@ async function sharedBranchesFixture() {
 }
 
 describe("FinalReportService", () => {
+  it("ends the completed session profile without archiving its tree or reopening planning", async () => {
+    const f = await finalStageFixture();
+    const decisionId = await affiliatedSession(f, "completed-session");
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "completed-session"))
+      .toMatchObject({ profile: "structured_coding" });
+
+    f.runtime.finalReports.finalize({ projectId: f.project.projectId, treeId: f.tree.treeId,
+      workflowRevision: 8, idempotencyKey: "complete-session" });
+
+    expect(await f.runtime.hooks.ingest(mapClaudeHook({
+      hook_event_name: "Stop", session_id: "completed-session", cwd: f.projectDir,
+    }))).toMatchObject({ recorded: false, reason: "inactive" });
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "completed-session"))
+      .toMatchObject({ profile: "conversation", reasonCode: "task_tree:completed", affiliationDecisionId: decisionId });
+    expect(f.runtime.queries.getRuntimeSnapshot(f.project.projectId))
+      .toMatchObject({ selectedTreeId: f.tree.treeId, workflow: null });
+    expect(f.runtime.database.get("SELECT status FROM task_trees WHERE id = ?", f.tree.treeId))
+      .toEqual({ status: "completed" });
+    expect(await f.runtime.hooks.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "completed-session", cwd: f.projectDir,
+      tool_name: "Bash", tool_use_id: "post-completion-build", tool_input: { command: "npm run build" },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+    const reopened = openRuntime(f.environment);
+    runtimes.push(reopened);
+    expect(reopened.runtimeProfiles.current(f.project.projectId, "completed-session"))
+      .toMatchObject({ profile: "conversation" });
+    expect(reopened.database.all("SELECT next_profile, reason_code FROM runtime_profile_transitions WHERE project_id = ? AND session_id = ? AND reason_code = 'task_tree:completed'", f.project.projectId, "completed-session"))
+      .toEqual([{ next_profile: "conversation", reason_code: "task_tree:completed" }]);
+  });
+
+  it("preserves another session's new structured request when completing a tree", async () => {
+    const f = await finalStageFixture();
+    await affiliatedSession(f, "completed-session");
+    await f.runtime.hooks.ingest(mapClaudeHook({
+      hook_event_name: "UserPromptSubmit", session_id: "new-request", cwd: f.projectDir,
+      prompt: "请先和我讨论并完善需求，确认规划之后再开始实现。",
+    }));
+    f.runtime.finalReports.finalize({ projectId: f.project.projectId, treeId: f.tree.treeId,
+      workflowRevision: 8, idempotencyKey: "preserve-new-request" });
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "new-request"))
+      .toMatchObject({ profile: "structured_coding" });
+    expect(await f.runtime.hooks.ingest(mapClaudeHook({
+      hook_event_name: "Stop", session_id: "new-request", cwd: f.projectDir,
+    }))).toMatchObject({ directive: { kind: "stop" } });
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "completed-session"))
+      .toMatchObject({ profile: "conversation" });
+  });
+
+  it("does not clear a newer request on an idempotent completion retry", async () => {
+    const f = await finalStageFixture();
+    await affiliatedSession(f, "completed-session");
+    const input = { projectId: f.project.projectId, treeId: f.tree.treeId,
+      workflowRevision: 8, idempotencyKey: "retry-after-new-request" };
+    const report = f.runtime.finalReports.finalize(input);
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "completed-session"))
+      .toMatchObject({ profile: "conversation" });
+    await f.runtime.runtimeProfiles.resolveForPrompt({ cwd: f.projectDir, sessionId: "completed-session",
+      prompt: "请先和我讨论并完善需求，确认规划之后再开始实现。" });
+    expect(f.runtime.finalReports.finalize(input)).toMatchObject({ reportId: report.reportId, created: false });
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "completed-session"))
+      .toMatchObject({ profile: "structured_coding" });
+    expect(await f.runtime.hooks.ingest(mapClaudeHook({
+      hook_event_name: "Stop", session_id: "completed-session", cwd: f.projectDir,
+    }))).toMatchObject({ directive: { kind: "stop" } });
+  });
+
+  it("finishes a session resumed by a user prompt after root verification", async () => {
+    const f = await finalStageFixture();
+    await affiliatedSession(f, "resumed-session");
+    const prompt = await f.runtime.hooks.ingest(mapClaudeHook({
+      hook_event_name: "UserPromptSubmit", session_id: "resumed-session", cwd: f.projectDir,
+      prompt: "继续完成最终报告",
+    }));
+    if (!prompt.recorded) throw new Error("continuation prompt was not recorded");
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "resumed-session"))
+      .toMatchObject({ profile: "structured_coding", reasonCode: "active_approved_workflow", affiliationDecisionId: null });
+    expect(f.runtime.database.get("SELECT tree_id FROM trace_events WHERE id = ?", prompt.eventId))
+      .toEqual({ tree_id: f.tree.treeId });
+    f.runtime.finalReports.finalize({ projectId: f.project.projectId, treeId: f.tree.treeId,
+      workflowRevision: 8, idempotencyKey: "resumed-session" });
+    expect(await f.runtime.hooks.ingest(mapClaudeHook({
+      hook_event_name: "Stop", session_id: "resumed-session", cwd: f.projectDir,
+    }))).toMatchObject({ recorded: false, reason: "inactive" });
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "resumed-session"))
+      .toMatchObject({ profile: "conversation" });
+  });
+
+  it.each(["继续完成最终报告", " \t\n继续完成最终报告\r\n\u3000"])("uses the latest continuation Trace for a cached route (%j)", async (continuationPrompt) => {
+    const f = await finalStageFixture();
+    await affiliatedSession(f, "resumed-session");
+    await f.runtime.hooks.ingest(mapClaudeHook({ hook_event_name: "UserPromptSubmit",
+      session_id: "resumed-session", cwd: f.projectDir, prompt: continuationPrompt }));
+    const priorRouteId = f.runtime.runtimeProfiles.current(f.project.projectId, "resumed-session")!.routeDecisionId;
+    f.runtime.finalReports.finalize({ projectId: f.project.projectId, treeId: f.tree.treeId,
+      workflowRevision: 8, idempotencyKey: "first-cached-route" });
+    const next = await f.runtime.taskTrees.createTaskRoot({ projectId: f.project.projectId, title: "Close lifecycle" });
+    f.runtime.database.run("UPDATE task_nodes SET status = 'succeeded' WHERE tree_id = ?", next.treeId);
+    f.runtime.database.run("UPDATE workflow_states SET stage = 'final_report', revision = 8 WHERE tree_id = ?", next.treeId);
+    f.runtime.database.run(`INSERT INTO workflow_phase_gate_results (
+      id, project_id, tree_id, tree_revision_id, workflow_revision, stage, status,
+      required_node_ids_json, incomplete_node_ids_json, blocking_drift_ids_json, blocker_codes_json, next_stage, created_at
+    ) VALUES ('next-root-gate', ?, ?, ?, 7, 'root_verification', 'passed', '[]', '[]', '[]', '[]', 'final_report', '2030')`,
+    f.project.projectId, next.treeId, next.revisionId);
+    const prompt = await f.runtime.hooks.ingest(mapClaudeHook({ hook_event_name: "UserPromptSubmit",
+      session_id: "resumed-session", cwd: f.projectDir, prompt: "继续完成最终报告" }));
+    if (!prompt.recorded) throw new Error("cached continuation was not recorded");
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "resumed-session"))
+      .toMatchObject({ routeDecisionId: priorRouteId, profile: "structured_coding" });
+    expect(f.runtime.database.get("SELECT tree_id FROM trace_events WHERE id = ?", prompt.eventId))
+      .toEqual({ tree_id: next.treeId });
+    f.runtime.finalReports.finalize({ projectId: f.project.projectId, treeId: next.treeId,
+      workflowRevision: 8, idempotencyKey: "next-cached-route" });
+    expect(await f.runtime.hooks.ingest(mapClaudeHook({ hook_event_name: "Stop",
+      session_id: "resumed-session", cwd: f.projectDir })))
+      .toMatchObject({ recorded: false, reason: "inactive" });
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "resumed-session"))
+      .toMatchObject({ profile: "conversation" });
+  });
+
+  it("does not reset a structured session when completion is rejected", async () => {
+    const f = await finalStageFixture();
+    await affiliatedSession(f, "blocked-session");
+    f.runtime.database.run("UPDATE task_nodes SET status = 'running' WHERE id = ?", f.rootNodeId);
+    expect(() => f.runtime.finalReports.finalize({ projectId: f.project.projectId, treeId: f.tree.treeId,
+      workflowRevision: 8, idempotencyKey: "blocked-session" }))
+      .toThrow(expect.objectContaining({ code: "workflow_transition_rejected" }));
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "blocked-session"))
+      .toMatchObject({ profile: "structured_coding" });
+    expect(f.runtime.database.all("SELECT id FROM runtime_profile_transitions WHERE reason_code = 'task_tree:completed'"))
+      .toEqual([]);
+  });
+
+  it.each([
+    { startedAt: "2030-01-01T00:00:00.000Z", expectedProfile: "conversation" },
+    { startedAt: "2020-01-01T00:00:00.000Z", expectedProfile: "structured_coding" },
+  ])("only resets an execution participant whose request predates the Attempt ($startedAt)", async ({ startedAt, expectedProfile }) => {
+    const f = await finalStageFixture();
+    await f.runtime.runtimeProfiles.resolveForPrompt({ cwd: f.projectDir, sessionId: "participant",
+      prompt: "请先和我讨论并完善需求，确认规划之后再开始实现。" });
+    const nodeRevisionId = f.runtime.database.get<{ id: string }>(
+      "SELECT id FROM task_node_revisions WHERE tree_revision_id = ? AND node_id = ?", f.tree.revisionId, f.rootNodeId,
+    )!.id;
+    f.runtime.database.run(`INSERT INTO execution_attempts (
+      id, project_id, tree_id, task_node_id, task_node_revision_id, attempt_number, status, started_at, session_id
+    ) VALUES ('participant-attempt', ?, ?, ?, ?, 1, 'succeeded', ?, 'participant')`,
+    f.project.projectId, f.tree.treeId, f.rootNodeId, nodeRevisionId, startedAt);
+    f.runtime.finalReports.finalize({ projectId: f.project.projectId, treeId: f.tree.treeId,
+      workflowRevision: 8, idempotencyKey: "participant-session" });
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "participant"))
+      .toMatchObject({ profile: expectedProfile });
+  });
+
+  it("rolls back the report and workflow if the completion profile transition fails", async () => {
+    const f = await finalStageFixture();
+    await affiliatedSession(f, "completed-session");
+    f.runtime.database.run(`CREATE TRIGGER reject_completion_profile
+      BEFORE INSERT ON runtime_profile_transitions WHEN NEW.reason_code = 'task_tree:completed'
+      BEGIN SELECT RAISE(ABORT, 'test profile failure'); END`);
+    expect(() => f.runtime.finalReports.finalize({ projectId: f.project.projectId, treeId: f.tree.treeId,
+      workflowRevision: 8, idempotencyKey: "atomic-profile" }))
+      .toThrow(expect.objectContaining({ code: "storage_failure" }));
+    expect(f.runtime.finalReports.list(f.project.projectId)).toEqual([]);
+    expect(f.runtime.queries.getRuntimeSnapshot(f.project.projectId))
+      .toMatchObject({ workflow: { stage: "final_report", revision: 8 } });
+    expect(f.runtime.runtimeProfiles.current(f.project.projectId, "completed-session"))
+      .toMatchObject({ profile: "structured_coding" });
+  });
+
   it.each(["unchanged", "changed", "invalidated"])("retains only valid prior-revision evidence (%s)", async (scenario) => {
     const unchanged = scenario !== "changed";
     const f = await finalStageFixture();

@@ -62,7 +62,7 @@ export class ReplacementService {
       node_id: string; tree_id: string; tree_revision_id: string; created_at: string; current_revision_id: string;
     }>(`
       SELECT nr.node_id, n.tree_id, nr.tree_revision_id, nr.created_at, t.current_revision_id
-      FROM task_node_revisions nr
+      FROM runtime_task_node_revisions nr
       JOIN task_nodes n ON n.id = nr.node_id
       JOIN task_trees t ON t.id = n.tree_id
       WHERE nr.id = ? AND t.project_id = ?
@@ -163,7 +163,7 @@ export class ReplacementService {
     if (!input.reason.trim()) throw new HarnessError("replacement_invalid", "Replacement reason is required");
     const tree = this.database.get<{ current_revision_id: string; document_json: string }>(`
       SELECT t.current_revision_id, tr.document_json FROM task_trees t
-      JOIN task_tree_revisions tr ON tr.id = t.current_revision_id
+      JOIN runtime_task_tree_revisions tr ON tr.id = t.current_revision_id
       WHERE t.id = ? AND t.project_id = ?
     `, input.treeId, input.projectId);
     if (!tree) throw new HarnessError("not_found", "Task Tree was not found in this Project");
@@ -176,7 +176,7 @@ export class ReplacementService {
       throw new HarnessError("replacement_invalid", "Task Node already has an active Replacement");
     }
     const oldRevision = this.database.get<{ id: string; body_json: string; created_at: string }>(`
-      SELECT nr.id, nr.body_json, nr.created_at FROM task_node_revisions nr
+      SELECT nr.id, nr.body_json, nr.created_at FROM runtime_task_node_revisions nr
       JOIN task_nodes n ON n.id = nr.node_id
       WHERE nr.node_id = ? AND nr.tree_revision_id = ? AND n.tree_id = ?
     `, input.nodeId, tree.current_revision_id, input.treeId);
@@ -220,7 +220,7 @@ export class ReplacementService {
       ? JSON.parse(oldBinding.requires_contract_ids_json) as string[]
       : contractRows.filter((row) => (JSON.parse(row.consumer_revision_ids_json) as string[]).includes(oldRevision.id)).map((row) => row.contract_id);
     const revisionNodes = new Map(this.database.all<{ id: string; node_id: string }>(`
-      SELECT nr.id, nr.node_id FROM task_node_revisions nr WHERE nr.tree_revision_id = ?
+      SELECT nr.id, nr.node_id FROM runtime_task_node_revisions nr WHERE nr.tree_revision_id = ?
     `, tree.current_revision_id).map((row) => [row.id, row.node_id]));
     const availableProviderContracts = contractRows.flatMap((row) =>
       (JSON.parse(row.provider_revision_ids_json) as string[]).some((revisionId) => revisionNodes.get(revisionId) !== input.nodeId)
@@ -358,7 +358,7 @@ export class ReplacementService {
       for (const nodeId of suspensionOrder) {
         const node = this.database.get<{ status: string; revision_id: string }>(`
           SELECT n.status, nr.id AS revision_id FROM task_nodes n
-          JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
+          JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
           WHERE n.id = ? AND n.tree_id = ?
         `, tree.current_revision_id, nodeId, record.tree_id);
         if (!node) throw new HarnessError("replacement_invalid", "affected Task Node disappeared before suspension");
@@ -419,7 +419,7 @@ export class ReplacementService {
     }
     const tree = this.database.get<{ current_revision_id: string; document_json: string }>(`
       SELECT t.current_revision_id, tr.document_json FROM task_trees t
-      JOIN task_tree_revisions tr ON tr.id = t.current_revision_id
+      JOIN runtime_task_tree_revisions tr ON tr.id = t.current_revision_id
       WHERE t.id = ? AND t.project_id = ?
     `, record.tree_id, input.projectId);
     if (!tree || tree.current_revision_id !== record.expected_tree_revision_id) {
@@ -526,7 +526,7 @@ export class ReplacementService {
         decisionSummary: `Activate replacement ${record.id}`,
       });
       const activeRevisions = new Map(this.database.all<{ id: string; node_id: string }>(
-        "SELECT id, node_id FROM task_node_revisions WHERE tree_revision_id = ?", activated.revisionId,
+        "SELECT id, node_id FROM runtime_task_node_revisions WHERE tree_revision_id = ?", activated.revisionId,
       ).map((row) => [row.node_id, row.id]));
       const candidateActiveRevisionId = activeRevisions.get(record.task_node_id)!;
       this.database.run(`INSERT INTO task_node_revision_contract_bindings (
@@ -635,7 +635,7 @@ export class ReplacementService {
 
   private ensureCompositionState(projectId: string, treeId: string, nodeId: string, treeRevisionId: string, state: "active", replacementId: string | null, at: string): void {
     const revision = this.database.get<{ id: string }>(
-      "SELECT id FROM task_node_revisions WHERE node_id = ? AND tree_revision_id = ?", nodeId, treeRevisionId,
+      "SELECT id FROM runtime_task_node_revisions WHERE node_id = ? AND tree_revision_id = ?", nodeId, treeRevisionId,
     );
     if (!revision) throw new HarnessError("replacement_invalid", "affected Task Node revision was not found");
     this.database.run(`INSERT INTO task_node_composition_states (

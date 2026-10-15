@@ -3,6 +3,7 @@ import { hasNativeQuestionAnswer } from "./user-decision-evidence.js";
 import { commandArtifactLocator } from "../domain/artifact.js";
 import { buildExecutionContext, type ExecutionContext } from "../domain/execution-context.js";
 import { newId } from "../domain/ids.js";
+import { isReadOnlyShellCommand } from "../domain/read-only-shell.js";
 import { canonicalJson, createHookIdempotencyKey, redactSecrets } from "../domain/trace.js";
 import type { ClaudeHookEvent } from "../bindings/claude/hook-mapper.js";
 import type { RuntimeDatabase } from "../storage/database.js";
@@ -201,6 +202,8 @@ export class HookIngestionService {
       ...(event.toolName ? { toolName: event.toolName } : {}),
       ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
       ...(event.toolInput ? { toolInput: event.toolInput } : {}),
+      ...(event.toolName === "Bash" && typeof event.toolInput?.command === "string"
+        ? { commandFingerprint: commandArtifactLocator(event.toolInput.command) } : {}),
       ...(event.toolResponse !== undefined ? { toolResponse: event.toolResponse } : {}),
       ...(event.prompt ? { prompt: event.prompt } : {}),
       ...(violationReason ? { reason: violationReason } : {}),
@@ -377,15 +380,15 @@ export class HookIngestionService {
     if (event.toolName !== "Bash") return false;
     const command = typeof event.toolInput?.command === "string" ? event.toolInput.command.trim() : "";
     if (!command) return false;
+    if (isReadOnlyShellCommand(command)) return false;
     const redirection = /(^|[^<>])>{1,2}(?![>&])\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g;
     for (const match of command.matchAll(redirection)) {
       const target = match[2] ?? match[3] ?? match[4];
       if (target && this.isProjectPath(event.cwd, target)) return true;
     }
     if (this.isSimpleExternalMutation(event.cwd, command)) return false;
-    const readOnlyCommand = /^(?:pwd|ls(?:\s|$)|rg(?:\s|$)|grep(?:\s|$)|cat(?:\s|$)|head(?:\s|$)|tail(?:\s|$)|wc(?:\s|$)|stat(?:\s|$)|which(?:\s|$)|type(?:\s|$)|git\s+(?:status|diff|log|show)(?:\s|$)|npm\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|pnpm\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|yarn\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|vitest(?:\s|$)|pytest(?:\s|$)|tsc\s+--noEmit(?:\s|$)|node\s+(?:--version|-v)(?:\s|$))[^;&|]*$/;
-    const unsafeFind = /^find\b/.test(command) && /(?:-delete|-exec|-execdir|-ok)\b/.test(command);
-    if (!unsafeFind && (/^find\b[^;&|]*$/.test(command) || readOnlyCommand.test(command))) return false;
+    const verificationCommand = /^(?:npm\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|pnpm\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|yarn\s+(?:test|run\s+(?:test|typecheck|check))(?:\s|$)|vitest(?:\s|$)|pytest(?:\s|$)|tsc\s+--noEmit(?:\s|$))[^;&|]*$/;
+    if (verificationCommand.test(command)) return false;
     // In structured mode, an unknown shell command is potentially mutating. This prevents
     // script runners and package scripts from bypassing the lifecycle boundary.
     return true;

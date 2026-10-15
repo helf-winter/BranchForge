@@ -1,6 +1,6 @@
 {
   "name": "agent-harness",
-  "version": "0.1.4",
+  "version": "0.1.10",
   "description": "Task Tree workflow, runtime state, Trace facts, and Artifact memory for coding agents",
   "author": {
     "name": "Agent Harness"

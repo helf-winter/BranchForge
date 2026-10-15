@@ -6,10 +6,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { RuntimeDatabase } from "../../src/storage/database.js";
 
 const dirs: string[] = [];
-const entry = path.resolve("src/cli/entry.ts");
-const tsx = path.resolve("node_modules/tsx/dist/cli.mjs");
+// npm pretest builds this release entry. Exercise the shipped CLI, avoiding
+// repeated tsx filesystem transforms in every subprocess under full-suite load.
+const entry = path.resolve("plugin/runtime/cli.mjs");
 function run(cwd: string, args: string[]) {
-  return spawnSync(process.execPath, [tsx, entry, ...args], {
+  return spawnSync(process.execPath, [entry, ...args], {
     cwd, encoding: "utf8", env: { ...process.env, AGENT_HARNESS_DATA_HOME: path.join(cwd, ".data") },
   });
 }

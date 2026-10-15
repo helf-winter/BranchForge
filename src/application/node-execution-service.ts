@@ -6,6 +6,7 @@ import type { RequiredEvidence, TaskNodeInput } from "../domain/task-tree.js";
 import type { WorkflowStage } from "../domain/workflow.js";
 import type { RuntimeDatabase } from "../storage/database.js";
 import { ExecutionSchedulerService } from "./execution-scheduler-service.js";
+import { ArtifactEvidenceBaselineService } from "./artifact-evidence-baseline-service.js";
 
 interface ExecutableNodeRow {
   node_id: string;
@@ -100,7 +101,12 @@ export class NodeExecutionService {
       if (this.database.get("SELECT id FROM execution_attempts WHERE task_node_id = ? AND status IN ('running', 'verifying')", node.node_id)) {
         throw new HarnessError("attempt_already_active", "Task Node already has an active attempt");
       }
-      if (!(["ready", "failed", "needs_revalidation"] as string[]).includes(node.node_status)) {
+      const recoveryNode = node.node_status === "succeeded" && node.workflow_stage === "skeleton_pass"
+        ? this.scheduler.next({ projectId: input.projectId, treeId: node.tree_id }) : null;
+      const approvedRepair = recoveryNode?.nodeId === node.node_id && Boolean(recoveryNode.recovery);
+      const scheduledRevalidation = node.node_status === "succeeded" ? this.scheduler.next({ projectId: input.projectId, treeId: node.tree_id }) : null;
+      const approvedRevalidation = scheduledRevalidation?.nodeId === node.node_id && scheduledRevalidation.executionPurpose === "revalidation";
+      if (!(["ready", "failed", "needs_revalidation"] as string[]).includes(node.node_status) && !approvedRepair && !approvedRevalidation) {
         throw new HarnessError("attempt_not_executable", `Task Node status ${node.node_status} is not executable`);
       }
       if (node.confirmation_state !== "confirmed") {
@@ -114,7 +120,7 @@ export class NodeExecutionService {
         throw new HarnessError("attempt_not_executable", `Task Node phase ${body.executionPhase ?? "undefined"} is not allowed during ${node.workflow_stage}`);
       }
       const document = this.database.get<{ document_json: string }>(
-        "SELECT document_json FROM task_tree_revisions WHERE id = ?",
+        "SELECT document_json FROM runtime_task_tree_revisions WHERE id = ?",
         node.current_revision_id,
       );
       let hasSchedulableDocument = false;
@@ -164,6 +170,7 @@ export class NodeExecutionService {
     const attempt = this.requireAttemptRow(input.projectId, input.attemptId);
     this.assertAttemptStatus(attempt, input.expectedStatus);
     this.database.transaction(() => {
+      new ArtifactEvidenceBaselineService(this.database).captureStartWithinTransaction(input);
       this.database.run("UPDATE execution_attempts SET status = 'verifying' WHERE id = ?", attempt.id);
       this.database.run("UPDATE task_nodes SET status = 'verifying' WHERE id = ?", attempt.task_node_id);
     });
@@ -175,7 +182,7 @@ export class NodeExecutionService {
     if (!(["running", "verifying"] as ExecutionAttemptStatus[]).includes(attempt.status)) {
       throw new HarnessError("attempt_state_conflict", "evidence can only be attached to an active attempt");
     }
-    const nodeRevision = this.database.get<{ body_json: string }>("SELECT body_json FROM task_node_revisions WHERE id = ?", attempt.task_node_revision_id);
+    const nodeRevision = this.database.get<{ body_json: string }>("SELECT body_json FROM runtime_task_node_revisions WHERE id = ?", attempt.task_node_revision_id);
     const requiredEvidence = (JSON.parse(nodeRevision?.body_json ?? "{}") as TaskNodeInput).requiredEvidence ?? [];
     if (!requiredEvidence.some((item: RequiredEvidence) => item.key === input.requiredEvidenceKey)) {
       throw new HarnessError("invalid_input", "required evidence key is not declared by this Task Node revision");
@@ -201,7 +208,7 @@ export class NodeExecutionService {
     this.database.transaction(() => {
       this.database.run("UPDATE execution_attempts SET status = 'aborted', completed_at = ? WHERE id = ?", completedAt, attempt.id);
       const current = this.database.get<{ current_revision_id: string }>("SELECT current_revision_id FROM task_trees WHERE id = ?", attempt.tree_id);
-      const revision = this.database.get<{ tree_revision_id: string }>("SELECT tree_revision_id FROM task_node_revisions WHERE id = ?", attempt.task_node_revision_id);
+      const revision = this.database.get<{ tree_revision_id: string }>("SELECT tree_revision_id FROM runtime_task_node_revisions WHERE id = ?", attempt.task_node_revision_id);
       this.database.run("UPDATE task_nodes SET status = ? WHERE id = ?", current?.current_revision_id === revision?.tree_revision_id ? "ready" : "needs_revalidation", attempt.task_node_id);
     });
     return this.requireAttempt(input.projectId, input.attemptId);
@@ -215,7 +222,7 @@ export class NodeExecutionService {
              cs.state AS confirmation_state, w.active_branch_node_id
       FROM task_nodes n
       JOIN task_trees t ON t.id = n.tree_id
-      JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
+      JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
       JOIN task_node_confirmation_states cs ON cs.task_node_id = n.id AND cs.tree_revision_id = t.current_revision_id
       JOIN workflow_states w ON w.tree_id = t.id AND w.project_id = t.project_id AND w.active = 1
       WHERE n.id = ? AND t.project_id = ?
@@ -259,7 +266,7 @@ export class NodeExecutionService {
         SELECT n.status
         FROM task_nodes n
         JOIN task_trees t ON t.id = n.tree_id
-        JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
+        JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
         WHERE n.id = ? AND n.tree_id = ?
       `, dependencyId, treeId);
       if (!dependency || !complete(dependencyId)) {
@@ -274,7 +281,7 @@ export class NodeExecutionService {
       SELECT n.id, n.status
       FROM task_nodes n
       JOIN task_trees t ON t.id = n.tree_id
-      JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
+      JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
       WHERE n.tree_id = ? AND n.parent_id = ?
       ORDER BY n.id
     `, treeId, parentNodeId).find((child) => !complete(child.id));

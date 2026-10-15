@@ -7,11 +7,14 @@ import { migrations } from "./migrations.js";
 export class RuntimeDatabase {
   private readonly database: DatabaseSync;
 
-  constructor(readonly filename: string) {
-    mkdirSync(path.dirname(filename), { recursive: true });
-    this.database = new DatabaseSync(filename);
-    this.database.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
-    this.migrate();
+  constructor(readonly filename: string, options: { readOnly?: boolean } = {}) {
+    if (!options.readOnly) mkdirSync(path.dirname(filename), { recursive: true });
+    this.database = new DatabaseSync(filename, { readOnly: options.readOnly ?? false });
+    this.database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+    if (!options.readOnly) {
+      this.database.exec("PRAGMA journal_mode = WAL;");
+      this.migrate();
+    }
   }
 
   private migrate(): void {

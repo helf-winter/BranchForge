@@ -14,6 +14,7 @@ import { FailureCaseService } from "./failure-case-service.js";
 import { EvolutionService } from "./evolution-service.js";
 import { loadSemanticEvidenceSnapshot } from "./semantic-evaluation-service.js";
 import { loadNodeCompletion } from "./node-completion.js";
+import { ArtifactEvidenceBaselineService } from "./artifact-evidence-baseline-service.js";
 
 interface EvaluationAttemptRow {
   id: string;
@@ -99,7 +100,8 @@ export class EvaluationService {
       semanticEvaluationResultId = semantic?.id ?? null;
       semanticEvidencePassed = semantic?.status === "passed";
     }
-    const verdict: EvaluationVerdict = input.proposedVerdict === "succeeded" && (!successConditionsMet || blockingDrift || !semanticEvidencePassed)
+    const baseline = new ArtifactEvidenceBaselineService(this.database).captureEndWithinTransaction(input);
+    const verdict: EvaluationVerdict = input.proposedVerdict === "succeeded" && (!successConditionsMet || blockingDrift || !semanticEvidencePassed || baseline.changedArtifactIds.length > 0)
       ? "uncertain"
       : input.proposedVerdict;
     const currentRevision = attempt.revision_tree_id === attempt.current_revision_id;
@@ -179,7 +181,7 @@ export class EvaluationService {
              nr.body_json, nr.tree_revision_id AS revision_tree_id,
              t.current_revision_id, n.status AS node_status
       FROM execution_attempts a
-      JOIN task_node_revisions nr ON nr.id = a.task_node_revision_id
+      JOIN runtime_task_node_revisions nr ON nr.id = a.task_node_revision_id
       JOIN task_trees t ON t.id = a.tree_id
       JOIN task_nodes n ON n.id = a.task_node_id
       WHERE a.id = ? AND a.project_id = ?
@@ -198,7 +200,7 @@ export class EvaluationService {
       `SELECT n.id
        FROM task_nodes n
        JOIN task_trees t ON t.id = n.tree_id
-       JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
+       JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = t.current_revision_id
        WHERE n.tree_id = ? AND n.parent_id = ?`,
       treeId, nodeId,
     ).every((child) => complete(child.id));

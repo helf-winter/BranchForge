@@ -71,7 +71,7 @@ export class ProjectCloneService {
     const revisions = this.database.all<{
       id: string; tree_id: string; revision: number; document_json: string;
     }>(`SELECT r.id, r.tree_id, r.revision, r.document_json
-        FROM task_tree_revisions r JOIN task_trees t ON t.id = r.tree_id
+        FROM runtime_task_tree_revisions r JOIN task_trees t ON t.id = r.tree_id
         WHERE t.project_id = ? ORDER BY r.tree_id, r.revision`, source.id);
     const documents = new Map(revisions.map((row) => [row.id, JSON.parse(row.document_json) as TaskTreeDocument]));
     const nodes = this.database.all<{
@@ -80,7 +80,7 @@ export class ProjectCloneService {
         JOIN task_trees t ON t.id = n.tree_id WHERE t.project_id = ? ORDER BY n.tree_id, n.id`, source.id);
     const nodeRevisions = this.database.all<{
       id: string; node_id: string; tree_revision_id: string;
-    }>(`SELECT nr.id, nr.node_id, nr.tree_revision_id FROM task_node_revisions nr
+    }>(`SELECT nr.id, nr.node_id, nr.tree_revision_id FROM runtime_task_node_revisions nr
         JOIN task_nodes n ON n.id = nr.node_id JOIN task_trees t ON t.id = n.tree_id
         WHERE t.project_id = ? ORDER BY nr.tree_revision_id, nr.node_id`, source.id);
     const artifacts = this.database.all<Record<string, unknown> & {
@@ -210,15 +210,15 @@ export class ProjectCloneService {
       this.map(input.cloneId, "task_node_revision", revision.id, maps.nodeRevisions.get(revision.id)!, input.createdAt);
     }
     for (const row of this.database.all<{ node_revision_id: string }>(`
-      SELECT l.node_revision_id FROM leaf_task_contracts l JOIN task_node_revisions nr ON nr.id = l.node_revision_id
+      SELECT l.node_revision_id FROM leaf_task_contracts l JOIN runtime_task_node_revisions nr ON nr.id = l.node_revision_id
       JOIN task_nodes n ON n.id = nr.node_id JOIN task_trees t ON t.id = n.tree_id WHERE t.project_id = ?`, input.sourceProjectId)) {
       const targetRevisionId = maps.nodeRevisions.get(row.node_revision_id)!;
-      const body = this.database.get<{ body_json: string }>("SELECT body_json FROM task_node_revisions WHERE id = ?", targetRevisionId)!;
+      const body = this.database.get<{ body_json: string }>("SELECT body_json FROM runtime_task_node_revisions WHERE id = ?", targetRevisionId)!;
       this.database.run("INSERT INTO leaf_task_contracts (node_revision_id, contract_json) VALUES (?, ?)", targetRevisionId, body.body_json);
     }
     for (const row of this.database.all<{ id: string; tree_revision_id: string; criterion: string; criteria_json: string | null }>(`
       SELECT s.id, s.tree_revision_id, s.criterion, s.criteria_json FROM skeleton_acceptance_criteria s
-      JOIN task_tree_revisions r ON r.id = s.tree_revision_id JOIN task_trees t ON t.id = r.tree_id
+      JOIN runtime_task_tree_revisions r ON r.id = s.tree_revision_id JOIN task_trees t ON t.id = r.tree_id
       WHERE t.project_id = ?`, input.sourceProjectId)) {
       const rewrittenCriterion = row.criteria_json
         ? input.rewrittenDocuments.get(row.tree_revision_id)?.skeletonCriteria?.find((criterion) =>
@@ -235,7 +235,7 @@ export class ProjectCloneService {
     }
     for (const row of this.database.all<{ tree_revision_id: string; from_node_id: string; to_node_id: string; kind: string; artifact_id: string | null }>(`
       SELECT e.tree_revision_id, e.from_node_id, e.to_node_id, e.kind, e.artifact_id
-      FROM task_relation_edges e JOIN task_tree_revisions r ON r.id = e.tree_revision_id
+      FROM task_relation_edges e JOIN runtime_task_tree_revisions r ON r.id = e.tree_revision_id
       JOIN task_trees t ON t.id = r.tree_id WHERE t.project_id = ?`, input.sourceProjectId)) {
       this.database.run("INSERT INTO task_relation_edges (id, tree_revision_id, from_node_id, to_node_id, kind, artifact_id) VALUES (?, ?, ?, ?, ?, ?)",
         newId(), maps.revisions.get(row.tree_revision_id)!, maps.nodes.get(row.from_node_id)!, maps.nodes.get(row.to_node_id)!, row.kind,

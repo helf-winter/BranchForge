@@ -27,7 +27,31 @@ function document(): TaskTreeDocument {
       { id: "branch-b", parentId: "root", title: "Branch B", children: ["b-skeleton", "b-impl"], executionPhase: "verification", requiredEvidence: [{ key: "b-verify", description: "B integration" }] },
       leaf("b-skeleton", "branch-b", "B Skeleton", "skeleton"), leaf("b-impl", "branch-b", "B Implementation"),
     ],
-    relations: [], artifacts: [],
+    relations: [],
+    artifacts: [
+      { id: "a-file", kind: "file", locator: "src/branch-a.ts" },
+      { id: "b-file", kind: "file", locator: "src/branch-b.ts" },
+      { id: "a-contract-artifact", kind: "contract", locator: "contract:a" },
+      { id: "b-contract-artifact", kind: "contract", locator: "contract:b" },
+    ],
+    artifactLinks: [
+      { taskNodeId: "a-skeleton", artifactId: "a-file", relationType: "creates" },
+      { taskNodeId: "b-skeleton", artifactId: "b-file", relationType: "creates" },
+      { taskNodeId: "a-skeleton", artifactId: "a-contract-artifact", relationType: "implements" },
+      { taskNodeId: "b-skeleton", artifactId: "b-contract-artifact", relationType: "implements" },
+    ],
+    artifactContracts: [
+      {
+        id: "a-contract", artifactId: "a-contract-artifact", name: "A contract", version: "1",
+        compatibilityPolicy: "exact", schemaOrSignature: "runA(): void",
+        providerNodeIds: ["a-skeleton"], consumerNodeIds: ["a-impl"], validationRefs: ["a-skeleton-test"],
+      },
+      {
+        id: "b-contract", artifactId: "b-contract-artifact", name: "B contract", version: "1",
+        compatibilityPolicy: "exact", schemaOrSignature: "runB(): void",
+        providerNodeIds: ["b-skeleton"], consumerNodeIds: ["b-impl"], validationRefs: ["b-skeleton-test"],
+      },
+    ],
     skeletonCriteria: [
       { id: "s-a", branchNodeId: "branch-a", expectedArtifacts: ["src/branch-a.ts"], requiredContracts: ["a-contract"], verificationCommands: ["npm test -- a"], readinessConditions: ["A wired"] },
       { id: "s-b", branchNodeId: "branch-b", expectedArtifacts: ["src/branch-b.ts"], requiredContracts: ["b-contract"], verificationCommands: ["npm test -- b"], readinessConditions: ["B wired"] },
@@ -124,6 +148,76 @@ describe("Task refinement domain", () => {
       }),
     ]));
   });
+
+  it("rejects required Skeleton contracts when no contracts are declared", () => {
+    const draft = document();
+    draft.artifactContracts = [];
+
+    const result = analyzePlanReadiness(draft, "branch-a");
+
+    expect(result.ready).toBe(false);
+    expect(result.blockingIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "skeleton_contract_not_provided_by_skeleton",
+        affectedRefs: expect.arrayContaining(["branch-a", "a-contract"]),
+      }),
+    ]));
+  });
+
+  it.each(["tests/unplanned.test.ts", "a-impl-test", "b-skeleton-test"])(
+    "rejects required Skeleton contract validation ref %s that the branch cannot produce",
+    (validationRef) => {
+      const draft = document();
+      draft.artifactContracts![0]!.validationRefs = [validationRef];
+
+      const result = analyzePlanReadiness(draft, "branch-a");
+
+      expect(result.ready).toBe(false);
+      expect(result.blockingIssues).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: "skeleton_contract_validation_unresolved",
+          affectedRefs: expect.arrayContaining(["branch-a", "a-contract", validationRef]),
+        }),
+      ]));
+    },
+  );
+
+  it.each(["a-file", "src/branch-a.ts"])(
+    "accepts explicitly owned validation artifact %s and warns that its Trace must be attached",
+    (validationRef) => {
+      const draft = document();
+      draft.artifactContracts![0]!.validationRefs = [validationRef];
+
+      const result = analyzePlanReadiness(draft, "branch-a");
+
+      expect(result.ready).toBe(true);
+      expect(result.blockingIssues).toEqual([]);
+      expect(result.warnings).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: "skeleton_contract_validation_requires_trace_attachment",
+          affectedRefs: expect.arrayContaining(["branch-a", "a-contract", validationRef, "a-skeleton"]),
+        }),
+      ]));
+    },
+  );
+
+  it.each(["a-impl", "b-skeleton"])(
+    "rejects validation artifacts owned only by %s outside the branch Skeleton work",
+    (ownerNodeId) => {
+      const draft = document();
+      draft.artifactContracts![0]!.validationRefs = ["src/branch-a.ts"];
+      draft.artifactLinks![0]!.taskNodeId = ownerNodeId;
+
+      const result = analyzePlanReadiness(draft, "branch-a");
+
+      expect(result.blockingIssues).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: "skeleton_contract_validation_unresolved",
+          affectedRefs: expect.arrayContaining(["branch-a", "a-contract", "src/branch-a.ts"]),
+        }),
+      ]));
+    },
+  );
 
   it("classifies one-branch changes as direct and multi-branch/root changes as preview-required", () => {
     const base = document();

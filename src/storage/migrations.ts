@@ -1474,4 +1474,90 @@ export const migrations: Migration[] = [{
     CREATE INDEX task_affiliation_history_idx
       ON task_affiliation_decisions(project_id, created_at DESC, id DESC);
   `,
+}, {
+  version: 26,
+  sql: `
+    CREATE TABLE task_node_identity_repairs (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+      tree_id TEXT NOT NULL REFERENCES task_trees(id) ON DELETE RESTRICT,
+      tree_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      mapping_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(tree_id, tree_revision_id)
+    );
+    CREATE TABLE task_tree_revision_identity_projections (
+      revision_id TEXT PRIMARY KEY REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      repair_id TEXT NOT NULL REFERENCES task_node_identity_repairs(id) ON DELETE RESTRICT,
+      document_json TEXT NOT NULL
+    );
+    CREATE TABLE task_node_revision_identity_projections (
+      node_revision_id TEXT PRIMARY KEY REFERENCES task_node_revisions(id) ON DELETE RESTRICT,
+      repair_id TEXT NOT NULL REFERENCES task_node_identity_repairs(id) ON DELETE RESTRICT,
+      node_id TEXT NOT NULL REFERENCES task_nodes(id) ON DELETE RESTRICT,
+      body_json TEXT NOT NULL
+    );
+    CREATE VIEW runtime_task_tree_revisions AS
+      SELECT r.id, r.tree_id, r.revision, COALESCE(p.document_json, r.document_json) AS document_json, r.created_at
+      FROM task_tree_revisions r LEFT JOIN task_tree_revision_identity_projections p ON p.revision_id = r.id;
+    CREATE VIEW runtime_task_node_revisions AS
+      SELECT r.id, COALESCE(p.node_id, r.node_id) AS node_id, r.tree_revision_id,
+             COALESCE(p.body_json, r.body_json) AS body_json, r.created_at
+      FROM task_node_revisions r LEFT JOIN task_node_revision_identity_projections p ON p.node_revision_id = r.id;
+    CREATE TRIGGER task_node_identity_repairs_no_update BEFORE UPDATE ON task_node_identity_repairs
+      BEGIN SELECT RAISE(ABORT, 'identity repair audits are immutable'); END;
+    CREATE TRIGGER task_node_identity_repairs_no_delete BEFORE DELETE ON task_node_identity_repairs
+      BEGIN SELECT RAISE(ABORT, 'identity repair audits are immutable'); END;
+    CREATE TRIGGER task_tree_identity_projections_no_update BEFORE UPDATE ON task_tree_revision_identity_projections
+      BEGIN SELECT RAISE(ABORT, 'identity projections are immutable'); END;
+    CREATE TRIGGER task_tree_identity_projections_no_delete BEFORE DELETE ON task_tree_revision_identity_projections
+      BEGIN SELECT RAISE(ABORT, 'identity projections are immutable'); END;
+    CREATE TRIGGER task_node_identity_projections_no_update BEFORE UPDATE ON task_node_revision_identity_projections
+      BEGIN SELECT RAISE(ABORT, 'identity projections are immutable'); END;
+    CREATE TRIGGER task_node_identity_projections_no_delete BEFORE DELETE ON task_node_revision_identity_projections
+      BEGIN SELECT RAISE(ABORT, 'identity projections are immutable'); END;
+  `,
+}, {
+  version: 27,
+  sql: `
+    CREATE TABLE execution_attempt_artifact_baselines (
+      attempt_id TEXT NOT NULL REFERENCES execution_attempts(id) ON DELETE RESTRICT,
+      stage TEXT NOT NULL CHECK(stage IN ('start', 'end')),
+      baseline_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(attempt_id, stage)
+    );
+    CREATE TABLE final_report_artifact_baselines (
+      report_id TEXT PRIMARY KEY REFERENCES final_reports(id) ON DELETE RESTRICT,
+      root_attempt_id TEXT REFERENCES execution_attempts(id) ON DELETE RESTRICT,
+      baseline_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TRIGGER attempt_baselines_no_update BEFORE UPDATE ON execution_attempt_artifact_baselines
+      BEGIN SELECT RAISE(ABORT, 'proof baselines are immutable'); END;
+    CREATE TRIGGER attempt_baselines_no_delete BEFORE DELETE ON execution_attempt_artifact_baselines
+      BEGIN SELECT RAISE(ABORT, 'proof baselines are immutable'); END;
+    CREATE TRIGGER report_baselines_no_update BEFORE UPDATE ON final_report_artifact_baselines
+      BEGIN SELECT RAISE(ABORT, 'report baselines are immutable'); END;
+    CREATE TRIGGER report_baselines_no_delete BEFORE DELETE ON final_report_artifact_baselines
+      BEGIN SELECT RAISE(ABORT, 'report baselines are immutable'); END;
+    CREATE TABLE task_tree_iteration_records (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+      tree_id TEXT NOT NULL REFERENCES task_trees(id) ON DELETE RESTRICT,
+      base_revision_id TEXT NOT NULL REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      base_report_id TEXT NOT NULL REFERENCES final_reports(id) ON DELETE RESTRICT,
+      result_revision_id TEXT NOT NULL UNIQUE REFERENCES task_tree_revisions(id) ON DELETE RESTRICT,
+      affiliation_decision_id TEXT NOT NULL UNIQUE REFERENCES task_affiliation_decisions(id) ON DELETE RESTRICT,
+      answer_trace_event_id TEXT NOT NULL REFERENCES trace_events(id) ON DELETE RESTRICT,
+      input_hash TEXT NOT NULL,
+      impact_json TEXT NOT NULL,
+      reuse_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TRIGGER tree_iterations_no_update BEFORE UPDATE ON task_tree_iteration_records
+      BEGIN SELECT RAISE(ABORT, 'iteration audits are immutable'); END;
+    CREATE TRIGGER tree_iterations_no_delete BEFORE DELETE ON task_tree_iteration_records
+      BEGIN SELECT RAISE(ABORT, 'iteration audits are immutable'); END;
+  `,
 }];

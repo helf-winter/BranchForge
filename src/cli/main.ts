@@ -3,6 +3,11 @@ import { openRuntime } from "../application/runtime.js";
 import { mapClaudeHook } from "../bindings/claude/hook-mapper.js";
 import { present } from "./presenter.js";
 import { resolveJevRequestRoutingConfiguration } from "../domain/request-routing.js";
+import { backupRuntimeDatabase } from "../storage/backup.js";
+import path from "node:path";
+import { RuntimeDatabase } from "../storage/database.js";
+import { ProjectIdentityService, resolveDataHome } from "../application/project-identity-service.js";
+import { NodeIdentityRepairService } from "../application/node-identity-repair-service.js";
 
 function option(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
@@ -12,10 +17,11 @@ function option(args: string[], name: string): string | undefined {
 function positional(args: string[]): string[] {
   const result: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
-    if (["--json", "--include-archived"].includes(args[index]!)) continue;
+    if (["--json", "--include-archived", "--apply"].includes(args[index]!)) continue;
     if ([
       "--cwd", "--limit", "--cursor", "--status",
       "--map-limit", "--map-cursor", "--evidence-limit", "--evidence-cursor",
+      "--expected-revision", "--backup",
     ].includes(args[index]!)) { index += 1; continue; }
     result.push(args[index]!);
   }
@@ -49,6 +55,20 @@ export async function runCli(args = process.argv.slice(2)): Promise<number> {
     };
     process.stdout.write(`${present(result, json)}\n`);
     return 0;
+  }
+
+  if (words[0] === "tree" && words[1] === "repair-identities" && !args.includes("--apply")) {
+    let database: RuntimeDatabase | undefined;
+    try {
+      if (!words[2]) throw new HarnessError("invalid_input", "tree ID is required for identity recovery");
+      database = new RuntimeDatabase(path.join(resolveDataHome(process.env), "runtime.db"), { readOnly: true });
+      const project = await new ProjectIdentityService(database).resolve(cwd, "inspect");
+      if (project.status !== "same_project") throw new HarnessError("project_identity_conflict", "read-only identity preview requires the registered project path");
+      const result = new NodeIdentityRepairService(database).preview({ projectId: project.projectId, treeId: words[2] });
+      process.stdout.write(`${present(result, json)}\n`);
+      return 0;
+    } catch (error) { return presentCliError(error); }
+    finally { database?.close(); }
   }
 
   const runtime = openRuntime();
@@ -94,6 +114,21 @@ export async function runCli(args = process.argv.slice(2)): Promise<number> {
         projectId: project.projectId, ...(query ? { query } : {}),
         ...(args.includes("--include-archived") ? { includeArchived: true } : {}),
       });
+    } else if (words[0] === "tree" && words[1] === "repair-identities") {
+      const project = await requireProject(runtime, cwd);
+      const treeId = words[2];
+      if (!treeId) throw new HarnessError("invalid_input", "tree ID is required for identity recovery");
+      if (!args.includes("--apply")) result = runtime.nodeIdentities.preview({ projectId: project.projectId, treeId });
+      else {
+        const expectedTreeRevisionId = option(args, "--expected-revision");
+        const target = option(args, "--backup");
+        if (!expectedTreeRevisionId || !target) throw new HarnessError("invalid_input", "explicit identity recovery requires --expected-revision and --backup");
+        const preview = runtime.nodeIdentities.preview({ projectId: project.projectId, treeId });
+        if (preview.treeRevisionId !== expectedTreeRevisionId) throw new HarnessError("revision_conflict", "identity recovery preview is stale");
+        if (!preview.canApply) throw new HarnessError("runtime_action_rejected", "identity recovery is not safe", preview);
+        const backupPath = backupRuntimeDatabase(runtime.database.filename, target);
+        result = { ...runtime.nodeIdentities.apply({ projectId: project.projectId, treeId, expectedTreeRevisionId }), backupPath };
+      }
     } else if (words[0] === "tree" && words[1] === "select") {
       const project = await requireProject(runtime, cwd);
       result = runtime.taskTrees.selectTaskTree({ projectId: project.projectId, treeId: words[2] ?? "" });
@@ -148,13 +183,16 @@ export async function runCli(args = process.argv.slice(2)): Promise<number> {
     process.stdout.write(`${present(result, json)}\n`);
     return 0;
   } catch (error) {
-    const harnessError = error instanceof HarnessError ? error : new HarnessError("storage_failure", error instanceof Error ? error.message : String(error));
-    const output = { error: { code: harnessError.code, message: harnessError.message, details: harnessError.details ?? null } };
-    process.stderr.write(`${present(output, true)}\n`);
-    return 1;
+    return presentCliError(error);
   } finally {
     try { runtime.close(); } catch { /* MCP owns its runtime after dispatch. */ }
   }
+}
+
+function presentCliError(error: unknown): number {
+  const harnessError = error instanceof HarnessError ? error : new HarnessError("storage_failure", error instanceof Error ? error.message : String(error));
+  process.stderr.write(`${present({ error: { code: harnessError.code, message: harnessError.message, details: harnessError.details ?? null } }, true)}\n`);
+  return 1;
 }
 
 async function requireProject(runtime: ReturnType<typeof openRuntime>, cwd: string) {

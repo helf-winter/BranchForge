@@ -1,7 +1,9 @@
 import { newId, nowIso } from "../domain/ids.js";
 import { canonicalJson } from "../domain/trace.js";
-import type { TaskNodeInput } from "../domain/task-tree.js";
+import type { TaskNodeInput, TaskTreeDocument } from "../domain/task-tree.js";
 import type { RuntimeDatabase } from "../storage/database.js";
+import { hasUsableNodeProof, isPriorEvaluationUsable, iterationForRevision, type EvidenceReuseGrant } from "./evidence-reuse-policy.js";
+import { ArtifactEvidenceBaselineService } from "./artifact-evidence-baseline-service.js";
 
 interface WorkflowRow {
   id: string;
@@ -47,6 +49,31 @@ interface VerificationInvalidationRow {
 
 export class VerificationFreshnessService {
   constructor(private readonly database: RuntimeDatabase) {}
+
+  /** Explicit Gate/finalize operations reconcile observed stale reuse. Read-only
+   * queries and scheduler.next deliberately never call this method. */
+  reconcileIterationBaselinesWithinTransaction(input: { projectId: string; treeId: string }) {
+    const workflow = this.database.get<{ stage: string; revision: number; current_revision_id: string }>(`SELECT w.stage, w.revision, t.current_revision_id FROM workflow_states w JOIN task_trees t ON t.id = w.tree_id WHERE w.project_id = ? AND w.tree_id = ? AND w.active = 1`, input.projectId, input.treeId);
+    const iteration = workflow ? iterationForRevision(this.database, workflow.current_revision_id) : null;
+    if (!workflow || !iteration || !freshnessStages.has(workflow.stage)) return null;
+    const staleNodeIds: string[] = [];
+    for (const grant of JSON.parse(iteration.reuse_json) as EvidenceReuseGrant[]) {
+      if (!grant.evaluationId || !grant.attemptId) continue;
+      const node = this.database.get<{ status: string }>("SELECT status FROM task_nodes WHERE id = ? AND tree_id = ?", grant.nodeId, input.treeId);
+      if (node?.status !== "succeeded" || hasUsableNodeProof(this.database, { ...input, targetRevisionId: workflow.current_revision_id, nodeId: grant.nodeId })) continue;
+      const changes = new ArtifactEvidenceBaselineService(this.database).changedAttemptInputs({ projectId: input.projectId, attemptId: grant.attemptId });
+      const artifact = changes.flatMap(item => this.database.all<{ id: string }>("SELECT id FROM artifacts WHERE project_id = ? AND kind = ? AND locator = ?", input.projectId, item.kind, item.locator)).at(0);
+      const traceId = newId(); const timestamp = nowIso();
+      this.database.run(`INSERT INTO trace_events (id, project_id, tree_id, node_id, session_id, event_name, payload_json, execution_context_json, occurred_at, idempotency_key) VALUES (?, ?, ?, ?, 'runtime:verification-freshness', 'verification_baseline_stale', ?, '{}', ?, ?)`,
+        traceId, input.projectId, input.treeId, grant.nodeId, canonicalJson({ reason: "reusable_proof_no_longer_available", evaluationId: grant.evaluationId, attemptId: grant.attemptId, changedInputs: changes, ...(artifact ? { artifactRefs: [artifact.id] } : {}) }), timestamp,
+        `verification-baseline-stale:${workflow.current_revision_id}:${workflow.revision}:${grant.nodeId}:${traceId}`);
+      this.invalidateMutationWithinTransaction({ ...input, sourceTraceEventId: traceId, fallbackNodeId: grant.nodeId, ...(artifact ? { artifactId: artifact.id } : {}) });
+      staleNodeIds.push(grant.nodeId);
+    }
+    if (!staleNodeIds.length) return null;
+    const current = this.database.get<{ stage: string; revision: number; active_branch_node_id: string | null }>("SELECT stage, revision, active_branch_node_id FROM workflow_states WHERE project_id = ? AND tree_id = ? AND active = 1", input.projectId, input.treeId)!;
+    return { staleNodeIds, workflow: { stage: current.stage, revision: current.revision, activeBranchNodeId: current.active_branch_node_id } };
+  }
 
   list(projectId: string, options: { treeId?: string; invalidationId?: string } = {}) {
     const clauses = ["project_id = ?"];
@@ -127,7 +154,7 @@ export class VerificationFreshnessService {
     const nodes = this.database.all<CurrentNodeRow>(`
       SELECT n.id, n.parent_id, n.status, nr.body_json
       FROM task_nodes n
-      JOIN task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
+      JOIN runtime_task_node_revisions nr ON nr.node_id = n.id AND nr.tree_revision_id = ?
       WHERE n.tree_id = ? ORDER BY n.id
     `, workflow.current_revision_id, input.treeId);
     const byId = new Map(nodes.map((node) => [node.id, node]));
@@ -140,13 +167,37 @@ export class VerificationFreshnessService {
     const mutationNode = input.fallbackNodeId ? byId.get(input.fallbackNodeId) : undefined;
     const mutationBody = mutationNode ? JSON.parse(mutationNode.body_json) as TaskNodeInput : undefined;
     const changedArtifact = input.artifactId
-      ? this.database.get<{ kind: string; locator: string }>("SELECT kind, locator FROM artifacts WHERE id = ?", input.artifactId)
+      ? this.database.get<{ kind: string; locator: string }>("SELECT kind, locator FROM artifacts WHERE id = ? AND project_id = ?", input.artifactId, input.projectId)
       : undefined;
+    const mutationBranch = mutationNode ? branchFor(mutationNode.id) : null;
+    // Only an actual file-tool mutation bound to this revision's running writer
+    // can preserve skeleton proof. External observations, another session, and
+    // writes during verification must not borrow the implementation exemption.
+    const writerTrace = mutationBody?.executionPhase === "implementation" && changedArtifact?.kind === "file" && mutationBranch
+      ? this.database.get<{ payload_json: string }>(`
+          SELECT t.payload_json FROM trace_events t
+          JOIN execution_attempts a ON a.project_id = t.project_id AND a.tree_id = t.tree_id
+            AND a.task_node_id = t.node_id AND a.session_id = t.session_id
+          WHERE t.id = ? AND t.project_id = ? AND t.tree_id = ? AND t.node_id = ?
+            AND t.event_name = 'PostToolUse' AND a.status = 'running'
+            AND a.tree_revision_id = ? AND t.occurred_at >= a.started_at
+        `, input.sourceTraceEventId, input.projectId, input.treeId, mutationNode!.id, workflow.current_revision_id)
+      : undefined;
+    const writerPayload = writerTrace ? JSON.parse(writerTrace.payload_json) as { toolName?: string; artifactRefs?: string[] } : undefined;
+    const boundFileMutation = Boolean(writerPayload && ["Write", "Edit", "MultiEdit"].includes(writerPayload.toolName ?? "")
+      && writerPayload.artifactRefs?.includes(input.artifactId!));
+    const plannedWriteLink = boundFileMutation && this.database.get(`
+      SELECT id FROM task_node_artifact_links
+      WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ?
+        AND task_node_id = ? AND artifact_id = ? AND relation_type IN ('implements', 'modifies')
+    `, input.projectId, input.treeId, workflow.current_revision_id, mutationNode!.id, input.artifactId!);
     const extendsPlannedSkeleton = mutationBody?.executionPhase === "implementation" && changedArtifact?.kind === "file"
-      && (mutationBody.expectedOutputs ?? []).some((output) => output.replaceAll("\\", "/") === changedArtifact.locator);
+      && boundFileMutation && (Boolean(plannedWriteLink)
+        || (mutationBody.expectedOutputs ?? []).some((output) => output.replaceAll("\\", "/") === changedArtifact.locator));
     const skeletonCreators = extendsPlannedSkeleton ? new Set(this.database.all<{ task_node_id: string }>(`
-      SELECT task_node_id FROM task_node_artifact_links WHERE tree_revision_id = ? AND artifact_id = ? AND relation_type = 'creates'
-    `, workflow.current_revision_id, input.artifactId!).map((row) => row.task_node_id)) : new Set<string>();
+      SELECT task_node_id FROM task_node_artifact_links
+      WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ? AND artifact_id = ? AND relation_type = 'creates'
+    `, input.projectId, input.treeId, workflow.current_revision_id, input.artifactId!).map((row) => row.task_node_id)) : new Set<string>();
     // Filling a planned implementation into a created skeleton file is normal
     // forward progress, not evidence that the shared skeleton was broken. A
     // contract change or an out-of-scope mutation still invalidates its owners.
@@ -155,12 +206,13 @@ export class VerificationFreshnessService {
       if (!node) return false;
       const body = JSON.parse(node.body_json) as TaskNodeInput;
       return !(skeletonCreators.has(nodeId) && body.executionPhase === "skeleton"
-        && branchFor(nodeId) === branchFor(mutationNode!.id));
+        && branchFor(nodeId) === mutationBranch);
     }));
     const taskRelations = this.database.all<{ from_node_id: string; to_node_id: string; kind: string }>(`
       SELECT from_node_id, to_node_id, kind FROM task_relation_edges
       WHERE tree_revision_id = ?
     `, workflow.current_revision_id);
+    const document = JSON.parse(this.database.get<{ document_json: string }>("SELECT document_json FROM runtime_task_tree_revisions WHERE id = ?", workflow.current_revision_id)!.document_json) as TaskTreeDocument;
     for (const node of nodes) {
       const body = JSON.parse(node.body_json) as TaskNodeInput;
       for (const dependency of body.dependencies ?? []) {
@@ -177,6 +229,14 @@ export class VerificationFreshnessService {
           impact.add(relation.from_node_id);
           taskImpactExpanded = true;
         }
+      }
+      // Contract declarations carry evidence dependencies even without a
+      // redundant consumes-link or depends_on edge in the planning document.
+      for (const contract of document.artifactContracts ?? []) {
+        const providerAffected = relatedArtifactIds.has(contract.artifactId) || contract.providerNodeIds.some(id => impact.has(id)
+          || candidateNodeIds.includes(id) || (changedArtifact?.kind === "file" && (JSON.parse(byId.get(id)?.body_json ?? "{}") as TaskNodeInput).expectedOutputs?.some(output => output.replaceAll("\\", "/") === changedArtifact.locator)));
+        if (!providerAffected) continue;
+        for (const consumer of contract.consumerNodeIds) if (!impact.has(consumer)) { impact.add(consumer); taskImpactExpanded = true; }
       }
     }
     for (const nodeId of [...impact]) {
@@ -212,7 +272,7 @@ export class VerificationFreshnessService {
       ? this.database.all<{ id: string; task_node_id: string; body_json: string }>(`
           SELECT a.id, a.task_node_id, nr.body_json
           FROM execution_attempts a
-          JOIN task_node_revisions nr ON nr.id = a.task_node_revision_id
+          JOIN runtime_task_node_revisions nr ON nr.id = a.task_node_revision_id
           WHERE a.project_id = ? AND a.tree_id = ? AND a.status IN ('running', 'verifying')
             AND a.task_node_id IN (${impactPlaceholders})
         `, input.projectId, input.treeId, ...impact).filter((attempt) => {
@@ -279,13 +339,17 @@ export class VerificationFreshnessService {
       : null;
 
     const affectedPlaceholders = affectedNodeIds.map(() => "?").join(", ");
-    const invalidatedEvaluationIds = this.database.all<{ id: string }>(`
-      SELECT e.id FROM evaluations e
-      JOIN task_node_revisions nr ON nr.id = e.task_node_revision_id
-      WHERE e.project_id = ? AND e.tree_id = ? AND nr.tree_revision_id = ?
+    const iteration = iterationForRevision(this.database, workflow.current_revision_id);
+    const grantedEvaluationIds = new Set(iteration ? (JSON.parse(iteration.reuse_json) as EvidenceReuseGrant[]).map(grant => grant.evaluationId) : []);
+    const invalidatedEvaluationIds = this.database.all<{ id: string; task_node_id: string; tree_revision_id: string }>(`
+      SELECT e.id, e.task_node_id, nr.tree_revision_id FROM evaluations e
+      JOIN runtime_task_node_revisions nr ON nr.id = e.task_node_revision_id
+      WHERE e.project_id = ? AND e.tree_id = ?
         AND e.task_node_id IN (${affectedPlaceholders}) AND e.verdict = 'succeeded'
       ORDER BY e.created_at, e.id
-    `, input.projectId, input.treeId, workflow.current_revision_id, ...affectedNodeIds).map((row) => row.id);
+    `, input.projectId, input.treeId, ...affectedNodeIds).filter(row => row.tree_revision_id === workflow.current_revision_id
+      || grantedEvaluationIds.has(row.id)
+      || isPriorEvaluationUsable(this.database, { ...input, targetRevisionId: workflow.current_revision_id, nodeId: row.task_node_id, evaluationId: row.id })).map(row => row.id);
     const invalidatedGateResultIds = this.database.all<{ id: string }>(`
       SELECT id FROM workflow_phase_gate_results
       WHERE project_id = ? AND tree_id = ? AND tree_revision_id = ? AND status = 'passed'

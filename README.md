@@ -306,6 +306,8 @@ Readiness 结果和确认提示都绑定创建时的 Task Tree revision。树结
 - 每次 `passed`、`failed` 或 `uncertain` 结果都会不可变保存；失败和无法判断时保持 `skeleton_pass`，补齐事实后可重试；只有通过时才原子进入 `branch_implementation`；
 - `harness_get_skeleton_gate_results` 与 Runtime Snapshot 可在重启后恢复结果、阻塞项数量和证据引用。
 
+骨架节点都已成功但门禁仍缺证据时，`harness_get_next_executable_node` 会返回带 `recovery` 的局部补验节点：缺失的精确命令、契约验证引用和产物。按正常接口新开 Attempt，补齐并绑定证据，再重新评估骨架门；不修改旧成功 Attempt、不重建树、不重复审批。规划本身缺契约定义时仍需精炼，不能用补验绕过规划检查。
+
 没有 `planningVersion: 1` 的旧 Task Tree 采用明确标记的兼容策略，只要求当前 Skeleton 节点均有成功 Attempt；新规划不得依赖该兼容路径。
 
 ### Branch Phase Orchestration
@@ -412,7 +414,7 @@ claude plugin update agent-harness@agent-harness-local --scope user
 claude plugin list --json
 ```
 
-确认列表中的 `version` 为仓库当前版本（本版为 `0.1.4`）后，再关闭并重新打开 Claude Code。`/clear` 只清理对话上下文，不能替代插件/MCP 进程重启。
+确认列表中的 `version` 为仓库当前版本（本版为 `0.1.10`）后，再关闭并重新打开 Claude Code。`/clear` 只清理对话上下文，不能替代插件/MCP 进程重启。
 
 重新启动 Claude Code，然后在任意项目目录运行：
 
@@ -450,3 +452,15 @@ claude plugin validate ./plugin
 完整人工验收见 [docs/acceptance.md](docs/acceptance.md)。当前切片尚不包含完整 AST/符号调用图、Codex Binding 和图形界面。
 
 `0.1.4` 修复原生选项回答证据、纯容器分支的根验证、正常实现对骨架的错误回退、依赖失效后的 Attempt 释放，以及归档/暂停后的残留门禁。回归范围与人工复测步骤见 [工作流死锁回归](docs/harness-deadlock-regressions.md)。
+
+`0.1.5` 修复完成 Final Report 后的 Stop 误报：最终报告、树完成、工作流停用与相关会话的 Profile 收尾在同一事务提交。已完成树保持可查询，无需归档来解除门禁；新请求仍按原生讨论与 Task Tree 规划流程路由。
+
+`0.1.6` 修复骨架门缺证据后的执行死锁：在现有审批与 revision 内调度新补验 Attempt，复用未失效的同上下文证据，区分契约缺定义与缺验证。命令验证使用绑定 Trace 的不可变签名，不受跨分支投影覆盖或秘密脱敏影响；只读组合诊断不再误拦，输出文件、命令替换和危险选项仍受门禁约束。
+
+`0.1.7` 修复跨任务树重用节点 ID 导致的错误覆盖与根验证阻塞：冲突 ID 在保存前按树规范化，所有结构引用同步映射；持久化再次校验实际归属。旧的未执行根节点冲突可显式恢复为身份读模型，不改批准的规划 revision、原始 JSON 或不可变验证事实。只读预览不迁移数据库，执行恢复必须绑定 revision 并先做一致性备份。详见 [节点身份恢复](docs/node-identity-recovery.md)。
+
+`0.1.8` 修正空闲 Runtime 的原生执行引导：`availableActions` 明确只列任务树工作流动作，不是项目工具权限白名单。无活动工作流的已注册项目会收到精简 Hook 提示，说明小修改无需归属确认、完成后“继续”不应扩展历史 warning 为新任务；暂停提示只停止当前请求。显式结构化规划仍受原生审批和 Attempt 门禁约束。详见 [原生执行边界回归](docs/native-execution-guidance.md)。
+
+`0.1.9` 支持对已完成任务树显式追加功能分支：同一 treeId、新 revision、新原生 Plan 审批；旧报告与执行事实不被覆盖。可证明未受影响的旧证据按审计记录复用；旧版无指纹或受影响节点先补验证，根验收每轮重新执行。普通“继续”、选树和小修改不会自动重开树。详见 [任务树增量迭代](docs/task-tree-incremental-iterations.md)。
+
+`0.1.10` 修复同分支正常实现被误判为骨架破坏的问题：使用当前修订的 `implements` / `modifies` 产物关系识别已规划写入，兼容旧版精确路径输出。仅同会话、当前 revision 的运行中 Attempt 所绑定的文件工具写入可以保留本分支骨架证据；实现仍须取得新的验收证据。跨分支、外部修改、验证期间写入和契约变化仍按原规则重验，不推断任意源码 API 是否兼容。无需新增 schema migration。

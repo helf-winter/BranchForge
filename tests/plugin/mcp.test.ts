@@ -7,11 +7,42 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../../src/bindings/claude/mcp-server.js";
 import { RuntimeDatabase } from "../../src/storage/database.js";
 import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
+import { affiliation, completedTreeFixture, iterationDocument } from "../helpers/completed-tree-fixture.js";
 
 const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));
 
 describe("Harness MCP binding", () => {
+  it("uses the existing create-draft tool for a completed merge without making a new tree", async () => {
+    const f = await completedTreeFixture();
+    const harness = createMcpServer(f.environment);
+    const client = new Client({ name: "iteration-tool-test", version: "1" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([harness.server.connect(serverTransport), client.connect(clientTransport)]);
+      const decision = await affiliation(f, "merge");
+      const queried = await client.callTool({ name: "harness_get_tree_view", arguments: { cwd: f.projectDir, treeId: f.treeId, depth: "detail" } });
+      const queriedContent = queried.content as Array<{ type: string; text?: string }>;
+      const base = JSON.parse(queriedContent.find(item => item.type === "text")!.text!) as { treeRevisionId: string; planningDocument: TaskTreeDocument };
+      expect(base.planningDocument).toMatchObject({ planningVersion: 1, planningContext: { goal: "Counter" } });
+      const document = base.planningDocument;
+      const added = iterationDocument(["snapshots"]);
+      document.nodes.find(node => node.parentId === null)!.children.push("snapshots");
+      document.nodes.push(...added.nodes.filter(node => node.parentId !== null));
+      document.artifacts.push(...added.artifacts);
+      document.artifactLinks!.push(...added.artifactLinks!);
+      document.artifactContracts!.push(...added.artifactContracts!);
+      document.skeletonCriteria!.push(...added.skeletonCriteria!);
+      const args = { cwd: f.projectDir, affiliationDecisionId: decision.decisionId, expectedTreeRevisionId: base.treeRevisionId, document, idempotencyKey: "mcp-increment" };
+      const omitted = await client.callTool({ name: "harness_create_task_tree_draft", arguments: { ...args, expectedTreeRevisionId: undefined } });
+      expect(omitted.isError).toBe(true);
+      const result = await client.callTool({ name: "harness_create_task_tree_draft", arguments: args });
+      expect(result.isError).not.toBe(true);
+      const content = result.content as Array<{ type: string; text?: string }>;
+      expect(JSON.parse(content.find(item => item.type === "text")!.text!)).toMatchObject({ treeId: f.treeId, revision: 3, baseReportId: f.report.reportId });
+      expect(f.runtime.database.all("SELECT id FROM task_trees")).toHaveLength(1);
+    } finally { await client.close(); await harness.close(); await f.close(); }
+  });
   it("advertises the approved surface and performs a create/query round trip", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "harness-mcp-")); dirs.push(directory);
     const project = path.join(directory, "project");
@@ -325,7 +356,19 @@ describe("Harness MCP binding", () => {
           executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
         },
       ],
-      relations: [], artifacts: [],
+      relations: [], artifacts: [
+        { id: "canvas-file", kind: "file", locator: "canvas.ts" },
+        { id: "canvas-contract", kind: "contract", locator: "contract:canvas-api" },
+      ],
+      artifactLinks: [
+        { taskNodeId: "canvas-skeleton", artifactId: "canvas-file", relationType: "creates" },
+        { taskNodeId: "canvas-skeleton", artifactId: "canvas-contract", relationType: "implements" },
+      ],
+      artifactContracts: [{
+        id: "canvas-api", artifactId: "canvas-contract", name: "Canvas API", version: "1", compatibilityPolicy: "exact",
+        schemaOrSignature: "render(): void", providerNodeIds: ["canvas-skeleton"],
+        consumerNodeIds: ["canvas-implementation"], validationRefs: ["skeleton-test"],
+      }],
       skeletonCriteria: [{
         id: "canvas-skeleton", branchNodeId: "canvas", expectedArtifacts: ["canvas.ts"],
         requiredContracts: ["canvas-api"], verificationCommands: ["npm test"], readinessConditions: ["module imports"],
@@ -356,6 +399,7 @@ describe("Harness MCP binding", () => {
       name: "harness_validate_task_tree",
       arguments: { cwd: project, treeId: patched.treeId, treeRevisionId: patched.revisionId },
     }));
+    expect(readiness.blockingIssues).toEqual([]);
     expect(readiness).toMatchObject({ ready: true, revisionId: patched.revisionId });
     addAnswer("approval-answer", patched.treeId as string);
     const approval = parse(await client.callTool({

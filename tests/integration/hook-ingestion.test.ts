@@ -94,7 +94,20 @@ async function nativePlanTree(directory: string, database: RuntimeDatabase) {
         executionPhase: "implementation", stopDecompositionReason: "One verifiable feature",
       },
     ],
-    relations: [], artifacts: [],
+    relations: [], artifacts: [
+      { id: "canvas-file", kind: "file", locator: "canvas.ts" },
+      { id: "canvas-contract", kind: "contract", locator: "canvas-api" },
+    ],
+    artifactLinks: [
+      { taskNodeId: "canvas-skeleton", artifactId: "canvas-file", relationType: "creates" },
+      { taskNodeId: "canvas-skeleton", artifactId: "canvas-contract", relationType: "creates" },
+    ],
+    artifactContracts: [{
+      id: "canvas-api", artifactId: "canvas-contract", name: "Canvas API", version: "1",
+      compatibilityPolicy: "exact", schemaOrSignature: "export interface Canvas {}",
+      providerNodeIds: ["canvas-skeleton"], consumerNodeIds: ["canvas-implementation"],
+      validationRefs: ["skeleton-test"],
+    }],
     skeletonCriteria: [{
       id: "canvas-skeleton", branchNodeId: "canvas", expectedArtifacts: ["canvas.ts"],
       requiredContracts: ["canvas-api"], verificationCommands: ["npm test"], readinessConditions: ["module imports"],
@@ -720,6 +733,44 @@ describe("Claude hook ingestion", () => {
       "SELECT node_id FROM trace_events WHERE payload_json LIKE '%explicit-direct%'",
     )).toEqual({ node_id: null });
     database.close();
+  });
+
+  it.each([
+    "ls -la '/mnt/d/code/创业/简易计数器' 2>&1 | head -50; echo '---'; find '/mnt/d/code/创业/简易计数器' -maxdepth 2 -not -path '*/node_modules/*' 2>/dev/null | head -50",
+    "cd '/mnt/d/code/创业/Agent-Harness' && grep -rn 'required_contract_missing\\|verification_command_missing' src/ --include=*.ts | head -20",
+    "grep -n 'value>limit' src/example.ts | head -20",
+  ])("keeps read-only shell investigation available without an active Attempt: %s", async (command) => {
+    const { directory, database } = await fixture();
+    const native = await nativePlanTree(directory, database);
+    setProfile(database, native.project.projectId, "s1", "structured_coding");
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "approve-diagnostics", tool_input: { plan: native.approval.canonicalBlock },
+    }));
+    await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PostToolUse", session_id: "s1", cwd: directory,
+      tool_name: "ExitPlanMode", tool_use_id: "approve-diagnostics", tool_input: {}, tool_response: { approved: true },
+    }));
+    expect(database.all("SELECT id FROM execution_attempts")).toEqual([]);
+    expect(await native.service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "Bash", tool_use_id: "read-diagnostics", tool_input: { command },
+    }))).toMatchObject({ recorded: true, violation: false, blocked: false });
+  });
+
+  it.each([
+    "ls | head; touch src/new.ts", "cd . && node -e 'process.exit(0)'",
+    "rg --pre 'touch src/new.ts' pattern src", "git diff --output=src/diff.txt",
+    "find . -delete | head -20", "ls 2>&1 > src/list.txt",
+    "find . *", "git diff *", "git diff -- *",
+  ])("keeps unsafe diagnostic-looking shell commands behind the structured mutation gate: %s", async (command) => {
+    const { directory, database, service } = await fixture();
+    const { project } = await activeTree(directory, database);
+    setProfile(database, project.projectId, "s1", "structured_coding");
+    expect(await service.ingest(mapClaudeHook({
+      hook_event_name: "PreToolUse", session_id: "s1", cwd: directory,
+      tool_name: "Bash", tool_use_id: "unsafe-diagnostics", tool_input: { command },
+    }))).toMatchObject({ recorded: true, violation: true, blocked: true, directive: { kind: "deny" } });
   });
 
   it("continues project-approved work in a new Session without borrowing another Session's Attempt", async () => {

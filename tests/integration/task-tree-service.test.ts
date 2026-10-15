@@ -43,6 +43,31 @@ const branchedDocument = {
 };
 const planningDocument: TaskTreeDocument = {
   ...branchedDocument,
+  nodes: branchedDocument.nodes.map((node) => node.parentId ? { ...node, executionPhase: "skeleton" } : node),
+  artifacts: [
+    { id: "a-file", kind: "file", locator: "a.ts" },
+    { id: "b-file", kind: "file", locator: "b.ts" },
+    { id: "a-contract-artifact", kind: "contract", locator: "contract:a" },
+    { id: "b-contract-artifact", kind: "contract", locator: "contract:b" },
+  ],
+  artifactLinks: [
+    { taskNodeId: "branch-a", artifactId: "a-file", relationType: "creates" },
+    { taskNodeId: "branch-b", artifactId: "b-file", relationType: "creates" },
+    { taskNodeId: "branch-a", artifactId: "a-contract-artifact", relationType: "implements" },
+    { taskNodeId: "branch-b", artifactId: "b-contract-artifact", relationType: "implements" },
+  ],
+  artifactContracts: [
+    {
+      id: "a-contract", artifactId: "a-contract-artifact", name: "A contract", version: "1",
+      compatibilityPolicy: "exact", schemaOrSignature: "runA(): void",
+      providerNodeIds: ["branch-a"], consumerNodeIds: ["branch-b"], validationRefs: ["a-test"],
+    },
+    {
+      id: "b-contract", artifactId: "b-contract-artifact", name: "B contract", version: "1",
+      compatibilityPolicy: "exact", schemaOrSignature: "runB(): void",
+      providerNodeIds: ["branch-b"], consumerNodeIds: ["branch-a"], validationRefs: ["b-test"],
+    },
+  ],
   planningVersion: 1,
   planningContext: {
     goal: "Build the runtime",

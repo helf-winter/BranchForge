@@ -9,6 +9,7 @@ import {
 import type { TaskTreeDocument } from "../domain/task-tree.js";
 import type { RuntimeDatabase } from "../storage/database.js";
 import { TaskTreeService, type TaskTreeRevisionView } from "./task-tree-service.js";
+import { TaskTreeIterationService, iterationRevisionView, type TaskTreeIterationView } from "./task-tree-iteration-service.js";
 
 interface AffiliationRow {
   id: string;
@@ -25,6 +26,7 @@ interface CommandRow {
 
 interface TreeRow {
   id: string;
+  status: string;
   current_revision_id: string;
   document_json: string;
 }
@@ -42,7 +44,7 @@ export class TaskTreeDraftService {
     expectedTreeRevisionId?: string;
     document: TaskTreeDocument;
     idempotencyKey: string;
-  }): TaskTreeRevisionView {
+  }): TaskTreeRevisionView | TaskTreeIterationView {
     if (input.document.planningVersion !== 1) {
       throw new HarnessError("invalid_input", "first-class Task Tree drafts require planningVersion 1");
     }
@@ -82,7 +84,10 @@ export class TaskTreeDraftService {
     }
 
     return this.database.transaction(() => {
-      const result = this.trees.saveDraftRevisionWithinTransaction({
+      const result = tree.status === "completed" ? new TaskTreeIterationService(this.database, this.trees).reopenWithinTransaction({
+        projectId: input.projectId, sessionId: input.sessionId, affiliationDecisionId: affiliation.id,
+        treeId: tree.id, expectedTreeRevisionId: tree.current_revision_id, document: input.document, inputHash,
+      }) : this.trees.saveDraftRevisionWithinTransaction({
         projectId: input.projectId,
         treeId: tree.id,
         baseRevisionId: tree.current_revision_id,
@@ -155,8 +160,8 @@ export class TaskTreeDraftService {
 
   private currentTree(projectId: string, treeId: string): TreeRow {
     const row = this.database.get<TreeRow>(`
-      SELECT t.id, t.current_revision_id, r.document_json
-      FROM task_trees t JOIN task_tree_revisions r ON r.id = t.current_revision_id
+      SELECT t.id, t.status, t.current_revision_id, r.document_json
+      FROM task_trees t JOIN runtime_task_tree_revisions r ON r.id = t.current_revision_id
       WHERE t.id = ? AND t.project_id = ?
     `, treeId, projectId);
     if (!row) throw new HarnessError("not_found", "resolved Task Tree was not found in this Project");
@@ -173,7 +178,7 @@ export class TaskTreeDraftService {
     if (existing.input_hash !== inputHash) {
       throw new HarnessError("revision_conflict", "authoring idempotency key was already used with a different payload");
     }
-    return this.trees.getRevisionById(projectId, existing.tree_id, existing.result_revision_id);
+    return iterationRevisionView(this.database, this.trees.getRevisionById(projectId, existing.tree_id, existing.result_revision_id));
   }
 
   private isBlankRoot(document: TaskTreeDocument): boolean {

@@ -262,7 +262,7 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   }));
 
   server.registerTool("harness_create_task_tree_draft", {
-    description: "Create the first full goal-level Task Tree draft after explicit affiliation, deriving Session provenance from the recorded answer.",
+    description: "Create a full goal-level draft after explicit affiliation. A completed-tree merge appends branches under the same treeId and a new revision, preserving historical reports and requiring a fresh native Plan approval; it never reopens from a bare continue. Session provenance comes from the recorded answer.",
     inputSchema: {
       cwd: cwdSchema,
       affiliationDecisionId: z.string().min(1),
@@ -458,7 +458,7 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   }, ({ cwd, treeId }) => guarded(async () => runtime.queries.getTaskTreeSummary((await existingProject(cwd)).projectId, treeId)));
 
   server.registerTool("harness_get_tree_view", {
-    description: "Get a project-scoped Tree-centered Snapshot, selected-node Summary, or explicit filtered Relation Overlay Detail.",
+    description: "Get a project-scoped Tree-centered Snapshot, selected-node Summary, or explicit filtered Relation Overlay Detail. Detail also returns planningDocument: the complete persisted current-revision planning input, unaffected by view filters. Read it with treeRevisionId before an additive merge; queries never reopen or modify the tree.",
     inputSchema: {
       cwd: cwdSchema, treeId: z.string().min(1), depth: z.enum(["snapshot", "summary", "detail"]),
       selectedNodeId: z.string().min(1).optional(), includeRelationOverlay: z.boolean().optional(),
@@ -924,7 +924,7 @@ export function createMcpServer(environment: NodeJS.ProcessEnv = process.env) {
   )));
 
   server.registerTool("harness_get_next_executable_node", {
-    description: "Project the one deterministic Task Node eligible to execute next; this does not start an Attempt or change lifecycle state.",
+    description: "Project the one deterministic Task Node eligible to execute next without changing state. If recovery is present, start a fresh Attempt on this same approved revision, run its missing verificationCommands exactly (no output pipelines), read and attach missing artifact validation Traces using declared requiredEvidence keys, then reevaluate the Skeleton Gate. Preserve old Attempts; do not rebuild the tree or request repeat approval for evidence-only recovery.",
     inputSchema: { cwd: cwdSchema, treeId: z.string().min(1) },
   }, ({ cwd, treeId }) => guarded(async () => runtime.scheduler.next({
     projectId: (await existingProject(cwd)).projectId, treeId,
