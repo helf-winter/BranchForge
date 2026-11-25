@@ -1,9 +1,9 @@
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { openRuntime } from "../../src/application/runtime.js";
-import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
-import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
+import { openRuntime } from "../../agent-runtime/application/runtime.js";
+import { mapClaudeHook } from "../../agent-claude/hook-mapper.js";
+import type { TaskTreeDocument } from "../../agent-planning/domain/task-tree.js";
 
 export function iterationDocument(branches = ["base"], containers = false): TaskTreeDocument {
   const document: TaskTreeDocument = {

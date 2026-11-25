@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeTaskTreeDocument, validateTaskTree } from "../../src/domain/task-tree.js";
+import { normalizeTaskTreeDocument, validateTaskTree } from "../../agent-planning/domain/task-tree.js";
 
 const leaf = {
   id: "leaf",

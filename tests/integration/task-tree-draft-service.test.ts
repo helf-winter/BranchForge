@@ -2,12 +2,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { TaskAffiliationService } from "../../src/application/task-affiliation-service.js";
-import { TaskTreeDraftService } from "../../src/application/task-tree-draft-service.js";
-import { TaskTreeService } from "../../src/application/task-tree-service.js";
-import { TaskTreeValidationService } from "../../src/application/task-tree-validation-service.js";
-import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { TaskAffiliationService } from "../../agent-planning/application/task-affiliation-service.js";
+import { TaskTreeDraftService } from "../../agent-planning/application/task-tree-draft-service.js";
+import { TaskTreeService } from "../../agent-planning/application/task-tree-service.js";
+import { TaskTreeValidationService } from "../../agent-planning/application/task-tree-validation-service.js";
+import type { TaskTreeDocument } from "../../agent-planning/domain/task-tree.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));

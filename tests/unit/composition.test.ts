@@ -4,7 +4,7 @@ import {
   computeDependencyImpactClosure,
   decideEffectDisposition,
   validateEffectDefinition,
-} from "../../src/domain/composition.js";
+} from "../../agent-plugin/domain/composition.js";
 
 describe("Task Node composition policy", () => {
   it("classifies compatible, missing-dependency, and incompatible contract changes", () => {

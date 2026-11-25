@@ -2,12 +2,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ProjectIdentityService } from "../../src/application/project-identity-service.js";
-import { RequestRoutingService } from "../../src/application/request-routing-service.js";
-import { RuntimeProfileService } from "../../src/application/runtime-profile-service.js";
-import { TaskTreeService } from "../../src/application/task-tree-service.js";
-import { resolveJevRequestRoutingConfiguration, type RequestRouteClassification } from "../../src/domain/request-routing.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { ProjectIdentityService } from "../../agent-project/application/project-identity-service.js";
+import { RequestRoutingService } from "../../agent-routing/application/request-routing-service.js";
+import { RuntimeProfileService } from "../../agent-routing/application/runtime-profile-service.js";
+import { TaskTreeService } from "../../agent-planning/application/task-tree-service.js";
+import { resolveJevRequestRoutingConfiguration, type RequestRouteClassification } from "../../agent-routing/domain/request-routing.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));
@@ -46,7 +46,7 @@ describe("RuntimeProfileService", () => {
   it("persists a pause so Stop hooks do not resurrect structured coding", async () => {
     const f = await fixture("task_tree_workflow", 0.95);
     const initial = await f.profiles.resolveForPrompt({ cwd: f.projectDirectory, sessionId: "session-1", prompt: "实现完整应用" });
-    const proposal = new (await import("../../src/application/task-affiliation-service.js")).TaskAffiliationService(f.database, f.profiles).propose({ projectId: initial.projectId!, requestTitle: "Pause", recommendation: "new_tree" });
+    const proposal = new (await import("../../agent-planning/application/task-affiliation-service.js")).TaskAffiliationService(f.database, f.profiles).propose({ projectId: initial.projectId!, requestTitle: "Pause", recommendation: "new_tree" });
     f.profiles.applyAffiliationChoice({ projectId: initial.projectId!, sessionId: "session-1", affiliationDecisionId: proposal.decisionId, choice: "pause" });
     expect(f.profiles.current(initial.projectId!, "session-1")).toMatchObject({ profile: "conversation", reasonCode: "affiliation:pause", nextAction: "await_user_direction" });
     f.database.close();

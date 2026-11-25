@@ -2,8 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ReplacementService } from "../../src/application/replacement-service.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { ReplacementService } from "../../agent-change/application/replacement-service.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 

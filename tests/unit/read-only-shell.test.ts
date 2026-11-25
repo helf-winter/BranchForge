@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isReadOnlyShellCommand } from "../../src/domain/read-only-shell.js";
+import { isReadOnlyShellCommand } from "../../agent-tracking/domain/read-only-shell.js";
 
 describe("read-only shell diagnostics", () => {
   it.each([

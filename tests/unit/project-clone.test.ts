@@ -6,7 +6,7 @@ import {
   rebaseCloneLocator,
   rewriteTaskTreeDocumentForClone,
   serializeProjectIdentityMarker,
-} from "../../src/domain/project-clone.js";
+} from "../../agent-project/domain/project-clone.js";
 
 describe("Project Clone domain policy", () => {
   it("parses token-backed markers and accepts legacy markers only as upgrade candidates", () => {

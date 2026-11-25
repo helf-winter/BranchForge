@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   deriveConfirmationStates,
   resolveConfirmationScope,
-} from "../../src/domain/confirmation.js";
-import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
+} from "../../agent-planning/domain/confirmation.js";
+import type { TaskTreeDocument } from "../../agent-planning/domain/task-tree.js";
 
 const document: TaskTreeDocument = {
   nodes: [

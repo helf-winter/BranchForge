@@ -4,7 +4,7 @@ import {
   evaluateSkillPromotion,
   type SkillTestType,
   type SkillValidationRunFact,
-} from "../../src/domain/evolution.js";
+} from "../../agent-evolution/domain/evolution.js";
 
 describe("Skill Evolution policy", () => {
   it("requires two applied failures before an applied success on the same revision", () => {

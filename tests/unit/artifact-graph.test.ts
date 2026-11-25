@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { normalizeArtifactInput } from "../../src/domain/artifact-graph.js";
-import { validateTaskTree, type TaskTreeDocument } from "../../src/domain/task-tree.js";
+import { normalizeArtifactInput } from "../../agent-tracking/domain/artifact-graph.js";
+import { validateTaskTree, type TaskTreeDocument } from "../../agent-planning/domain/task-tree.js";
 
 const leaf = {
   id: "leaf", parentId: null, title: "Implement API", children: [], objectives: ["Implement API"],

@@ -5,9 +5,9 @@ await rm("plugin/runtime", { recursive: true, force: true });
 await mkdir("plugin/runtime", { recursive: true });
 
 for (const [entry, outfile] of [
-  ["src/cli/entry.ts", "plugin/runtime/cli.mjs"],
-  ["src/bindings/claude/hook-entry.ts", "plugin/runtime/hook.mjs"],
-  ["src/bindings/claude/mcp-server.ts", "plugin/runtime/mcp.mjs"],
+  ["agent-cli/entry.ts", "plugin/runtime/cli.mjs"],
+  ["agent-claude/hook-entry.ts", "plugin/runtime/hook.mjs"],
+  ["agent-claude/mcp-server.ts", "plugin/runtime/mcp.mjs"],
 ] as const) {
   await build({
     entryPoints: [entry],

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateSkeletonGate, type SkeletonGateBranchObservation } from "../../src/domain/skeleton-gate.js";
+import { evaluateSkeletonGate, type SkeletonGateBranchObservation } from "../../agent-verification/domain/skeleton-gate.js";
 
 function branch(overrides: Partial<SkeletonGateBranchObservation> = {}): SkeletonGateBranchObservation {
   return {

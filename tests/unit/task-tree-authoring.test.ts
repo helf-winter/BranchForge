@@ -3,7 +3,7 @@ import {
   hashTaskTreeAuthoringPayload,
   requireSingleTaskTreePatchOperation,
   type TaskTreePatchOperation,
-} from "../../src/domain/task-tree-authoring.js";
+} from "../../agent-planning/domain/task-tree-authoring.js";
 
 const document = {
   planningVersion: 1 as const,

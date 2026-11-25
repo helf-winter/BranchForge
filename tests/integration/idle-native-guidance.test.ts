@@ -3,15 +3,15 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { RuntimeDatabase } from "../../src/storage/database.js";
-import { ProjectIdentityService } from "../../src/application/project-identity-service.js";
-import { TaskTreeService } from "../../src/application/task-tree-service.js";
-import { RuntimeQueryService } from "../../src/application/runtime-query-service.js";
-import { RuntimeProfileService } from "../../src/application/runtime-profile-service.js";
-import { RequestRoutingService } from "../../src/application/request-routing-service.js";
-import { HookIngestionService } from "../../src/application/hook-ingestion-service.js";
-import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
-import { resolveJevRequestRoutingConfiguration } from "../../src/domain/request-routing.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
+import { ProjectIdentityService } from "../../agent-project/application/project-identity-service.js";
+import { TaskTreeService } from "../../agent-planning/application/task-tree-service.js";
+import { RuntimeQueryService } from "../../agent-runtime/application/runtime-query-service.js";
+import { RuntimeProfileService } from "../../agent-routing/application/runtime-profile-service.js";
+import { RequestRoutingService } from "../../agent-routing/application/request-routing-service.js";
+import { HookIngestionService } from "../../agent-tracking/application/hook-ingestion-service.js";
+import { mapClaudeHook } from "../../agent-claude/hook-mapper.js";
+import { resolveJevRequestRoutingConfiguration } from "../../agent-routing/domain/request-routing.js";
 
 const fixtures: Array<{ directory: string; database: RuntimeDatabase }> = [];
 afterEach(async () => {

@@ -1,5 +1,26 @@
 # Self-Evolving Agent Harness
 
+## 代码模块
+
+源码按职责平铺在仓库根目录；各模块内部可包含 `domain/`（规则与类型）和 `application/`（用例与服务）。
+
+- `agent-routing`：请求分类、运行模式和执行指引。
+- `agent-project`：项目身份、路径和复制。
+- `agent-planning`：任务树、归属、修订、确认和原生计划绑定。
+- `agent-execution`：节点调度、执行尝试及完成状态。
+- `agent-verification`：执行证据、评估、骨架门禁和验证失效。
+- `agent-workflow`：工作流阶段推进及最终报告。
+- `agent-tracking`：Hook 事件、Trace、Artifact 和执行上下文。
+- `agent-change`：运行时变更、计划漂移及节点替换。
+- `agent-evolution`：失败案例、经验及 Skill 进化。
+- `agent-plugin`：Harness Runtime Plugin 的组合与生命周期。
+- `agent-claude` / `agent-jev` / `agent-cli`：Claude Code、Jev 和命令行适配入口。
+- `agent-storage`：SQLite 数据库、迁移和备份。
+- `agent-common`：共享基础类型和工具。
+- `agent-runtime`：运行时组装及跨模块查询。
+
+模块划分用于定位职责；当前仍是单个 npm 项目，不代表各目录可独立发布。
+
 Agent Harness 是 Claude Code 内部的一层长期工程运行时：Skills 约束任务规划和执行方式，Hooks 记录生命周期事实并在确定性边界执行有限门禁，MCP 工具提供可验证的 Task Tree 与 Runtime State 操作。它不是独立管理 Claude 的后台系统。
 
 当前版本实现 Runtime Foundation、Branch Confirmation、Node Execution & Evaluation、Artifact Graph & Plan Drift、Runtime Action & User Change、Failure Case Maturity、Experience & Skill Evolution、Task Node Replacement & Effect Disposal、Project Identity & Clone、Plugin Composition Contract、Task Tree Refinement Loop、Trace Execution Context、Task Tree Collection Lifecycle、Parent–Child Task Communication、Tree-centered Runtime View、Task Affiliation Confirmation、Jev Evidence Semantic Evaluation、Skeleton Gate Evaluation、Branch Phase Orchestration、Final Report & Task Tree Completion，以及 Verification Freshness & Invalidation 二十一个纵向切片：

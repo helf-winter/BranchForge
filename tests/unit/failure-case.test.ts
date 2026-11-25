@@ -4,7 +4,7 @@ import {
   validateReproductionContract,
   type FailureReproductionContract,
   type ReproductionValidationObservation,
-} from "../../src/domain/failure-case.js";
+} from "../../agent-evolution/domain/failure-case.js";
 
 function contract(mode: "manual" | "assisted" | "automated"): FailureReproductionContract {
   return {

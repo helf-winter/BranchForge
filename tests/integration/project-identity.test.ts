@@ -2,8 +2,8 @@ import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ProjectIdentityService } from "../../src/application/project-identity-service.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { ProjectIdentityService } from "../../agent-project/application/project-identity-service.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 async function fixture() {

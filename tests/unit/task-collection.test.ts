@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { restoredTaskTreeStatus } from "../../src/domain/task-collection.js";
+import { restoredTaskTreeStatus } from "../../agent-planning/domain/task-collection.js";
 
 describe("Task Tree collection policy", () => {
   it.each([undefined, null, "", "   ", "archived"])(

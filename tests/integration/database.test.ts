@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { RuntimeDatabase } from "../../src/storage/database.js";
-import { migrations } from "../../src/storage/migrations.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
+import { migrations } from "../../agent-storage/migrations.js";
 
 const dirs: string[] = [];
 async function databasePath(): Promise<string> {

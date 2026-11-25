@@ -2,8 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { PlanDriftService } from "../../src/application/plan-drift-service.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { PlanDriftService } from "../../agent-change/application/plan-drift-service.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 const databases: RuntimeDatabase[] = [];

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
+import { mapClaudeHook } from "../../agent-claude/hook-mapper.js";
 import { affiliation, approveIteration, completedTreeFixture, executeToReport, iterationDocument } from "../helpers/completed-tree-fixture.js";
 
 const fixtures: Awaited<ReturnType<typeof completedTreeFixture>>[] = [];

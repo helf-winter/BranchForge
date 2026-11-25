@@ -4,7 +4,7 @@ import {
   resolveJevRequestRoutingConfiguration,
   resolveRuntimeProfile,
   type RequestRouteResult,
-} from "../../src/domain/request-routing.js";
+} from "../../agent-routing/domain/request-routing.js";
 
 function route(
   classification: RequestRouteResult["classification"],

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { affiliation, completedTreeFixture, iterationDocument } from "../helpers/completed-tree-fixture.js";
-import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
+import { mapClaudeHook } from "../../agent-claude/hook-mapper.js";
 const fixtures: Awaited<ReturnType<typeof completedTreeFixture>>[] = [];
 afterEach(async () => { for (const f of fixtures.splice(0)) await f.close(); });
 describe("current versus historical completion", () => {

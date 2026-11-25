@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeProjectPath, pathsReferToSameProject } from "../../src/domain/project.js";
+import { normalizeProjectPath, pathsReferToSameProject } from "../../agent-project/domain/project.js";
 
 describe("project path normalization", () => {
   it("normalizes Windows paths without changing their project boundary", () => {

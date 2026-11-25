@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { JevEvaluationProvider } from "../../src/bindings/typesafe/jev-evaluation-provider.js";
-import { resolveJevConfiguration, type SemanticEvidenceSnapshot } from "../../src/domain/semantic-evaluation.js";
+import { JevEvaluationProvider } from "../../agent-jev/jev-evaluation-provider.js";
+import { resolveJevConfiguration, type SemanticEvidenceSnapshot } from "../../agent-verification/domain/semantic-evaluation.js";
 
 const snapshot: SemanticEvidenceSnapshot = {
   schemaVersion: 1,

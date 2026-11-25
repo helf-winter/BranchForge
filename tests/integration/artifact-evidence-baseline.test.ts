@@ -2,10 +2,10 @@ import { mkdtemp, mkdir, writeFile, utimes, symlink, truncate, rm, chmod, stat }
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { RuntimeDatabase } from "../../src/storage/database.js";
-import { ArtifactEvidenceBaselineService } from "../../src/application/artifact-evidence-baseline-service.js";
-import { NodeExecutionService } from "../../src/application/node-execution-service.js";
-import { EvaluationService } from "../../src/application/evaluation-service.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
+import { ArtifactEvidenceBaselineService } from "../../agent-verification/application/artifact-evidence-baseline-service.js";
+import { NodeExecutionService } from "../../agent-execution/application/node-execution-service.js";
+import { EvaluationService } from "../../agent-verification/application/evaluation-service.js";
 
 const databases: RuntimeDatabase[] = [];
 const directories: string[] = [];

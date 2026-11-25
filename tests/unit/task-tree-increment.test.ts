@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { analyzeIncrementalStructure } from "../../src/domain/task-tree-increment.js";
-import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
+import { analyzeIncrementalStructure } from "../../agent-planning/domain/task-tree-increment.js";
+import type { TaskTreeDocument } from "../../agent-planning/domain/task-tree.js";
 
 function base(): TaskTreeDocument {
   return {
