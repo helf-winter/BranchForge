@@ -2,9 +2,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { TaskTreeService } from "../../src/application/task-tree-service.js";
-import { WorkflowService } from "../../src/application/workflow-service.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { TaskTreeService } from "../../agent-planning/application/task-tree-service.js";
+import { WorkflowService } from "../../agent-workflow/application/workflow-service.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 const branchDocument = {

@@ -6,7 +6,7 @@ import {
   decideRegistrationDisposal,
   validatePluginManifest,
   type PluginRevisionManifest,
-} from "../../src/domain/plugin-composition.js";
+} from "../../agent-plugin/domain/plugin-composition.js";
 
 const manifest = (overrides: Partial<PluginRevisionManifest> = {}): PluginRevisionManifest => ({
   revision: "1.0.0",

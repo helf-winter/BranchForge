@@ -4,9 +4,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createMcpServer } from "../../src/bindings/claude/mcp-server.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
-import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
+import { createMcpServer } from "../../agent-claude/mcp-server.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
+import type { TaskTreeDocument } from "../../agent-planning/domain/task-tree.js";
 import { affiliation, completedTreeFixture, iterationDocument } from "../helpers/completed-tree-fixture.js";
 
 const dirs: string[] = [];

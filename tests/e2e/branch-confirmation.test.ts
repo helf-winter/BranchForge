@@ -2,8 +2,8 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { openRuntime } from "../../src/application/runtime.js";
-import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
+import { openRuntime } from "../../agent-runtime/application/runtime.js";
+import { mapClaudeHook } from "../../agent-claude/hook-mapper.js";
 
 const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));

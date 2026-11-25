@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { JevRequestRouter, type RequestRouteSnapshot } from "../../src/bindings/typesafe/jev-request-router.js";
-import { resolveJevRequestRoutingConfiguration } from "../../src/domain/request-routing.js";
+import { JevRequestRouter, type RequestRouteSnapshot } from "../../agent-jev/jev-request-router.js";
+import { resolveJevRequestRoutingConfiguration } from "../../agent-routing/domain/request-routing.js";
 
 const snapshot: RequestRouteSnapshot = {
   prompt: "实现可复用的登录表单",

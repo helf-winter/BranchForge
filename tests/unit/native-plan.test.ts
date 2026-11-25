@@ -3,9 +3,9 @@ import {
   extractCanonicalTaskTreeBlock,
   hashNativePlanBlock,
   renderCanonicalTaskTreeBlock,
-} from "../../src/domain/native-plan.js";
-import type { TaskTreeRevisionView } from "../../src/application/task-tree-service.js";
-import type { PlanReadinessView } from "../../src/application/task-tree-validation-service.js";
+} from "../../agent-planning/domain/native-plan.js";
+import type { TaskTreeRevisionView } from "../../agent-planning/application/task-tree-service.js";
+import type { PlanReadinessView } from "../../agent-planning/application/task-tree-validation-service.js";
 
 const tree: TaskTreeRevisionView = {
   treeId: "tree-1",

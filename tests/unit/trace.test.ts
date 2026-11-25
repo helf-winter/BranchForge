@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createHookIdempotencyKey, redactSecrets } from "../../src/domain/trace.js";
+import { createHookIdempotencyKey, redactSecrets } from "../../agent-tracking/domain/trace.js";
 
 describe("Trace facts", () => {
   it("deeply redacts secret-bearing keys while preserving useful evidence", () => {

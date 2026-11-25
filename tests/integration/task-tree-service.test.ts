@@ -2,11 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { TaskTreeService } from "../../src/application/task-tree-service.js";
-import { RuntimeQueryService } from "../../src/application/runtime-query-service.js";
-import { TaskTreeApprovalService } from "../../src/application/task-tree-approval-service.js";
-import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { TaskTreeService } from "../../agent-planning/application/task-tree-service.js";
+import { RuntimeQueryService } from "../../agent-runtime/application/runtime-query-service.js";
+import { TaskTreeApprovalService } from "../../agent-planning/application/task-tree-approval-service.js";
+import type { TaskTreeDocument } from "../../agent-planning/domain/task-tree.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 const validDocument = {

@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { affiliation, completedTreeFixture, iterationDocument } from "../helpers/completed-tree-fixture.js";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { openRuntime } from "../../src/application/runtime.js";
-import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
+import { openRuntime } from "../../agent-runtime/application/runtime.js";
+import { mapClaudeHook } from "../../agent-claude/hook-mapper.js";
 const fixtures: Awaited<ReturnType<typeof completedTreeFixture>>[] = [];
 afterEach(async () => { for (const f of fixtures.splice(0)) await f.close(); });
 async function fixture() { const f = await completedTreeFixture(); fixtures.push(f); return f; }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decideLifecycleTransition } from "../../src/domain/execution.js";
+import { decideLifecycleTransition } from "../../agent-execution/domain/execution.js";
 
 describe("Task Node lifecycle policy", () => {
   it("applies succeeded only when current evidence and dependencies are complete", () => {

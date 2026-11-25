@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateRuntimeActionSafety } from "../../src/domain/runtime-action.js";
+import { evaluateRuntimeActionSafety } from "../../agent-change/domain/runtime-action.js";
 
 describe("Runtime Action safety policy", () => {
   it("requires confirmation for blocking Drift resolution", () => {

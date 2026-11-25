@@ -3,10 +3,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
-import { runCli } from "../../src/cli/main.js";
-import { backupRuntimeDatabase } from "../../src/storage/backup.js";
-import { openRuntime } from "../../src/application/runtime.js";
-import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
+import { runCli } from "../../agent-cli/main.js";
+import { backupRuntimeDatabase } from "../../agent-storage/backup.js";
+import { openRuntime } from "../../agent-runtime/application/runtime.js";
+import type { TaskTreeDocument } from "../../agent-planning/domain/task-tree.js";
 
 const directories: string[] = [];
 afterEach(async () => Promise.all(directories.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))));

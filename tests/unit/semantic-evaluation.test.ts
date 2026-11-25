@@ -4,7 +4,7 @@ import {
   resolveJevConfiguration,
   semanticSnapshotHash,
   type SemanticEvidenceSnapshot,
-} from "../../src/domain/semantic-evaluation.js";
+} from "../../agent-verification/domain/semantic-evaluation.js";
 
 const snapshot: SemanticEvidenceSnapshot = {
   schemaVersion: 1,

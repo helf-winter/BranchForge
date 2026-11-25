@@ -3,8 +3,8 @@ import {
   analyzeDraftImpact,
   analyzePlanReadiness,
   validateDraftStructure,
-} from "../../src/domain/task-refinement.js";
-import type { TaskTreeDocument } from "../../src/domain/task-tree.js";
+} from "../../agent-planning/domain/task-refinement.js";
+import type { TaskTreeDocument } from "../../agent-planning/domain/task-tree.js";
 
 const leaf = (id: string, parentId: string, title = id, executionPhase: "skeleton" | "implementation" | "verification" = "implementation") => ({
   id, parentId, title, children: [], objectives: [`Implement ${title}`], expectedOutputs: [`src/${id}.ts`],

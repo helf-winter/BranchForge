@@ -2,12 +2,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { EvaluationService } from "../../src/application/evaluation-service.js";
-import { openRuntime } from "../../src/application/runtime.js";
-import { SemanticEvaluationService, loadSemanticEvidenceSnapshot } from "../../src/application/semantic-evaluation-service.js";
-import { HarnessError } from "../../src/domain/errors.js";
-import { resolveJevConfiguration, type SemanticEvidenceSnapshot } from "../../src/domain/semantic-evaluation.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { EvaluationService } from "../../agent-verification/application/evaluation-service.js";
+import { openRuntime } from "../../agent-runtime/application/runtime.js";
+import { SemanticEvaluationService, loadSemanticEvidenceSnapshot } from "../../agent-verification/application/semantic-evaluation-service.js";
+import { HarnessError } from "../../agent-common/domain/errors.js";
+import { resolveJevConfiguration, type SemanticEvidenceSnapshot } from "../../agent-verification/domain/semantic-evaluation.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));

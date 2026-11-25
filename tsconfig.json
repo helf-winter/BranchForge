@@ -9,5 +9,5 @@
     "noEmit": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts", "vitest.config.ts"]
+  "include": ["agent-*/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts", "vitest.config.ts"]
 }

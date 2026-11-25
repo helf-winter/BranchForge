@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canTransitionWorkflow } from "../../src/domain/workflow.js";
+import { canTransitionWorkflow } from "../../agent-workflow/domain/workflow.js";
 
 describe("coding workflow", () => {
   it("allows the declared next stage with required confirmation evidence", () => {

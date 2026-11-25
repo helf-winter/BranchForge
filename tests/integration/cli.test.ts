@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 // npm pretest builds this release entry. Exercise the shipped CLI, avoiding

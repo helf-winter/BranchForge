@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { affiliation, approveIteration, completedTreeFixture, executeToReport, iterationDocument } from "../helpers/completed-tree-fixture.js";
 import { writeFile, readFile } from "node:fs/promises";
 import path from "node:path";
-import { mapClaudeHook } from "../../src/bindings/claude/hook-mapper.js";
+import { mapClaudeHook } from "../../agent-claude/hook-mapper.js";
 const fixtures: Awaited<ReturnType<typeof completedTreeFixture>>[] = [];
 afterEach(async () => { for (const f of fixtures.splice(0)) await f.close(); });
 async function reopened(changed = false) {

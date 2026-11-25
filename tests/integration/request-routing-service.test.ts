@@ -2,10 +2,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RequestRoutingService } from "../../src/application/request-routing-service.js";
-import { HarnessError } from "../../src/domain/errors.js";
-import { resolveJevRequestRoutingConfiguration, type RequestRouteClassification } from "../../src/domain/request-routing.js";
-import { RuntimeDatabase } from "../../src/storage/database.js";
+import { RequestRoutingService } from "../../agent-routing/application/request-routing-service.js";
+import { HarnessError } from "../../agent-common/domain/errors.js";
+import { resolveJevRequestRoutingConfiguration, type RequestRouteClassification } from "../../agent-routing/domain/request-routing.js";
+import { RuntimeDatabase } from "../../agent-storage/database.js";
 
 const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));
